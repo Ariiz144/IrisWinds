@@ -1,0 +1,29 @@
+# your own game files and what's made from them (building from source puts them here)
+input/
+extracted/
+generated/
+generated-*/
+# Nintendo fonts (users import their own; only the README ships)
+/fonts/*
+!/fonts/README.md
+# build output, caches, saves and settings
+build/
+/cache/
+save/
+/savagewind.ini
+# tools and Python environments (machine-specific)
+tools/venv/
+venv/
+__pycache__/
+.DS_Store
+# Savage Wind: never track console dumps, keys or decrypted/extracted game data
+*.keys
+*.xci
+*.xcz
+*.nsp
+*.nsz
+*.nca
+dump/
+keys/
+# Ghidra query paths for this machine (tools/ghidra/README.md)
+tools/ghidra/gq.local.json
