@@ -639,6 +639,8 @@ static uint32_t tex_wh[2][64][2];
 static VkFormat pass_color[8], pass_depth, pass_stencil;
 static uint32_t pass_ncolor, pass_samples = 1, pass_w, pass_h;
 static int debug_pass_no;
+static NvnTexture *pass_dbg[8];  // (debug frame) the color targets of the pass in progress
+static int pass_dbg_n, pass_dbg_draws;
 
 static void vk_end_pass_at(int line);
 void vk_end_pass(void) { vk_end_pass_at(0); }
@@ -648,7 +650,8 @@ static void vk_end_pass_at(int line) {
     if (prof && line < 4096) prof_end_line[line]++;
     vkCmdEndRendering(vk_cmd());
     in_pass = false;
-    if (g_debug_frame && st.rt.ncolor && st.rt.color[0] && st.rt.color[0]->backend) {
+    // (debug frame) what the pass drew: its targets, as begin_pass recorded them (st.rt may name the next pass's)
+    if (g_debug_frame && pass_dbg_n && pass_dbg[0] && pass_dbg[0]->backend) {
         char path[256];
         static uint64_t debug_pass_frame = ~0ull;
         static int multi = -1;
@@ -656,7 +659,14 @@ static void vk_end_pass_at(int line) {
         if (multi && renderer_present_count() != debug_pass_frame) { debug_pass_frame = renderer_present_count(); debug_pass_no = 0; }
         if (multi) snprintf(path, sizeof path, "build/pass_%llu_%03d.png", (unsigned long long)debug_pass_frame, debug_pass_no++);
         else snprintf(path, sizeof path, "build/pass_%03d.png", debug_pass_no++);
-        renderer_save_texture_tex(st.rt.color[0]->backend, path);
+        LOG("[pass] %s: %d targets, %d draws\n", path, pass_dbg_n, pass_dbg_draws);
+        renderer_save_texture_tex(pass_dbg[0]->backend, path);
+        for (int i = 1; i < pass_dbg_n; i++) {  // the other targets of a multi-target pass: pass_NNN_c<i>.png
+            if (!pass_dbg[i] || !pass_dbg[i]->backend) continue;
+            char p2[300];
+            snprintf(p2, sizeof p2, "%.*s_c%d.png", (int)strlen(path) - 4, path, i);
+            renderer_save_texture_tex(pass_dbg[i]->backend, p2);
+        }
     }
 }
 
@@ -679,9 +689,25 @@ static void begin_pass(void) {
         gp_mark(cb, "pass: %d color %ux%u fmt %#x, depth %s", st.rt.ncolor, t0 ? t0->width : 0, t0 ? t0->height : 0,
                 t0 ? t0->format : 0, st.rt.depth ? "yes" : "no");
     }
+    {   // one scale for the pass: attachments the size of a scaled one are scaled too (BOTW's G-buffer mixes
+        // targets the scaling heuristic takes and ones it does not; the unscaled ones got only part of the pass)
+        NvnTexture *all[9];
+        int n = 0;
+        for (int i = 0; i < st.rt.ncolor; i++) if (st.rt.color[i]) all[n++] = st.rt.color[i];
+        if (st.rt.depth) all[n++] = st.rt.depth;
+        for (int i = 0; i < n; i++) {
+            if (!renderer_texture_scalable(all[i])) continue;
+            for (int k = 0; k < n; k++)
+                if (all[k]->width == all[i]->width && all[k]->height == all[i]->height) renderer_make_scalable(all[k]);
+            break;
+        }
+    }
     VkRenderingAttachmentInfo ca[8], da = {0}, sa = {0};
     uint32_t w = 0, minw = UINT32_MAX, minh = UINT32_MAX;  // w: first attachment seen
     pass_ncolor = (uint32_t)st.rt.ncolor;
+    pass_dbg_n = st.rt.ncolor > 8 ? 8 : st.rt.ncolor;
+    for (int i = 0; i < pass_dbg_n; i++) pass_dbg[i] = st.rt.color[i];
+    pass_dbg_draws = 0;
     pass_samples = 1;
     for (int i = 0; i < st.rt.ncolor; i++) {
         NvnTexture *t = st.rt.color[i];
@@ -1859,7 +1885,7 @@ static void draw_(CmdRec *r, bool indexed) {
         if (g_debug_frame && getenv("SAVAGEWIND_LOG_FSHASH")) LOG("[fshash] fs=%llx hash %016llx\n", (unsigned long long)fs, (unsigned long long)last_hash);
         g_cur_fs_hash = last_hash;
     }
-    if (g_debug_frame) debug_draw(pr, r, indexed);
+    if (g_debug_frame) { debug_draw(pr, r, indexed); pass_dbg_draws++; }
     resolve_feedback(pr);
     snap_reason = "draw-depthwrite";
     if (st.rt.depth && st.ds[0] && st.ds[1]) snapshots_invalidate(st.rt.depth);
@@ -2172,7 +2198,9 @@ static void debug_draw(Prog *pr, CmdRec *r, bool indexed) {
         (unsigned long long)(indexed ? r->x[6] : r->x[4]), (unsigned long long)r->x[0], (unsigned long long)r->x[2],
         (unsigned long long)st.program->stages[0].code_addr, (unsigned long long)st.program->stages[1].code_addr,
         pr->vi->cbuf_mask, pr->fi->cbuf_mask, st.rt.ncolor);
-    for (int i = 0; i < st.rt.ncolor; i++) if (st.rt.color[i]) LOG(" %ux%u/f%#x", st.rt.color[i]->width, st.rt.color[i]->height, st.rt.color[i]->format);
+    for (int i = 0; i < st.rt.ncolor; i++)
+        if (st.rt.color[i]) LOG(" %ux%u/f%#x/fl%#x@%llx", st.rt.color[i]->width, st.rt.color[i]->height, st.rt.color[i]->format,
+                                st.rt.color[i]->flags, (unsigned long long)st.rt.color[i]->addr);
     if (st.rt.depth) LOG(" d%#x %p", st.rt.depth->format, (void *)st.rt.depth);
     LOG(" | vp %.0f %.0f %.0f %.0f | attrs %#x blend %#x ds %02x%02x%02x poly %02x%02x chmask %08x\n", st.viewport[0][0], st.viewport[0][1],
         st.viewport[0][2], st.viewport[0][3], pr->vi->attr_mask, st.color_state[0], st.ds[0], st.ds[1], st.ds[2], st.poly[0], st.poly[1],

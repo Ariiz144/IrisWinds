@@ -12,9 +12,12 @@
 your own copy of the game: a launcher, PC-style graphics options, mods, any controller, keyboard and mouse.
 
 > [!WARNING]
-> **Not playable yet.** This is early development. Today the game boots, runs its start-up, plays the opening
-> ("Open your eyes...") and draws the first 3D scenes, but the image is heavily corrupted and nothing past that has
-> been tested. There are no releases. Building it is only useful if you want to help develop it.
+> **Not playable yet.** This is early development. Today the game boots to its main menu, which renders correctly,
+> and goes into the first area with its HUD, but the 3D scenes are still mostly dark (the deferred lighting is being
+> fixed) and nothing past that has been tested. There are no releases. Building it is only useful if you want to
+> help develop it.
+
+![Savage Wind Recomp: development status and roadmap](docs/media/status.svg)
 
 > [!NOTE]
 > **No game files are included.** Savage Wind Recomp needs your own legally obtained copy of the game, updated to

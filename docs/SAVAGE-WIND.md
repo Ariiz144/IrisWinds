@@ -16,6 +16,22 @@ Notas de desarrollo. El README explica qué hace falta y las reglas de copyright
 - No se usan marcas de Nintendo en el nombre, los íconos ni los binarios del proyecto.
 - `.gitignore` bloquea `dump/`, `keys/`, `*.keys`, `*.xci`, `*.nsp`, `*.nca` y similares.
 
+## Publicación
+
+GitHub: `Revivedx/SavageWindRecomp` (remote `origin`, privado al crearlo el 2026-10-16). No se sube el historial
+local: la importación de LASRecomp trae capturas de *Link's Awakening* y su randomizer. El `main` remoto es la
+rama local `public`, un commit por publicación con el árbol de `main` y el email noreply de GitHub:
+
+```
+export GIT_AUTHOR_NAME=Revivedx GIT_AUTHOR_EMAIL=82332536+Revivedx@users.noreply.github.com
+export GIT_COMMITTER_NAME=$GIT_AUTHOR_NAME GIT_COMMITTER_EMAIL=$GIT_AUTHOR_EMAIL
+git branch -f public $(git commit-tree "main^{tree}" -p public -m "<qué cambia>")
+git -c credential.helper= -c "credential.helper=!gh auth git-credential" push origin public:main
+```
+
+Antes de cada publicación: `git ls-tree -r --name-only main` no debe tener archivos del juego, código generado,
+keys ni rutas personales.
+
 ## Estructura de entrada esperada
 
 ```
@@ -176,12 +192,30 @@ Pendiente:
        host vive hasta un reinicio.
      - Buffers de onda fuera de la memoria guest se saltean en vez de leerse; pools de descriptores: hasta 64
        por envío.
-   - Ahora: corre más de 100 s sin caerse y presenta frames: los rayos de luz del comienzo y después escenas
-     3D de unos 40.000 draws cada 2 s (12 fps). La imagen sale corrupta. Lo conocido:
-     - El traductor de shaders no tiene `TLD4`/`TLD4S` (gather): esos fragment shaders no se traducen y sus
-       draws se saltean.
-     - Un pool de memoria de 0x7300000 bytes sin storage (virtual): las texturas que caen en él no se suben.
-       Falta `nvnMemoryPoolMapVirtual`.
+   - Resuelto (2026-10-16, segunda tanda):
+     - Shaders: `TLD4`/`TLD4S` (gather), `TMML` (LOD), formas bindless con el handle cargado de `c[2]` justo
+       antes, y `LDS`/`STS` (memoria compartida de compute, tamaño en la sección de control +0x754). Todos los
+       shaders del arranque traducen.
+     - `nvnMemoryPoolMapVirtual`: el juego mapea su pool virtual de texturas (0x7300000) entero sobre uno físico;
+       el pool virtual toma esa memoria.
+     - Render targets re-creados cada frame: BOTW finaliza e inicializa otra vez sus targets en la misma memoria
+       y muestrea los objetos viejos (entradas del texture pool, copias de `NVNtexture`). La imagen de una textura
+       finalizada se estaciona y la toma la próxima textura con la misma memoria y forma; un objeto finalizado se
+       resuelve a la textura hecha después en su memoria. Era la imagen "en bloques".
+     - Cuelgue intermitente (la mitad de las corridas, entre los frames 280 y 1500): `svcWaitProcessWideKeyAtomic`
+       soltaba el mutex antes de marcar el condvar, y quien señalaba se salteaba `svcSignalProcessWideKey`.
+     - Entrada: BOTW lee los controles con `nn::hid::GetNpadStates` (plural), que el HLE no atendía.
+     - Imágenes de texturas finalizadas que se seguían muestreando no se liberaban (el menú agotaba la memoria de
+       video en 2 minutos).
+     - Escala de render targets (la "resolución interna" de LA): apagada salvo `SAVAGEWIND_SCALE_TARGETS=1`; con
+       ella el pipeline diferido de BOTW mostraba solo lo emisivo.
+   - Ahora: el menú principal se ve bien (ilustraciones, texto, "Ver. 1.8.2"). Con `Continue`
+     (`SAVAGEWIND_INPUT="900:A:8,1400:A:8,1900:A:8"`) entra al Santuario de la Resurrección: HUD y textos bien,
+     la escena 3D casi negra con partes rosas y verdes (unos 50.000 draws cada 2 s, 7-12 fps). Lo conocido:
+     - La iluminación diferida no sale: el G-buffer (6-8 targets de 1600x900) tiene geometría y texturas
+       correctas, lo que viene después no.
+     - Texturas de forma distinta en la misma memoria (la cadena de exposición 12x12 → 6x6 → 3x3 muestrea
+       texturas que nunca se dibujaron en el backend): falta propagar entre imágenes que comparten memoria.
      - Faltan `nvnCommandBufferBind*Deferred`.
      - Algunas voces de audio llegan con formato 0 y un buffer sin sentido.
    - Herramientas de diagnóstico:
@@ -192,7 +226,10 @@ Pendiente:
        entrada de esas funciones; `SAVAGEWIND_FNPROF_DEREF=<reg>:<n>` vuelca lo apuntado (y muestra textos).
      - `SAVAGEWIND_NVN_LOG=1`: funciones NVN que el juego busca y enteros del dispositivo que lee.
      - `SAVAGEWIND_CORES=0` / `SAVAGEWIND_ONE_CORE=1`: sin emulación de núcleos / todo en el núcleo 0.
-     - `SAVAGEWIND_SHOT_AT=<frame>,...` (capturas en `build/frames/`) y `SAVAGEWIND_DEBUG_FRAME=<frame>`.
+     - `SAVAGEWIND_SHOT_AT=<frame>,...` (capturas en `build/frames/`) y `SAVAGEWIND_DEBUG_FRAME=<frame>`
+       (cada pase en `build/pass_NNN.png`, `_c<i>` para los demás targets; un frame del juego guarda cientos de
+       imágenes y tarda minutos). `SAVAGEWIND_HIDDEN=1` corre sin ventana visible.
+     - `SAVAGEWIND_SHADER_DUMP=1`: el código Maxwell de los shaders que no traducen, en `build/shaders/`.
      - En Git Bash, `VAR=1 timeout 60 ./build/savagewind.exe` no le pasa la variable al programa: usar
        `timeout 60 env VAR=1 ./build/savagewind.exe`.
      - `tools/ghidra/gq.py data <dirección> [n]` (palabras de 64 bits y a qué apuntan). Con gdb de MSYS2

@@ -150,8 +150,12 @@ void renderer_get_scale(float *sx, float *sy) { *sx = g_rs_x; *sy = g_rs_y; }
 void renderer_set_scale(float sx, float sy) { g_rs_x = sx; g_rs_y = sy; }
 uint64_t renderer_present_count(void);
 
+// Render targets at the output scale (Link's Awakening's "Internal resolution"). Off unless
+// SAVAGEWIND_SCALE_TARGETS=1: BOTW 1.8.2's deferred pipeline came out with only its emissive parts lit with it on.
 static bool tex_scalable(const NvnTexture *t) {
-    if (getenv("SAVAGEWIND_NO_SCALE")) return false;
+    static int on = -1;
+    if (on < 0) on = getenv("SAVAGEWIND_SCALE_TARGETS") && !getenv("SAVAGEWIND_NO_SCALE");
+    if (!on) return false;
     if (t->target != 1 || t->samples > 1 || !(t->flags & 8) || t->width < 32 || t->height < 16) return false;
     float a = (float)t->width / (float)t->height;
     return a > 1.74f && a < 1.81f;
@@ -410,9 +414,30 @@ static TexBackend *parked_take(const NvnTexture *t) {  // (gpu lock held)
     return NULL;
 }
 
+// Zombies: finalized textures that still got an image (sampled through an old pool entry or a copy, with nothing
+// made in their memory since). Nothing will finalize them again, so their images go back to the parked ones once
+// unused for a few frames (BOTW's main menu, cycling its artwork, ran the GPU out of memory without this).
+static NvnTexture **g_zombies;
+static int g_nzombies, g_cap_zombies;
+static void park_backend(NvnTexture *t);
+
+static void zombies_expire(void) {  // (gpu lock held)
+    uint64_t now = renderer_present_count();
+    int k = 0;
+    for (int i = 0; i < g_nzombies; i++) {
+        NvnTexture *t = g_zombies[i];
+        TexBackend *b = t->backend;
+        if (!b) continue;
+        if (now - b->used_frame > PARK_FRAMES) park_backend(t);
+        else g_zombies[k++] = t;
+    }
+    g_nzombies = k;
+}
+
 static TexBackend *tex_backend(NvnTexture *t) {
     TexBackend *b = t->backend;
     if (b) {
+        if (t->finalized) b->used_frame = renderer_present_count();
         if (b->scalable && (b->sx != g_rs_x || b->sy != g_rs_y)) {  // output resolution changed: reallocate
             destroy_image(b);
             create_image(t, b);
@@ -420,6 +445,7 @@ static TexBackend *tex_backend(NvnTexture *t) {
         return b;
     }
     vk_collect_dead();
+    zombies_expire();
     parked_expire();
     b = parked_take(t);
     if (b && b->scalable && (b->sx != g_rs_x || b->sy != g_rs_y)) { destroy_image(b); create_image(t, b); }
@@ -430,11 +456,18 @@ static TexBackend *tex_backend(NvnTexture *t) {
     }
     t->backend = b;
     live_add(t, b);
+    if (t->finalized) {
+        b->used_frame = renderer_present_count();
+        if (g_nzombies == g_cap_zombies) {
+            g_cap_zombies = g_cap_zombies ? g_cap_zombies * 2 : 64;
+            g_zombies = realloc(g_zombies, g_cap_zombies * sizeof *g_zombies);
+        }
+        g_zombies[g_nzombies++] = t;
+    }
     return b;
 }
 
-void backend_texture_destroyed(NvnTexture *t) {
-    gpu_lock();
+static void park_backend(NvnTexture *t) {  // (gpu lock held) its image waits for the next texture made in its memory
     TexBackend *b = t->backend;
     if (b) {
         live_remove(b);
@@ -450,6 +483,11 @@ void backend_texture_destroyed(NvnTexture *t) {
         }
     }
     t->backend = NULL;
+}
+
+void backend_texture_destroyed(NvnTexture *t) {
+    gpu_lock();
+    park_backend(t);
     gpu_unlock();
 }
 
@@ -459,6 +497,7 @@ void vk_textures_reset(void) {
     while (g_nlive > 0) backend_texture_destroyed(g_live[g_nlive - 1]);
     for (int i = 0; i < g_nparked; i++) free_backend(g_parked[i].b);
     g_nparked = 0;
+    g_nzombies = 0;
     vk_collect_dead();
     LOG("[vk] reboot: %d textures released\n", n);
 }
@@ -632,6 +671,18 @@ TexBackend *vk_tex(NvnTexture *t, bool for_render) {
 }
 
 void renderer_mark_gpu_owned(NvnTexture *t) { tex_backend(t)->gpu_owned = true; }
+
+bool renderer_texture_scalable(NvnTexture *t) { return tex_backend(t)->scalable; }
+
+// Render at the output scale from now on: a target drawn into together with scaled ones (its contents so far, kept
+// at the guest size, are dropped: the pass about to run writes it).
+void renderer_make_scalable(NvnTexture *t) {
+    TexBackend *b = tex_backend(t);
+    if (b->scalable || t->target != 1 || t->samples > 1) return;
+    b->scalable = true;
+    destroy_image(b);
+    create_image(t, b);
+}
 bool renderer_is_gpu_owned(NvnTexture *t) { return tex_backend(t)->gpu_owned; }
 void backend_pool_written(uint64_t addr, uint64_t size) { (void)addr; (void)size; }
 

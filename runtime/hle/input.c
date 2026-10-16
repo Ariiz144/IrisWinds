@@ -427,6 +427,31 @@ HLE_FUNC("_ZN2nn3hid12GetNpadStateEPNS0_16NpadJoyLeftStateERKj", hid_state_left)
 HLE_FUNC("_ZN2nn3hid12GetNpadStateEPNS0_17NpadHandheldStateERKj", hid_state_handheld) { fill_state(c); }
 HLE_FUNC("_ZN2nn3hid12GetNpadStateEPNS0_17NpadJoyRightStateERKj", hid_state_right) { fill_state(c); }
 
+// int GetNpadStates(State *out, int count, const NpadIdType &id): the newest `count` samples, newest first (BOTW
+// 1.8.2 reads its controllers only this way). Every sample is the current state, with sampling numbers counting
+// back from the newest.
+static void fill_states(Cpu *c) {
+    uint8_t *out = (uint8_t *)(uintptr_t)c->x[0];
+    int count = (int)c->x[1];
+    uint64_t id_ptr = c->x[2];
+    if (!out || count <= 0) { c->x[0] = 0; return; }
+    uint64_t saved = c->x[1];
+    c->x[1] = id_ptr;  // (fill_state's arguments: state, &id)
+    fill_state(c);
+    c->x[1] = saved;
+    int64_t newest = *(int64_t *)out;
+    for (int i = 1; i < count; i++) {
+        memcpy(out + 0x28 * i, out, 0x28);
+        *(int64_t *)(out + 0x28 * i) = newest - i;
+    }
+    c->x[0] = (uint64_t)count;
+}
+HLE_FUNC("_ZN2nn3hid13GetNpadStatesEPNS0_16NpadFullKeyStateEiRKj", hid_states_fullkey) { fill_states(c); }
+HLE_FUNC("_ZN2nn3hid13GetNpadStatesEPNS0_16NpadJoyDualStateEiRKj", hid_states_dual) { fill_states(c); }
+HLE_FUNC("_ZN2nn3hid13GetNpadStatesEPNS0_16NpadJoyLeftStateEiRKj", hid_states_left) { fill_states(c); }
+HLE_FUNC("_ZN2nn3hid13GetNpadStatesEPNS0_17NpadHandheldStateEiRKj", hid_states_handheld) { fill_states(c); }
+HLE_FUNC("_ZN2nn3hid13GetNpadStatesEPNS0_17NpadJoyRightStateEiRKj", hid_states_right) { fill_states(c); }
+
 // FullKey for player 1 only (we report docked mode, where Handheld is unavailable)
 HLE_FUNC("_ZN2nn3hid15GetNpadStyleSetERKj", hid_style_set) {
     uint32_t id = *(uint32_t *)(uintptr_t)c->x[0];

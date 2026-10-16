@@ -456,12 +456,15 @@ static uint32_t svc_arbitrate_unlock(uint64_t addr) {
 static uint32_t svc_wait_process_wide_key(uint64_t mutex, uint64_t key, uint32_t tag, int64_t timeout) {
     pthread_mutex_lock(&g_klock);
     KThread *t = t_cur;
-    mutex_release(mutex);
+    // The key says "a thread waits" before the mutex is let go, as the real kernel orders it: a signaller takes
+    // the mutex in user mode the moment it is free and skips svcSignalProcessWideKey when the key reads 0. Released
+    // first, the wakeup could be lost and both sides wait for good (BOTW 1.8.2's job queues hung that way).
+    __atomic_store_n(u32p(key), 1, __ATOMIC_SEQ_CST);
     t->wait_kind = WAIT_CONDVAR;
     t->wait_addr = key;
     t->wait_mutex = mutex;
     t->wait_tag = tag;
-    __atomic_store_n(u32p(key), 1, __ATOMIC_SEQ_CST);
+    mutex_release(mutex);
     uint32_t r = block_current(timeout);
     if (r != R_OK) {
         // timed out / cancelled: still must reacquire the mutex

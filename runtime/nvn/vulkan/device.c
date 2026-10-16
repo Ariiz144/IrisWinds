@@ -446,11 +446,17 @@ void vk_frame_end(const char *shot_path) {
     }
 }
 
+// Saved opaque: render targets often keep data in alpha (BOTW's G-buffer), which image viewers turn into black.
 void vk_save_png(const char *path, const uint8_t *rgba, uint32_t w, uint32_t h) {
-    SDL_Surface *s = SDL_CreateSurfaceFrom((int)w, (int)h, SDL_PIXELFORMAT_ABGR8888, (void *)rgba, (int)w * 4);
+    uint8_t *px = malloc((size_t)w * h * 4);
+    if (!px) return;
+    memcpy(px, rgba, (size_t)w * h * 4);
+    for (size_t i = 3; i < (size_t)w * h * 4; i += 4) px[i] = 255;
+    SDL_Surface *s = SDL_CreateSurfaceFrom((int)w, (int)h, SDL_PIXELFORMAT_ABGR8888, px, (int)w * 4);
     if (!s || !SDL_SavePNG(s, path)) LOG("[vk] saving %s failed: %s\n", path, SDL_GetError());
     else LOG("[vk] saved %s (%ux%u)\n", path, w, h);
     SDL_DestroySurface(s);
+    free(px);
 }
 
 // ================================================================== game presentation (metal.m backend_present)
