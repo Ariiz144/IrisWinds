@@ -11,6 +11,7 @@
 #include <atomic>
 #include <vector>
 
+#include "i18n.h"
 #include "imgui.h"
 #include "option_rows.h"
 #include "imgui_internal.h"  // (NavCursorVisible)
@@ -25,6 +26,9 @@ extern "C" bool vk_imgui_backend_init(void);  // runtime/nvn/vulkan/imgui_glue.c
 extern "C" {
 #include "../hle.h"
 #include "../settings.h"
+extern "C" {
+#include "../language.h"
+}
 #include "menu.h"
 void input_reset(void);
 void controls_bindings_draw(float scale);  // controls_ui.mm
@@ -316,6 +320,55 @@ static void style_init(void) {
 }
 
 
+// The fonts, with the menu language's glyphs that Latin fonts lack merged in (runtime/ui/i18n.mm); made again when the
+// menu language changes (fonts_follow_language).
+static int g_fonts_lang = -1;
+static void load_fonts(void) {
+    ImGuiIO &io = ImGui::GetIO();
+    io.Fonts->Clear();
+    g_font = g_font_big = g_menu_font = g_menu_font_big = NULL;
+    g_fonts_lang = ui_lang_generation();
+    ImFontConfig cfg;
+    cfg.OversampleH = 2;
+    auto add = [&](const char *path, float size, ImFontConfig c) {
+        ImFont *f = io.Fonts->AddFontFromFileTTF(path, size, &c);
+        if (f) ui_merge_fallback_font(io.Fonts, size, &cfg);
+        return f;
+    };
+    const char *paths[] = {"/System/Library/Fonts/Avenir Next.ttc", "/System/Library/Fonts/Helvetica.ttc",
+                           "C:/Windows/Fonts/segoeui.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+                           "/usr/share/fonts/TTF/DejaVuSans.ttf", "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf"};
+    for (const char *p : paths) {
+        if (FILE *f = fopen(p, "rb")) fclose(f);  // a missing file is an assertion in ImGui, not a NULL return
+        else continue;
+        if (!g_font) g_font = add(p, 34, cfg);
+        if (g_font && !g_font_big) { ImFontConfig b = cfg; b.FontNo = 0; g_font_big = add(p, 56, b); }
+    }
+    // the menu window itself: Baloo 2 SemiBold, as on the start screen (shipped, OFL), at its Settings window's sizes; the
+    // FPS counter, overlays and on-screen keyboard keep the fonts above
+    char baloo[1024];
+    if (const char *f = getenv("SAVAGEWIND_MENU_FONT")) strlcpy(baloo, f, sizeof baloo);  // (test) another weight / face
+    if (getenv("SAVAGEWIND_MENU_FONT") || rt_resource("Baloo2-SemiBold.ttf", "third_party/fonts/Baloo2/Baloo2-SemiBold.ttf", baloo, sizeof baloo)) {
+        g_menu_font = add(baloo, 39, cfg);
+        g_menu_font_big = add(baloo, 72, cfg);
+    }
+    if (!g_font) g_font = io.Fonts->AddFontDefault();
+    if (!g_font_big) g_font_big = g_font;
+    if (!g_menu_font || !g_menu_font_big) g_menu_font = g_font, g_menu_font_big = g_font_big;
+}
+
+// Before a frame: another menu language may need other glyphs - the fonts and their texture are made again
+extern "C" void vk_imgui_fonts_changed(void);  // (runtime/nvn/vulkan/imgui_glue.cpp)
+static void fonts_follow_language(void) {
+    if (g_fonts_lang == ui_lang_generation()) return;
+    load_fonts();
+#ifdef __APPLE__
+    ImGui_ImplMetal_DestroyFontsTexture();  // (NewFrame makes it again)
+#else
+    vk_imgui_fonts_changed();
+#endif
+}
+
 #ifdef __APPLE__
 static void init(id<MTLDevice> dev) {
 #else
@@ -328,28 +381,7 @@ static void init(void) {
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard | ImGuiConfigFlags_NavEnableGamepad;
     io.BackendFlags |= ImGuiBackendFlags_HasGamepad;
     io.IniFilename = NULL;
-    ImFontConfig cfg;
-    cfg.OversampleH = 2;
-    const char *paths[] = {"/System/Library/Fonts/Avenir Next.ttc", "/System/Library/Fonts/Helvetica.ttc",
-                           "C:/Windows/Fonts/segoeui.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-                           "/usr/share/fonts/TTF/DejaVuSans.ttf", "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf"};
-    for (const char *p : paths) {
-        if (FILE *f = fopen(p, "rb")) fclose(f);  // a missing file is an assertion in ImGui, not a NULL return
-        else continue;
-        if (!g_font) g_font = io.Fonts->AddFontFromFileTTF(p, 34, &cfg);
-        if (g_font && !g_font_big) { ImFontConfig b = cfg; b.FontNo = 0; g_font_big = io.Fonts->AddFontFromFileTTF(p, 56, &b); }
-    }
-    // the menu window itself: Baloo 2 SemiBold, as on the start screen (shipped, OFL), at its Settings window's sizes; the
-    // FPS counter, overlays and on-screen keyboard keep the fonts above
-    char baloo[1024];
-    if (const char *f = getenv("SAVAGEWIND_MENU_FONT")) strlcpy(baloo, f, sizeof baloo);  // (test) another weight / face
-    if (getenv("SAVAGEWIND_MENU_FONT") || rt_resource("Baloo2-SemiBold.ttf", "third_party/fonts/Baloo2/Baloo2-SemiBold.ttf", baloo, sizeof baloo)) {
-        g_menu_font = io.Fonts->AddFontFromFileTTF(baloo, 39, &cfg);
-        g_menu_font_big = io.Fonts->AddFontFromFileTTF(baloo, 72, &cfg);
-    }
-    if (!g_font) g_font = io.Fonts->AddFontDefault();
-    if (!g_font_big) g_font_big = g_font;
-    if (!g_menu_font || !g_menu_font_big) g_menu_font = g_font, g_menu_font_big = g_font_big;
+    load_fonts();
     style_init();
 #ifdef __APPLE__
     ImGui_ImplMetal_Init(dev);
@@ -379,7 +411,7 @@ static void drain_events(ImGuiIO &io) {
 // Section header in the big font.
 static void header(const char *t) {
     ImGui::PushFont(g_font_big);
-    ImGui::TextColored(ImVec4(0.93f, 0.76f, 0.33f, 1), "%s", t);
+    ImGui::TextColored(ImVec4(0.93f, 0.76f, 0.33f, 1), "%s", tr(t));
     ImGui::PopFont();
     ImGui::Separator();
     ImGui::Spacing();
@@ -387,7 +419,7 @@ static void header(const char *t) {
 
 static void hint(const char *t) {
     ImGui::PushTextWrapPos(0);
-    ImGui::TextDisabled("%s", t);
+    ImGui::TextDisabled("%s", tr(t));
     ImGui::PopTextWrapPos();
 }
 
@@ -396,13 +428,15 @@ static void hint(const char *t) {
 static bool choice(const char *label, int *value, const char *const *names, int n, float reserve = 0) {
     ImGui::PushID(label);
     ImGui::AlignTextToFramePadding();
-    ImGui::TextUnformatted(label);
+    ImGui::TextUnformatted(tr(label));
     ImGui::SameLine(ImGui::GetContentRegionAvail().x * 0.45f);
     bool changed = false;
     ImGui::SetNextItemWidth(reserve > 0 ? -reserve : -1);
-    if (ImGui::BeginCombo("##c", names[*value])) {
+    if (ImGui::BeginCombo("##c", tr(names[*value]))) {
         for (int i = 0; i < n; i++) {
-            if (ImGui::Selectable(names[i], i == *value)) { *value = i; changed = true; }
+            ImGui::PushID(i);
+            if (ImGui::Selectable(tr(names[i]), i == *value)) { *value = i; changed = true; }
+            ImGui::PopID();
             if (i == *value) ImGui::SetItemDefaultFocus();
         }
         ImGui::EndCombo();
@@ -458,12 +492,12 @@ static void tab_display(void) {
         float sx, sy;
         renderer_get_scale(&sx, &sy);
         char d[400];
-        int n = snprintf(d, sizeof d, "How sharp the 3D image is. Match display: your screen's own resolution. Dynamic: "
-                                      "as sharp as your GPU keeps at full speed. 1x-4x: the Switch's 1080p times that. "
-                                      "75%% / 50%% / 25%%: a share of the display, for slower machines.\n\nRendering at "
-                                      "%.0f x %.0f.", 1920.0 * sx, 1080.0 * sy);
-        if (g_settings.res_mode == RES_DYNAMIC)
-            snprintf(d + n, sizeof d - n, " Dynamic: %.0f%% of the display right now.", output_scale_dynamic_factor() * 100);
+        int n = snprintf(d, sizeof d, tr("How sharp the 3D image is. Match display: your screen's own resolution. Dynamic: "
+                                         "as sharp as your GPU keeps at full speed. 1x-4x: the Switch's 1080p times that. "
+                                         "75%% / 50%% / 25%%: a share of the display, for slower machines.\n\nRendering at "
+                                         "%.0f x %.0f."), 1920.0 * sx, 1080.0 * sy);
+        if (g_settings.res_mode == RES_DYNAMIC && n > 0 && n < (int)sizeof d)
+            snprintf(d + n, sizeof d - n, tr(" Dynamic: %.0f%% of the display right now."), output_scale_dynamic_factor() * 100);
         if (opt_choice("Internal resolution", &ri, res, NRES, RES_MATCH_AT, d, false)) g_settings.res_mode = res_mode[ri];
     }
     {   // each OS's own upscaler next to bilinear (UPSCALE_SHARP: MetalFX on macOS, AMD FSR 1 on Windows)
@@ -479,7 +513,7 @@ static void tab_display(void) {
         int ui = g_settings.upscaler == UPSCALE_BILINEAR ? 0 : 1;
         char udm[512];
         if (g_settings.res_mode == RES_MATCH) {  // (renders at the window's size: nothing to scale up)
-            snprintf(udm, sizeof udm, "%s\n\nNot used at Match display: the game already renders at your display's resolution.", ud);
+            snprintf(udm, sizeof udm, tr("%s\n\nNot used at Match display: the game already renders at your display's resolution."), tr(ud));
             ud = udm;
             opt_disable_next();
         }
@@ -511,6 +545,34 @@ static void tab_audio(void) {
     opt_end();
 }
 
+extern "C" void rt_request_reboot(int kind);  // runtime/main.c (RT_REBOOT_GAME = 1, RT_REBOOT_TITLE = 2)
+
+// Text and voice languages (runtime/language.c). The game reads both when it starts: in game they apply after
+// Quit > Start screen and Play.
+static void tab_language(bool in_game) {
+    opt_begin("##language", ImGui::GetFontSize() / 34);
+    opt_section("Language");
+    static const char *tnames[32], *vnames[32];
+    for (int i = 0; i < g_ntext_languages && i < 32; i++) tnames[i] = g_text_languages[i].name;
+    for (int i = 0; i < g_nvoice_languages && i < 32; i++) vnames[i] = g_voice_languages[i].name;
+    const char *later = in_game ? tr("\n\nApplies the next time the game starts: Restart now below, or Quit > Start "
+                                     "screen, then Play.") : "";
+    char d1[600], d2[800];
+    snprintf(d1, sizeof d1, tr("The language of the game's texts and of these menus. Auto: your system's language "
+                               "(English if the game doesn't have it).%s"), later);
+    snprintf(d2, sizeof d2, tr("The language the characters speak. Same as text: the voices the game picks for the text "
+                               "language (Japanese for Korean and Chinese, English for the other languages it has no "
+                               "voices for). Any other: those voices with any text language.%s"), later);
+    opt_choice("Text", &g_settings.text_language, tnames, g_ntext_languages, 0, d1, false);
+    opt_choice("Voices", &g_settings.voice_language, vnames, g_nvoice_languages, 0, d2, false);
+    if (in_game && language_pending() &&
+        opt_button("Restart now", "Starts the game again with these languages. Progress since your last save is lost.")) {
+        settings_save();
+        rt_request_reboot(1);  // (RT_REBOOT_GAME: boot again at once)
+    }
+    opt_end();
+}
+
 // Quit: back to the start screen (in game: the game reboots to it) or out to the desktop. Each asks first (progress
 // since the last save is lost); B / Esc or Cancel backs out.
 extern "C" void rt_request_reboot(int kind);  // runtime/main.c (RT_REBOOT_TITLE = 2: the start screen)
@@ -518,10 +580,10 @@ static void tab_quit(float scale, bool in_game) {
     static int ask;  // 0: the two choices; 1: start screen?; 2: desktop?
     if (ask && (ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false) || ImGui::IsKeyPressed(ImGuiKey_Escape, false)))
         ask = 0;
-    const char *lost = in_game ? "\n\nProgress since your last save is lost." : "";
-    char d1[200], d2[200];
-    snprintf(d1, sizeof d1, "Leaves the game and goes back to the Savage Wind start screen.%s", lost);
-    snprintf(d2, sizeof d2, "Closes Savage Wind.%s", lost);
+    const char *lost = in_game ? tr("\n\nProgress since your last save is lost.") : "";
+    char d1[400], d2[400];
+    snprintf(d1, sizeof d1, tr("Leaves the game and goes back to the Savage Wind start screen.%s"), lost);
+    snprintf(d2, sizeof d2, tr("Closes Savage Wind.%s"), lost);
     opt_begin("##quit", scale);
     opt_section("Quit");
     if (!ask) {
@@ -563,9 +625,9 @@ static void tab_about(void) {
     controls_bindings_draw(ImGui::GetFontSize() / 34);
     ImGui::Spacing();
     header("Menu");
-    ImGui::TextUnformatted("Open / close this menu:  F1, Esc, the controller's Home / Xbox / PlayStation button, or Back + Start");
-    ImGui::TextUnformatted("Switch tabs:  L / R  (Q / E)        Back:  B  (Esc)");
-    ImGui::TextUnformatted("Fullscreen:  F11 / Alt+Enter");
+    ImGui::TextUnformatted(tr("Open / close this menu:  F1, Esc, the controller's Home / Xbox / PlayStation button, or Back + Start"));
+    ImGui::TextUnformatted(tr("Switch tabs:  L / R  (Q / E)        Back:  B  (Esc)"));
+    ImGui::TextUnformatted(tr("Fullscreen:  F11 / Alt+Enter"));
 }
 
 // Reboot (runtime/main.c): the game is gone - menu and name dialog close; the ImGui context stays.
@@ -608,16 +670,16 @@ static void perf_overlay_draw(ImGuiIO &io, float scale) {
         perf_cell("%.2f GB", s.vram_used_mb < 0 ? -1 : s.vram_used_mb / 1024); perf_cell("/ %.1f GB", s.vram_total_mb < 0 ? -1 : s.vram_total_mb / 1024);
         perf_cell("%.0f MHz", s.gpu_clock_mhz);
         ImGui::TableNextColumn(); ImGui::TextColored(cpu_c, "CPU");
-        perf_cell("%.0f%%", s.cpu_total_pct); perf_cell("%.0f C", s.cpu_temp_c); perf_cell("game %.0f%%", s.cpu_game_pct);
+        perf_cell("%.0f%%", s.cpu_total_pct); perf_cell("%.0f C", s.cpu_temp_c); perf_cell(tr("game %.0f%%"), s.cpu_game_pct);
         ImGui::TableNextColumn(); ImGui::TextColored(ram_c, "RAM");
-        perf_cell("%.1f GB", s.ram_used_mb / 1024); perf_cell("/ %.1f GB", s.ram_total_mb / 1024); perf_cell("game %.1f GB", s.ram_game_mb / 1024);
+        perf_cell("%.1f GB", s.ram_used_mb / 1024); perf_cell("/ %.1f GB", s.ram_total_mb / 1024); perf_cell(tr("game %.1f GB"), s.ram_game_mb / 1024);
         ImGui::TableNextColumn(); ImGui::TextColored(fps_c, "FPS");
-        perf_cell("%.0f", s.fps); perf_cell("%.1f ms", s.frame_ms_avg); perf_cell("max %.1f ms", s.frame_ms_max);
+        perf_cell("%.0f", s.fps); perf_cell("%.1f ms", s.frame_ms_avg); perf_cell(tr("max %.1f ms"), s.frame_ms_max);
         ImGui::EndTable();
     }
     float top = s.frame_ms_max > 50 ? s.frame_ms_max : 50;
     ImGui::PlotLines("##ft", s.frame_ms, PERF_HISTORY, 0, NULL, 0, top, ImVec2(330 * scale, 48 * scale));
-    ImGui::TextDisabled("%s", s.gpu_name[0] ? s.gpu_name : "GPU: no NVML / sysfs data");
+    ImGui::TextDisabled("%s", s.gpu_name[0] ? s.gpu_name : tr("GPU: no NVML / sysfs data"));
     ImGui::TextDisabled("%s", s.cpu_name);
     ImGui::End();
 }
@@ -630,7 +692,7 @@ static void keyboard_draw(ImGuiIO &io, float scale) {
     ImGui::Begin("##kbd", NULL, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings |
                                     ImGuiWindowFlags_AlwaysAutoResize);
     ImGui::PushFont(g_font_big);
-    ImGui::TextColored(ImVec4(0.93f, 0.76f, 0.33f, 1), "Enter your name");
+    ImGui::TextColored(ImVec4(0.93f, 0.76f, 0.33f, 1), "%s", tr("Enter your name"));
     ImGui::PopFont();
     static bool was_open, was_pad;
     bool pad = g_last_pad.load(), appearing = !was_open || pad != was_pad;  // (switching device: focus the new one)
@@ -644,7 +706,7 @@ static void keyboard_draw(ImGuiIO &io, float scale) {
                          [](ImGuiInputTextCallbackData *d) -> int { return d->EventChar < 0x20 ? 1 : 0; });
         ImGui::PopFont();
         if ((int)strlen(g_kbd_text) > g_kbd_max) g_kbd_text[g_kbd_max] = 0;
-        ImGui::TextDisabled("Enter  confirm      Esc  cancel      (%d / %d)", (int)strlen(g_kbd_text), g_kbd_max);
+        ImGui::TextDisabled(tr("Enter  confirm      Esc  cancel      (%d / %d)"), (int)strlen(g_kbd_text), g_kbd_max);
     } else {  // controller: on-screen keyboard (osk.mm, shared with our menus' text fields)
         int r = osk_keys(g_kbd_text, sizeof g_kbd_text, g_kbd_max, appearing, scale, g_font_big);
         if (r) g_kbd = r > 0 ? 2 : 3;  // (Start / + confirms in menu_handle_event too)
@@ -686,8 +748,8 @@ static void tabs_body(float scale, bool in_game, void (*prelaunch)(float)) {
     int ntabs = 0;
     if (prelaunch) tabs[ntabs++] = {"Prelaunch", -1, true};
     // (ids 2-7 were Link's Awakening tabs; the ids stay: test hooks)
-    static const char *names[] = {"Video", "Audio", "", "", "", "", "", "", "Controls", "Quit"};
-    static const int order[] = {8, 0, 1, 9};  // Controls, Video, Audio, Quit
+    static const char *names[] = {"Video", "Audio", "Language", "", "", "", "", "", "Controls", "Quit"};
+    static const int order[] = {8, 0, 1, 2, 9};  // Controls, Video, Audio, Language, Quit
     for (int i : order)  // (Quit: in game only - the start screen has its own QUIT)
         if (i != 9 || !prelaunch) tabs[ntabs++] = {names[i], i, true};
     int cur = 0;  // g_tab / g_tab_request hold ids
@@ -718,8 +780,8 @@ static void tabs_body(float scale, bool in_game, void (*prelaunch)(float)) {
         for (int k = 0; k < ntabs; k++) {
             const Tab &t = tabs[k];
             ImGuiTabItemFlags f = g_tab_request == t.id && t.on ? ImGuiTabItemFlags_SetSelected : 0;
-            char lbl[64];
-            snprintf(lbl, sizeof lbl, prelaunch ? " %s " : "  %s  ", t.name);
+            char lbl[160];
+            snprintf(lbl, sizeof lbl, prelaunch ? " %s ###%s" : "  %s  ###%s", tr(t.name), t.name);  // (### : ID stays English)
             ImGui::BeginDisabled(!t.on);
             // focus (controller / keyboard): the tab lights up a little with a gold bar along its bottom, instead of
             // ImGui's outline (it sits 4 px outside the tab and the tab bar's clipping could cut its top off on macOS)
@@ -766,6 +828,7 @@ static void tabs_body(float scale, bool in_game, void (*prelaunch)(float)) {
                 case -1: prelaunch(scale); break;
                 case 0: tab_display(); break;
                 case 1: tab_audio(); break;
+                case 2: tab_language(in_game); break;
                 case 8: tab_about(); break;
                 case 9: tab_quit(scale, in_game); break;
                 }
@@ -839,6 +902,7 @@ void menu_render(void *cmd, uint32_t target_w, uint32_t target_h) {
         ImGui::GetStyle().ScaleAllSizes(scale);
         style_scale = scale;
     }
+    fonts_follow_language();
 #ifdef __APPLE__
     ImGui_ImplMetal_NewFrame(rp);
 #else
@@ -861,7 +925,7 @@ void menu_render(void *cmd, uint32_t target_w, uint32_t target_h) {
         // header as on the start screen's Settings: the title, and a close X in the corner (B / Esc too). ("Title
         // screen" - rt_request_reboot(RT_REBOOT_TITLE) - is to find a new home; user 2026-10-11.)
         ImGui::PushFont(g_font_big);
-        ImGui::TextColored(ImVec4(0.93f, 0.76f, 0.33f, 1), "Settings");
+        ImGui::TextColored(ImVec4(0.93f, 0.76f, 0.33f, 1), "%s", tr("Settings"));
         ImGui::PopFont();
         {
             float bx = 44 * scale;

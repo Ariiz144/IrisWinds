@@ -232,7 +232,7 @@ static void attr_load(Ctx *c, int dst, uint32_t addr, const char *idx) {
             c->in_attr_mask |= 1u << a;
             c->vs_in_comp[a] |= 1u << comp;
             int kind = c->key ? c->key->attr_kind[a] : 0;
-            if (kind == 0) sprintf(e, "as_type<uint>(in.a%d[%d])", a, comp);
+            if (kind >= 3) sprintf(e, "as_type<uint>(float(in.a%d[%d]))", a, comp);  // integer formats read as float
             else sprintf(e, "as_type<uint>(in.a%d[%d])", a, comp);
         } else if (addr == 0x2F8) { c->uses_iid = true; strcpy(e, "iid"); }
         else if (addr == 0x2FC) { c->uses_vid = true; strcpy(e, "vid"); }
@@ -752,23 +752,45 @@ static void emit_texs(Ctx *c, uint64_t w, bool fetch) {
     write_tex_result(c, slot, call, mask, d0, d1, true, !bits(w, 59, 1));  // 0xd0/0xd2: .F16 results
 }
 
+// Whether bits 0-7 of w name a register the instruction writes. Not for the compares that set predicates there
+// (FSETP P0, PT reads as R7), stores (the data register), R2P and flow control.
+static bool writes_gpr(uint64_t w) {
+    static const uint16_t none[][2] = {  // top 16 bits: value, mask
+        {0x5bb0, 0xfff0}, {0x4bb0, 0xfff0}, {0x36b0, 0xfef0},  // FSETP
+        {0x5b60, 0xfff0}, {0x4b60, 0xfff0}, {0x3660, 0xfef0},  // ISETP
+        {0x5d20, 0xfff8}, {0x5090, 0xfff8}, {0x50a0, 0xfff8},  // HSETP2, PSETP, CSETP
+        {0x38f0, 0xfef8}, {0x5cf0, 0xfff8}, {0x4cf0, 0xfff8},  // R2P
+        {0xeff0, 0xfff8}, {0xeed8, 0xfff8}, {0xef50, 0xfff8}, {0xef58, 0xfff8},  // ST attribute, STG, STL, STS
+        {0xe300, 0xfff0}, {0xe330, 0xfff0}, {0xe240, 0xfff0}, {0xe250, 0xfff0},  // EXIT, KIL, BRA, BRX
+        {0xe290, 0xfff0}, {0xe2a0, 0xfff0}, {0xe2b0, 0xfff0}, {0xe340, 0xfff0}, {0xe350, 0xfff0},  // SSY PBK PCNT BRK CONT
+        {0xf0f8, 0xfff8}, {0xf0f0, 0xfff8}, {0x50b0, 0xfff8}, {0xef98, 0xfff8}, {0xf0a8, 0xfff8},  // SYNC DEPBAR NOP MEMBAR BAR
+    };
+    uint16_t op = (uint16_t)(w >> 48);
+    for (size_t i = 0; i < sizeof none / sizeof none[0]; i++)
+        if ((op & none[i][1]) == none[i][0]) return false;
+    return true;
+}
+
 // A bindless handle in register r, read by the instruction at pc. When the nearest earlier write of r is
 // MOV r, c[2][off] or LDC r, c[2][off] (the bound texture handles, where the bound forms' TidB points as well), the
-// lookup is the bound one with TidB off / 4: returns that, or -1. BOTW 1.8.2 loads the handle right before
-// (MOV R11, c[2][0x20]; TMML.B ... R11). The scan is linear: a write of r on another path in between is not seen.
+// lookup is the bound one with TidB off / 4: returns that, or -1. A MOV r, Rs follows Rs back from there. BOTW 1.8.2
+// loads the handle right before (MOV R11, c[2][0x20]; TMML.B ... R11). The scan is linear: a write of r on another
+// path in between is not seen.
 static int bindless_index(Ctx *c, uint32_t pc, int r) {
     if (r == RZ) return -1;
     const uint64_t *code = (const uint64_t *)c->code;
     for (int64_t i = (int64_t)(pc / 8) - 1; i >= 0 && (int64_t)(pc / 8) - i < 512; i--) {
         if (i % 4 == 0) continue;  // scheduling words
         uint64_t w = code[i];
-        if ((int)bits(w, 0, 8) != r) continue;
+        if ((int)bits(w, 0, 8) != r || !writes_gpr(w)) continue;
         bool always = bits(w, 16, 3) == PT && !bits(w, 19, 1);
         if (always && (w & 0xfff8000000000000ull) == 0x4c98000000000000ull && bits(w, 34, 5) == 2)  // MOV c[2][]
             return (int)bits(w, 20, 14);
         if (always && (w & 0xfff8000000000000ull) == 0xef90000000000000ull && bits(w, 8, 8) == RZ &&  // LDC c[2][]
             bits(w, 36, 5) == 2 && bits(w, 48, 3) == 4)
             return (int)(bits(w, 20, 16) / 4);
+        if (always && (w & 0xfff8000000000000ull) == 0x5c98000000000000ull && bits(w, 39, 4) == 0xf)  // MOV r, Rs
+            return bindless_index(c, (uint32_t)(i * 8), (int)bits(w, 20, 8));
         return -1;  // written by something else
     }
     return -1;
@@ -2017,7 +2039,7 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
         for (int i = 0; i < 32; i++) {
             if (!(c->in_attr_mask & (1u << i))) continue;
             int kind = key ? key->attr_kind[i] : 0;
-            sp(&s, "layout(location = %d) in %s a%d;\n", i, kind == 1 ? "ivec4" : kind == 2 ? "uvec4" : "vec4", i);
+            sp(&s, "layout(location = %d) in %s a%d;\n", i, kind == 1 || kind == 3 ? "ivec4" : kind == 2 || kind == 4 ? "uvec4" : "vec4", i);
         }
         // depth pre-pass + EQUAL test needs identical positions from different shaders: invariant, and precise so no
         // compiler fuses or reorders the math feeding it (MSL gets this from preserveInvariance; without it foliage
@@ -2206,7 +2228,7 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
         for (int i = 0; i < 32; i++) {
             if (!(c->in_attr_mask & (1u << i))) continue;
             int kind = key ? key->attr_kind[i] : 0;
-            sp(&s, "  %s4 a%d [[attribute(%d)]];\n", kind == 1 ? "int" : kind == 2 ? "uint" : "float", i, i);
+            sp(&s, "  %s4 a%d [[attribute(%d)]];\n", kind == 1 || kind == 3 ? "int" : kind == 2 || kind == 4 ? "uint" : "float", i, i);
         }
         sp(&s, "};\n");
         sp(&s, "struct VOut {\n  float4 pos [[position, invariant]];\n");  // depth pre-pass + EQUAL test needs identical positions

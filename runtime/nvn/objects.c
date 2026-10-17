@@ -618,13 +618,33 @@ static NvnSamplerDesc sampler_desc_from_builder(const NvnSamplerBuilderState *b)
     return d;
 }
 
+// An NVNsampler holds a pointer to its description, and the game copies sampler objects by value (registering the
+// copy later): descriptions are shared per distinct setting and never freed, so a copy made before the original
+// was finalized still names its own settings. (Each object owning a malloc'd description gave the copy a dangling
+// pointer; once the memory went to another sampler, the pool slot got that sampler's wrap and filters, and the
+// Shrine of Resurrection's walkway texture was clamped instead of repeated in some runs.)
+static pthread_mutex_t sampler_lock = PTHREAD_MUTEX_INITIALIZER;
+static NvnSamplerDesc *sampler_intern(const NvnSamplerDesc *want) {
+    static NvnSamplerDesc **tab;
+    static size_t n, cap;
+    pthread_mutex_lock(&sampler_lock);
+    NvnSamplerDesc *d = NULL;
+    for (size_t i = 0; i < n && !d; i++) if (!memcmp(tab[i], want, sizeof *want)) d = tab[i];
+    if (!d) {
+        if (n == cap) { cap = cap ? cap * 2 : 64; tab = realloc(tab, cap * sizeof *tab); }
+        d = malloc(sizeof *d);
+        *d = *want;
+        tab[n++] = d;
+    }
+    pthread_mutex_unlock(&sampler_lock);
+    return d;
+}
 NVN(nvnSamplerInitialize) {
-    NvnSamplerDesc *d = malloc(sizeof *d);
-    *d = sampler_desc_from_builder(AP(1));
-    SET_HOST(A(0), d);
+    NvnSamplerDesc d = sampler_desc_from_builder(AP(1));
+    SET_HOST(A(0), sampler_intern(&d));
     RET(1);
 }
-NVN(nvnSamplerFinalize) { free(HOST(NvnSamplerDesc, A(0))); SET_HOST(A(0), 0); }
+NVN(nvnSamplerFinalize) { SET_HOST(A(0), 0); }
 NVN(nvnSamplerSetDebugLabel) { (void)c; }
 #define SMP HOST(NvnSamplerDesc, A(0))
 NVN(nvnSamplerGetMinMagFilter) { *(uint32_t *)AP(1) = SMP->min_filter; *(uint32_t *)AP(2) = SMP->mag_filter; }
@@ -690,7 +710,11 @@ NVN(nvnSamplerPoolGetSize) { RET(G(uint32_t, A(0), 24)); }
 NVN(nvnSamplerPoolRegisterSampler) {
     NvnDescPool *d = HOST(NvnDescPool, A(0));
     int id = (int)A(1);
-    if (id >= 0 && id < d->count) ((NvnSamplerDesc *)d->entries)[id] = *HOST(NvnSamplerDesc, A(2));
+    if (id >= 0 && id < d->count && HOST(NvnSamplerDesc, A(2))) {
+        NvnSamplerDesc s = *HOST(NvnSamplerDesc, A(2));
+        s.backend = NULL;  // (the pool entry gets its own VkSampler)
+        ((NvnSamplerDesc *)d->entries)[id] = s;
+    }
 }
 NVN(nvnSamplerPoolRegisterSamplerBuilder) {
     NvnDescPool *d = HOST(NvnDescPool, A(0));

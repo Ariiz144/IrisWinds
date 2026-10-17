@@ -3927,6 +3927,41 @@ static inline const char* CalcWordWrapNextLineStartA(const char* text, const cha
 
 #define ImFontGetCharAdvanceX(_FONT, _CH)  ((int)(_CH) < (_FONT)->IndexAdvanceX.Size ? (_FONT)->IndexAdvanceX.Data[_CH] : (_FONT)->FallbackAdvanceX)
 
+// (Savage Wind local patch) Japanese and Chinese put no blanks between words: a line may also break between two
+// characters when either is CJK (ideographs, kana, CJK and full-width punctuation; not Hangul, Korean uses blanks),
+// except before closing punctuation and small kana or after an opening bracket (kinsoku).
+static bool ImCharIsCJK(unsigned int c)
+{
+    return (c >= 0x2E80 && c <= 0x2FDF) || (c >= 0x3000 && c <= 0x312F) || (c >= 0x31F0 && c <= 0x31FF) ||
+           (c >= 0x3400 && c <= 0x4DBF) || (c >= 0x4E00 && c <= 0x9FFF) || (c >= 0xF900 && c <= 0xFAFF) ||
+           (c >= 0xFF00 && c <= 0xFFEF);
+}
+static bool ImCharIsNoLineStart(unsigned int c)
+{
+    if (c < 0x80)
+        return c == ')' || c == ']' || c == '}' || c == '.' || c == ',' || c == ';' || c == ':' || c == '!' || c == '?' || c == '%';
+    static const char16_t no_start[] = u"、。，．・：；？！）］｝〕〉》」』】〙〗〟ー々ゝゞヽヾ〜～…’”"
+                                       u"ぁぃぅぇぉっゃゅょゎゕゖァィゥェォッャュョヮヵヶ";
+    for (char16_t n : no_start)
+        if (c == n)
+            return true;
+    return c >= 0x31F0 && c <= 0x31FF; // (small katakana extension)
+}
+static bool ImCharIsNoLineEnd(unsigned int c)
+{
+    if (c < 0x80)
+        return c == '(' || c == '[' || c == '{';
+    static const char16_t no_end[] = u"（［｛〔〈《「『【〘〖〝‘“";
+    for (char16_t n : no_end)
+        if (c == n)
+            return true;
+    return false;
+}
+static bool ImCharsCanBreakCJK(unsigned int prev_c, unsigned int c)
+{
+    return (ImCharIsCJK(prev_c) || ImCharIsCJK(c)) && !ImCharIsNoLineStart(c) && !ImCharIsNoLineEnd(prev_c);
+}
+
 // Simple word-wrapping for English, not full-featured. Please submit failing cases!
 // This will return the next location to wrap from. If no wrapping if necessary, this will fast-forward to e.g. text_end.
 // FIXME: Much possible improvements (don't cut things like "word !", "word!!!" but cut within "word,,,,", more sensible support for punctuations, support for Unicode punctuations, etc.)
@@ -3951,6 +3986,7 @@ const char* ImFont::CalcWordWrapPositionA(float scale, const char* text, const c
     const char* word_end = text;
     const char* prev_word_end = NULL;
     bool inside_word = true;
+    unsigned int prev_c = 0; // (Savage Wind: CJK breaks)
 
     const char* s = text;
     IM_ASSERT(text_end != NULL);
@@ -3969,6 +4005,7 @@ const char* ImFont::CalcWordWrapPositionA(float scale, const char* text, const c
             {
                 line_width = word_width = blank_width = 0.0f;
                 inside_word = true;
+                prev_c = 0;
                 s = next_s;
                 continue;
             }
@@ -3993,6 +4030,8 @@ const char* ImFont::CalcWordWrapPositionA(float scale, const char* text, const c
         }
         else
         {
+            if (inside_word && prev_c && ImCharsCanBreakCJK(prev_c, c))
+                inside_word = false; // (Savage Wind: c starts a new word)
             word_width += char_width;
             if (inside_word)
             {
@@ -4001,6 +4040,7 @@ const char* ImFont::CalcWordWrapPositionA(float scale, const char* text, const c
             else
             {
                 prev_word_end = word_end;
+                word_end = next_s; // (Savage Wind: a one-character word ends here, not where the previous one did)
                 line_width += word_width + blank_width;
                 word_width = blank_width = 0.0f;
             }
@@ -4008,6 +4048,7 @@ const char* ImFont::CalcWordWrapPositionA(float scale, const char* text, const c
             // Allow wrapping after punctuation.
             inside_word = (c != '.' && c != ',' && c != ';' && c != '!' && c != '?' && c != '\"');
         }
+        prev_c = c;
 
         // We ignore blank width at the end of the line (they can be skipped)
         if (line_width + word_width > wrap_width)

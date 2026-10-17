@@ -1045,17 +1045,49 @@ static void dump_failed_shader(uint64_t code, uint64_t max, const char *stage) {
     fclose(f);
 }
 
+// (debugging) Fragment shaders named in an env list (comma-separated): an fs hash (the [draw] log's), or
+// w<pc hex>=<word hex>, the shaders whose instruction at that pc (as the saved GLSL numbers them) is that word; the
+// latter does not need a run to learn the hash first.
+typedef struct { uint64_t v; uint32_t pc; bool word; } FsSel;
+
+static int fs_sel_parse(const char *p, FsSel *out, int max) {
+    int n = 0;
+    while (p && *p && n < max) {
+        const char *q = p;
+        FsSel f = {0};
+        if (*p == 'w') { f.word = true; f.pc = (uint32_t)strtoul(p + 1, (char **)&p, 16); if (*p == '=') p++; }
+        f.v = strtoull(p, (char **)&p, 16);
+        out[n++] = f;
+        while (*p == ',') p++;
+        if (p == q) break;
+    }
+    return n;
+}
+
+static bool fs_sel_match(const FsSel *f, uint64_t code, uint64_t hash) {
+    if (!f->word) return f->v == hash;
+    return code && f->pc % 32 && f->pc < 0x10000 && ((const uint64_t *)(uintptr_t)(code + 0x80))[f->pc / 8] == f->v;
+}
+
 static void translate_program(void *arg) {
     Prog *p = arg;
     maxwell_gmem_base = HEAP_BASE;
     maxwell_gmem_size = HEAP_MAX;
     pthread_mutex_lock(&translate_lock);
     {   // SAVAGEWIND_DBG_FS=<fs code addr hex>:<pc hex>:<reg>: that register after that instruction, as every output
-        // (pc ffffffff: 1.0, where the shader runs at all), as in renderer.m
+        // (pc ffffffff: 1.0, where the shader runs at all), as in renderer.m. The shader can also be named
+        // w<pc hex>=<word hex> (see FsSel) in place of its address, which changes from run to run.
         static unsigned long long dbg_addr;
         static unsigned dbg_pc;
         static int dbg_reg, parsed;
-        if (!parsed) { parsed = 1; const char *e = getenv("SAVAGEWIND_DBG_FS"); if (e) sscanf(e, "%llx:%x:%d", &dbg_addr, &dbg_pc, &dbg_reg); }
+        static FsSel sel;
+        if (!parsed) {
+            parsed = 1;
+            const char *e = getenv("SAVAGEWIND_DBG_FS");
+            if (e && *e == 'w') { fs_sel_parse(e, &sel, 1); e = strchr(e, ':'); if (e) sscanf(e, ":%x:%d", &dbg_pc, &dbg_reg); }
+            else if (e) sscanf(e, "%llx:%x:%d", &dbg_addr, &dbg_pc, &dbg_reg);
+        }
+        if (sel.word) dbg_addr = fs_sel_match(&sel, p->code[1], 0) ? p->code[1] : 0;
         maxwell_dbg_code = dbg_addr ? (const uint8_t *)(uintptr_t)dbg_addr : NULL;
         maxwell_dbg_pc = dbg_pc;
         maxwell_dbg_reg = dbg_reg;
@@ -1118,8 +1150,16 @@ static int attr_kind(uint32_t fmt) {
     case 0x27: case 0x2C: case 0x2F: case 0x3E:
         return 2;
     case 0x04: case 0x09: case 0x0C: case 0x10: case 0x15: case 0x18: case 0x1C: case 0x21: case 0x24:
-    case 0x28: case 0x2D: case 0x30:
+    case 0x28: case 0x2D: case 0x30: case 0x6A:
         return 1;
+    // integer-to-float formats (R8_UI2F 0x51 .. RGBA32_I2F 0x68, RGB10A2_UI2F / _I2F): fetched as integers, the
+    // shader converts (USCALED / SSCALED vertex formats are optional in Vulkan)
+    case 0x51: case 0x53: case 0x55: case 0x57: case 0x59: case 0x5B: case 0x5D: case 0x5F: case 0x61: case 0x63:
+    case 0x65: case 0x67: case 0x6B:
+        return 4;
+    case 0x52: case 0x54: case 0x56: case 0x58: case 0x5A: case 0x5C: case 0x5E: case 0x60: case 0x62: case 0x64:
+    case 0x66: case 0x68: case 0x6C:
+        return 3;
     default: return 0;
     }
 }
@@ -1175,11 +1215,43 @@ static VkFormat vertex_format(uint32_t f) {
     case 0x2F: return VK_FORMAT_R32G32B32A32_UINT;
     case 0x30: return VK_FORMAT_R32G32B32A32_SINT;
     case 0x3D: return VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+    case 0x3E: return VK_FORMAT_A2B10G10R10_UINT_PACK32;
     case 0x69: return VK_FORMAT_A2B10G10R10_SNORM_PACK32;
+    case 0x6A: return VK_FORMAT_A2B10G10R10_SINT_PACK32;
     case 0x3F: return VK_FORMAT_B10G11R11_UFLOAT_PACK32;
     case 0x40: return VK_FORMAT_E5B9G9R9_UFLOAT_PACK32;
+    // integer-to-float: the integer format (attr_kind 3 / 4 makes the shader convert)
     case 0x51: return VK_FORMAT_R8_UINT;
-    default: return VK_FORMAT_R32G32B32A32_SFLOAT;
+    case 0x52: return VK_FORMAT_R8_SINT;
+    case 0x53: return VK_FORMAT_R16_UINT;
+    case 0x54: return VK_FORMAT_R16_SINT;
+    case 0x55: return VK_FORMAT_R32_UINT;
+    case 0x56: return VK_FORMAT_R32_SINT;
+    case 0x57: return VK_FORMAT_R8G8_UINT;
+    case 0x58: return VK_FORMAT_R8G8_SINT;
+    case 0x59: return VK_FORMAT_R16G16_UINT;
+    case 0x5A: return VK_FORMAT_R16G16_SINT;
+    case 0x5B: return VK_FORMAT_R32G32_UINT;
+    case 0x5C: return VK_FORMAT_R32G32_SINT;
+    case 0x5D: return VK_FORMAT_R8G8B8_UINT;
+    case 0x5E: return VK_FORMAT_R8G8B8_SINT;
+    case 0x5F: return VK_FORMAT_R16G16B16_UINT;
+    case 0x60: return VK_FORMAT_R16G16B16_SINT;
+    case 0x61: return VK_FORMAT_R32G32B32_UINT;
+    case 0x62: return VK_FORMAT_R32G32B32_SINT;
+    case 0x63: return VK_FORMAT_R8G8B8A8_UINT;
+    case 0x64: return VK_FORMAT_R8G8B8A8_SINT;
+    case 0x65: return VK_FORMAT_R16G16B16A16_UINT;
+    case 0x66: return VK_FORMAT_R16G16B16A16_SINT;
+    case 0x67: return VK_FORMAT_R32G32B32A32_UINT;
+    case 0x68: return VK_FORMAT_R32G32B32A32_SINT;
+    case 0x6B: return VK_FORMAT_A2B10G10R10_UINT_PACK32;
+    case 0x6C: return VK_FORMAT_A2B10G10R10_SINT_PACK32;
+    default: {
+        static uint8_t told[256];
+        if (f != 0x2E && !told[f & 0xFF]++) LOG("[vk] vertex format %#x unknown: read as RGBA32F\n", f);
+        return VK_FORMAT_R32G32B32A32_SFLOAT;
+    }
     }
 }
 
@@ -1958,6 +2030,78 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
 // ================================================================== draws
 static void debug_draw(Prog *pr, CmdRec *r, bool indexed);
 
+// (debugging) SAVAGEWIND_DEBUG_PICK=<x>,<y>[;<x>,<y>...] (up to 4 points, first-target pixels): in a debug frame each
+// draw copies those pixels of its first target afterwards (its own pass), and vk_pick_report logs, per point, the
+// draws that changed it ("[pick]"): the last one is what the frame shows there.
+typedef struct { uint64_t vs, fs, hash; void *img; uint32_t w, h, fmt, no; } PickRec;
+static struct { VkBuffer buf; VmaAllocation mem; uint8_t *ptr; int n, npt, on; int pt[4][2]; uint32_t draws; PickRec rec[4096]; } pick = {.on = -1};
+
+static void pick_after_draw(void) {
+    if (pick.on < 0) {
+        pick.on = 0;
+        for (const char *e = getenv("SAVAGEWIND_DEBUG_PICK"); e && *e && pick.npt < 4;) {
+            if (sscanf(e, "%d,%d", &pick.pt[pick.npt][0], &pick.pt[pick.npt][1]) != 2) break;
+            pick.npt++;
+            e = strchr(e, ';');
+            if (e) e++;
+        }
+        pick.on = pick.npt > 0;
+    }
+    pick.draws++;
+    if (!pick.on || !st.rt.ncolor || !st.rt.color[0] || !st.rt.color[0]->backend || pick.n >= 4096) return;
+    TexBackend *b = st.rt.color[0]->backend;
+    if ((b->aspect & ~VK_IMAGE_ASPECT_COLOR_BIT) || b->samples > 1 || b->width < 64) return;
+    if (!pick.buf) {
+        VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = 4096 * 4 * 16, .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+        VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+                                      .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT};
+        VmaAllocationInfo info;
+        VK_CHECK(vmaCreateBuffer(g_vk.vma, &bi, &ai, &pick.buf, &pick.mem, &info));
+        pick.ptr = info.pMappedData;
+    }
+    uint32_t layer = st.rt.has_cview[0] && (st.rt.cview[0].setmask & 2) ? st.rt.cview[0].min_layer : 0;
+    uint32_t level = st.rt.has_cview[0] && (st.rt.cview[0].setmask & 1) ? st.rt.cview[0].base_level : 0;
+    if (level >= b->levels || layer >= b->layers) return;
+    vk_end_pass();
+    VkCommandBuffer cb = vk_cmd();
+    vk_full_barrier(cb);
+    for (int k = 0; k < pick.npt; k++) {
+        uint32_t x = (uint32_t)pick.pt[k][0] * b->width / 1600 >> level, y = (uint32_t)pick.pt[k][1] * b->height / 900 >> level;
+        memset(pick.ptr + ((size_t)pick.n * 4 + k) * 16, 0, 16);
+        if (x >= level_extent(b->width, level) || y >= level_extent(b->height, level)) continue;
+        VkBufferImageCopy c = {.bufferOffset = ((VkDeviceSize)pick.n * 4 + k) * 16,
+                               .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, layer, 1},
+                               .imageOffset = {(int32_t)x, (int32_t)y, 0}, .imageExtent = {1, 1, 1}};
+        vkCmdCopyImageToBuffer(cb, b->image, VK_IMAGE_LAYOUT_GENERAL, pick.buf, 1, &c);
+    }
+    PickRec *r = &pick.rec[pick.n++];
+    r->vs = st.program->stages[0].code_addr;
+    r->fs = st.program->stages[1].code_addr;
+    r->hash = g_cur_fs_hash;
+    r->img = (void *)b->image;
+    r->w = b->width; r->h = b->height; r->fmt = st.rt.color[0]->format; r->no = pick.draws;
+}
+
+void vk_pick_report(void) {
+    if (!pick.n) return;
+    renderer_flush();
+    for (int k = 0; k < pick.npt; k++) {
+        LOG("[pick] point %d (%d,%d of 1600x900): draws that changed it\n", k, pick.pt[k][0], pick.pt[k][1]);
+        for (int i = 0; i < pick.n; i++) {
+            const uint8_t *v = pick.ptr + ((size_t)i * 4 + k) * 16;
+            int j = i - 1;  // the previous draw into the same image
+            while (j >= 0 && pick.rec[j].img != pick.rec[i].img) j--;
+            if (j >= 0 && !memcmp(v, pick.ptr + ((size_t)j * 4 + k) * 16, 16)) continue;
+            const uint32_t *u = (const uint32_t *)v;
+            LOG("[pick]   draw %u fs %llx hash %016llx vs %llx | target %ux%u f%#x [%p] | %08x %08x %08x %08x\n", pick.rec[i].no,
+                (unsigned long long)pick.rec[i].fs, (unsigned long long)pick.rec[i].hash, (unsigned long long)pick.rec[i].vs,
+                pick.rec[i].w, pick.rec[i].h, pick.rec[i].fmt, pick.rec[i].img, u[0], u[1], u[2], u[3]);
+        }
+    }
+    pick.n = 0;
+    pick.draws = 0;
+}
+
 // Quads / fans / polygons as a 32-bit triangle index list.
 static uint32_t *expand_indices(uint32_t mode, uint32_t count, const void *indices, int itype, uint32_t first, uint32_t *out_count) {
     uint32_t tris = mode == 7 ? count / 4 * 2 : count >= 3 ? count - 2 : 0;
@@ -2013,21 +2157,19 @@ static void draw_(CmdRec *r, bool indexed) {
     }
     {   // fragment-shader hash: skip lists (SAVAGEWIND_SKIP_FSHASH), debug logs, GPU profile labels
         static uint64_t last_fs, last_hash;
+        static bool last_skip;
+        static FsSel skip[16];
+        static int nskip = -1;
+        if (nskip < 0) nskip = fs_sel_parse(getenv("SAVAGEWIND_SKIP_FSHASH"), skip, 16);
         uint64_t fs = st.program->stages[1].code_addr;
         if (fs != last_fs) {
             last_fs = fs;
             last_hash = fs ? hmix(1469598103934665603ull, (const void *)(uintptr_t)(fs + 0x30), 0x200) : 0;
+            last_skip = false;
+            for (int i = 0; i < nskip; i++) last_skip |= fs_sel_match(&skip[i], fs, last_hash);
         }
-        static uint64_t skip[16];
-        static int nskip = -1;
-        if (nskip < 0) {
-            nskip = 0;
-            for (const char *p = getenv("SAVAGEWIND_SKIP_FSHASH"); p && *p && nskip < 16;) {
-                skip[nskip++] = strtoull(p, (char **)&p, 16);
-                while (*p == ',') p++;
-            }
-        }
-        for (int i = 0; i < nskip; i++) if (last_hash == skip[i]) { stat_skipped++; return; }
+        extern volatile int g_skip_fs_off;
+        if (last_skip && !g_skip_fs_off) { stat_skipped++; return; }
         if (g_debug_frame && getenv("SAVAGEWIND_LOG_FSHASH")) LOG("[fshash] fs=%llx hash %016llx\n", (unsigned long long)fs, (unsigned long long)last_hash);
         g_cur_fs_hash = last_hash;
     }
@@ -2373,6 +2515,7 @@ static void draw_(CmdRec *r, bool indexed) {
     else vkCmdDrawIndexed(cb, icount, inst, 0, base_vertex, base_inst);
     stat_draws++;
     cum_draws++;
+    if (g_debug_frame) pick_after_draw();
     if (g_gpuprof_frame && gp_n) {
         if (!gp_draws[gp_n - 1]) {  // first draw of the row: its fragment shader hash
             size_t l = strlen(gp_label[gp_n - 1]);
@@ -2381,6 +2524,8 @@ static void draw_(CmdRec *r, bool indexed) {
         gp_draws[gp_n - 1]++;
     }
 }
+
+static void debug_save_channels(TexBackend *b, const char *path);
 
 static void debug_draw(Prog *pr, CmdRec *r, bool indexed) {
     LOG("[draw] %s inst %llu mode %llu count %llu prog vs=%llx fs=%llx | vs cb %#x fs cb %#x | rt %d", indexed ? "e" : "a",
@@ -2402,6 +2547,11 @@ static void debug_draw(Prog *pr, CmdRec *r, bool indexed) {
             LOG(" | bf%d %x %x %x %x %x %x", i, st.blend[i][1], st.blend[i][2], st.blend[i][3], st.blend[i][4], st.blend[i][5], st.blend[i][6]);
     LOG(" | fs out %#x | poly3 %#x offset %g %g %g\n", pr->fi->out_mask, st.poly[3], st.poly_offset[0], st.poly_offset[1],
         st.poly_offset[2]);
+    for (int i = 0; i < st.rt.ncolor; i++)  // target views (layer / level selections)
+        if (st.rt.color[i] && st.rt.has_cview[i])
+            LOG("[draw]   rt%d view: set %#x levels %u+%u layers %u+%u (texture target %u depth %u)\n", i, st.rt.cview[i].setmask,
+                st.rt.cview[i].base_level, st.rt.cview[i].num_levels, st.rt.cview[i].min_layer, st.rt.cview[i].num_layers,
+                st.rt.color[i]->target, st.rt.color[i]->depth);
     if (getenv("SAVAGEWIND_DEBUG_DATA")) {  // vertex streams 0-1 and fragment cbufs: the first floats
         for (int s = 0; s < 2; s++) {
             if (!st.vbuf[s].addr) continue;
@@ -2440,6 +2590,115 @@ static void debug_draw(Prog *pr, CmdRec *r, bool indexed) {
             t->format, b ? b->levels : 0, b ? b->width : 0, b ? b->height : 0, b ? b->sx : 0, b ? b->sy : 0,
             b && b->scalable ? " scalable" : "", t->finalized ? " FINALIZED" : "", (unsigned long long)t->addr,
             b ? (void *)b->image : NULL);
+        LOG("[draw]   shape%d: target %u depth %u levels %u -> layers %u%s\n", i, t->target, t->depth, t->levels, b ? b->layers : 0,
+            b && b->base_type == VK_IMAGE_VIEW_TYPE_2D_ARRAY ? " (array)" : "");
+        {   // its sampler and swizzle (view swizzle if the pool entry overrides it)
+            const NvnTexEntry *e = shader_texture_entry(1, &pr->fi->tex[i]);
+            if (e && e->has_view)
+                LOG("[draw]   view%d: set %#x levels %u+%u layers %u+%u format %#x target %u\n", i, e->view.setmask, e->view.base_level,
+                    e->view.num_levels, e->view.min_layer, e->view.num_layers, e->view.format, e->view.target);
+            int slot = ((int)pr->fi->tex[i].handle_offset - 0x20) / 8;
+            uint64_t h = (slot >= 0 && slot < 32) ? st.tex[1][slot] : 0;
+            uint32_t tsc = (uint32_t)(h >> 20) & 0xFFF;
+            const NvnSamplerDesc *sd = h && st.spool && tsc < (uint32_t)st.spool->count ? &((NvnSamplerDesc *)st.spool->entries)[tsc] : NULL;
+            const uint8_t *sw = e && e->has_view && (e->view.setmask & 8) ? e->view.swizzle : t->swizzle;
+            LOG("[draw]   smp%d: type %d swz %u%u%u%u%s h %llx tsc %u", i, pr->fi->tex[i].type, sw[0], sw[1], sw[2], sw[3],
+                e && e->has_view ? " (view)" : "", (unsigned long long)h, tsc);
+            if (sd) LOG(" filt %u/%u wrap %u %u %u lod %g..%g bias %g aniso %g cmp %u/%u", sd->min_filter, sd->mag_filter,
+                        sd->wrap[0], sd->wrap[1], sd->wrap[2], sd->lod_min, sd->lod_max, sd->lod_bias, sd->max_aniso,
+                        sd->compare_mode, sd->compare_func);
+            LOG("\n");
+        }
+    }
+    {   // SAVAGEWIND_DEBUG_TEXDUMP=<fs>[,...] (see FsSel): the first such draw of a debug frame saves its fragment
+        // textures (build/dtex_<hash>_<i>..., see debug_save_channels; depth as .pgm) and logs its vertex layout, its
+        // first vertices and its uniform buffers
+        static FsSel want[8];
+        static uint64_t done[8];
+        static int nwant = -1;
+        static int all = -1;  // SAVAGEWIND_DEBUG_TEXDUMP_ALL=1: every such draw also saves its textures whole (RGB),
+                              // build/dtex_<hash>_d<draw>_<i>.png, <draw> counting the frame's draws as [pick] does
+        if (nwant < 0) nwant = fs_sel_parse(getenv("SAVAGEWIND_DEBUG_TEXDUMP"), want, 8);
+        if (all < 0) all = getenv("SAVAGEWIND_DEBUG_TEXDUMP_ALL") != NULL;
+        for (int k = 0; k < nwant && all; k++) {
+            if (!fs_sel_match(&want[k], st.program->stages[1].code_addr, g_cur_fs_hash)) continue;
+            for (int i = 0; i < pr->fi->ntex && i < 64; i++) {
+                NvnTexture *t = shader_texture_object(1, &pr->fi->tex[i]);
+                TexBackend *b = t ? (TexBackend *)t->backend : NULL;
+                if (!b || (b->aspect & ~VK_IMAGE_ASPECT_COLOR_BIT)) continue;
+                char path[128];
+                snprintf(path, sizeof path, "build/dtex_%016llx_d%u_%d.png", (unsigned long long)g_cur_fs_hash, pick.draws + 1, i);
+                renderer_save_texture_tex(b, path);
+                LOG("[draw]   tex%d %ux%u f%#x saved as %s\n", i, t->width, t->height, t->format, path);
+            }
+        }
+        for (int k = 0; k < nwant; k++) {
+            if (!fs_sel_match(&want[k], st.program->stages[1].code_addr, g_cur_fs_hash) || done[k] == renderer_present_count() + 1)
+                continue;
+            done[k] = renderer_present_count() + 1;
+            for (int i = 0; i < pr->fi->ntex && i < 64; i++) {
+                NvnTexture *t = shader_texture_object(1, &pr->fi->tex[i]);
+                TexBackend *b = t ? (TexBackend *)t->backend : NULL;
+                if (!b) continue;
+                char path[128];
+                snprintf(path, sizeof path, "build/dtex_%016llx_%d.%s", (unsigned long long)g_cur_fs_hash, i,
+                         b->aspect & VK_IMAGE_ASPECT_DEPTH_BIT ? "pgm" : "png");
+                vk_end_pass();
+                if (b->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) debug_save_depth(b, path);
+                else debug_save_channels(b, path);
+                LOG("[draw]   tex%d saved as %s\n", i, path);
+            }
+            LOG("[draw]   attribs:");  // the vertex layout: format / stream / offset, and each stream's first bytes
+            for (int a = 0; a < 16; a++)
+                if ((pr->vi->attr_mask >> a) & 1)
+                    LOG(" a%d=%#x/s%u/+%u", a, a < st.nattrib ? st.attrib[a] & 0xFF : 0, a < st.nattrib ? (st.attrib[a] >> 8) & 0x1F : 99,
+                        a < st.nattrib ? st.attrib[a] >> 13 : 0);
+            LOG("\n");
+            for (int s = 0; s < st.nstream && s < 16; s++) {
+                if (!st.vbuf[s].addr) continue;
+                const float *f = (const float *)(uintptr_t)st.vbuf[s].addr;
+                LOG("[draw]   stream%d stride %u divisor %u %llx size %llu:", s, st.stream[s][0], st.stream[s][1],
+                    (unsigned long long)st.vbuf[s].addr, (unsigned long long)st.vbuf[s].size);
+                for (uint64_t k = 0; k < 64 && k * 4 < st.vbuf[s].size; k++) LOG("%s%.6g", k % 8 ? " " : "\n[draw]     ", f[k]);
+                LOG("\n");
+            }
+            if (indexed) {
+                LOG("[draw]   indices (type %llu, base vertex %lld):", (unsigned long long)r->x[1], (long long)(int32_t)r->x[4]);
+                for (uint64_t k = 0; k < r->x[2] && k < 64; k++)
+                    LOG(" %u", r->x[1] == 0 ? ((const uint8_t *)(uintptr_t)r->x[3])[k] : r->x[1] == 1 ? ((const uint16_t *)(uintptr_t)r->x[3])[k]
+                                                                                       : ((const uint32_t *)(uintptr_t)r->x[3])[k]);
+                LOG("\n");
+            }
+            for (uint64_t k = 0; k < r->x[2] && k < 24; k++) {  // the first vertices' attributes, raw bytes in hex
+                uint64_t v = indexed ? (r->x[1] == 0 ? ((const uint8_t *)(uintptr_t)r->x[3])[k] : r->x[1] == 1 ? ((const uint16_t *)(uintptr_t)r->x[3])[k]
+                                                                                                 : ((const uint32_t *)(uintptr_t)r->x[3])[k]) + (int32_t)r->x[4]
+                                     : r->x[1] + k;
+                LOG("[draw]   vertex %llu:", (unsigned long long)v);
+                for (int a = 0; a < 16 && a < st.nattrib; a++) {
+                    if (!((pr->vi->attr_mask >> a) & 1)) continue;
+                    uint32_t fmt = st.attrib[a] & 0xFF, s = (st.attrib[a] >> 8) & 0x1F, off = st.attrib[a] >> 13;
+                    if (s >= 16 || !st.vbuf[s].addr) continue;
+                    uint32_t bpb = nvn_format_info(fmt)->bpb;
+                    uint64_t at = v * st.stream[s][0] + off;
+                    if (at + bpb > st.vbuf[s].size) { LOG(" a%d=(out)", a); continue; }
+                    const uint8_t *p = (const uint8_t *)(uintptr_t)(st.vbuf[s].addr + at);
+                    LOG(" a%d=", a);
+                    for (uint32_t b = 0; b < bpb && b < 16; b++) LOG("%02x", p[b]);
+                }
+                LOG("\n");
+            }
+            for (int sg = 0; sg < 2; sg++)  // and every uniform buffer either stage reads, whole (up to 4 KiB)
+                for (int c = 0; c < 18; c++) {
+                    ShaderInfo *si = sg ? pr->fi : pr->vi;
+                    Range u = st.ubuf[sg][c];
+                    if (!((si->cbuf_mask >> (c + 3)) & 1) || !u.addr) continue;
+                    const float *f = (const float *)(uintptr_t)u.addr;
+                    LOG("[draw]   %ccb%d %llx size %u:", sg ? 'f' : 'v', c + 3, (unsigned long long)u.addr, (unsigned)u.size);
+                    for (uint32_t k = 0; k < 1024 && k * 4 < u.size; k++)
+                        LOG("%s%.6g", k % 16 == 0 ? "\n[draw]     " : k % 4 ? " " : " | ", f[k]);
+                    LOG("\n");
+                }
+        }
     }
 }
 
@@ -2919,9 +3178,32 @@ void vk_present_draw(VkCommandBuffer cb, TexBackend *b, float vx, float vy, floa
     vkCmdSetViewport(cb, 0, 1, &full);
 }
 
+static void save_view_png(TexBackend *b, VkImageView src, const char *path);
+
 // Screenshot of a game texture (presented crop applied to build/frame_* shots), via the present shader into RGBA8.
 void renderer_save_texture_tex(TexBackend *b, const char *path) {
     if (!b || !b->image || (b->aspect & ~VK_IMAGE_ASPECT_COLOR_BIT)) return;
+    save_view_png(b, raw_view(b), path);
+}
+
+// (debug frames) each channel of a colour texture's level 0 as grey, <path> minus .png + _<channel>.png, and
+// _L<layer> before that for the layers of an array (up to 8).
+static void debug_save_channels(TexBackend *b, const char *path) {
+    if (!b || !b->image || (b->aspect & ~VK_IMAGE_ASPECT_COLOR_BIT) || b->base_type == VK_IMAGE_VIEW_TYPE_3D) return;
+    VkFormat f = b->format == VK_FORMAT_R8G8B8A8_SRGB ? VK_FORMAT_R8G8B8A8_UNORM
+               : b->format == VK_FORMAT_B8G8R8A8_SRGB ? VK_FORMAT_B8G8R8A8_UNORM : b->format;
+    for (uint32_t ly = 0; ly < b->layers && ly < 8; ly++)
+        for (int ch = 0; ch < 4; ch++) {
+            VkComponentSwizzle c = (VkComponentSwizzle)(VK_COMPONENT_SWIZZLE_R + ch);
+            VkComponentMapping m = {c, c, c, VK_COMPONENT_SWIZZLE_ONE};
+            char p2[300], lay[16] = "";
+            if (b->layers > 1) snprintf(lay, sizeof lay, "_L%u", ly);
+            snprintf(p2, sizeof p2, "%.*s%s_%c.png", (int)strlen(path) - 4, path, lay, "rgba"[ch]);
+            save_view_png(b, vk_image_view(b, VK_IMAGE_VIEW_TYPE_2D, f, 0, 1, ly, 1, m, VK_IMAGE_ASPECT_COLOR_BIT), p2);
+        }
+}
+
+static void save_view_png(TexBackend *b, VkImageView src, const char *path) {
     extern const float *vk_shot_crop(void);
     float crop[4] = {0, 0, 1, 1};
     if (strstr(path, "frame_")) memcpy(crop, vk_shot_crop(), sizeof crop);
@@ -2949,7 +3231,7 @@ void renderer_save_texture_tex(TexBackend *b, const char *path) {
     vkCmdBeginRendering(cb, &ri);
     VkPipeline p = present_pipeline(VK_FORMAT_R8G8B8A8_UNORM);
     VkDescriptorSet ds = vk_alloc_set(present_set_layout);
-    VkDescriptorImageInfo ii = {vk_default_sampler(true), raw_view(b), VK_IMAGE_LAYOUT_GENERAL};
+    VkDescriptorImageInfo ii = {vk_default_sampler(true), src, VK_IMAGE_LAYOUT_GENERAL};
     VkWriteDescriptorSet wr = {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = ds, .dstBinding = 0, .descriptorCount = 1,
                                .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &ii};
     vkUpdateDescriptorSets(g_vk.dev, 1, &wr, 0, NULL);

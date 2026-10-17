@@ -13,6 +13,7 @@
 
 #include "../hle.h"
 #include "../ipc.h"
+#include "../language.h"
 
 #define FS_PATH_NOT_FOUND MAKE_RESULT(2, 1)
 #define FS_PATH_EXISTS MAKE_RESULT(2, 2)
@@ -236,6 +237,55 @@ static void add_new_files(int fd, const uint64_t *h, const uint8_t *dmeta, uint6
     LOG("[fs] overlay: %d new romfs files\n", added);
 }
 
+// The copy of the file-meta table that replacements patch (made on first use)
+static uint8_t *meta_copy(int fd, const uint8_t *fmeta, uint64_t foff, uint64_t fsz) {
+    if (!ov_meta) {
+        ov_meta = malloc(fsz);
+        memcpy(ov_meta, fmeta, fsz);
+        ov_meta_off = foff;
+        ov_meta_size = fsz;
+        struct stat rs;
+        fstat(fd, &rs);
+        ov_end = (rs.st_size + 0xF) & ~0xFull;
+    }
+    return ov_meta;
+}
+
+static int by_name_after(const void *a, const void *b) {  // (RomFile * by the path after "Voice/<lang>/")
+    const RomFile *x = *(RomFile *const *)a, *y = *(RomFile *const *)b;
+    return strcmp(strchr(x->path + 6, '/') + 1, strchr(y->path + 6, '/') + 1);
+}
+
+// Voices in another language than the text (runtime/language.c): every Voice/<lang>/<path> but Common's takes the
+// data of the chosen folder's <path> when it has one (the .bars banks and the Stream_*/ dialogue streams). (The game reads its text language's folder or a fallback;
+// whichever it is, it gets the chosen voices.) Only the file-meta entries change: the data stays in the image.
+static void voice_redirect(int fd, const uint8_t *fmeta, uint64_t foff, uint64_t fsz) {
+    const char *vf = language_voice_folder();
+    if (!vf) return;
+    char pre[64];
+    snprintf(pre, sizeof pre, "Voice/%s/", vf);
+    size_t pl = strlen(pre);
+    RomFile **chosen = malloc(sizeof *chosen * rom_nfiles);
+    int nc = 0;
+    for (int i = 0; i < rom_nfiles; i++)
+        if (!strncmp(rom_files[i].path, pre, pl)) chosen[nc++] = &rom_files[i];
+    if (!nc) { LOG("[fs] voices: the RomFS has no %s folder, the game's own voices play\n", pre); free(chosen); return; }
+    qsort(chosen, nc, sizeof *chosen, by_name_after);
+    int n = 0;
+    for (int i = 0; i < rom_nfiles; i++) {
+        const char *p = rom_files[i].path;
+        if (strncmp(p, "Voice/", 6) || !strncmp(p, pre, pl) || !strncmp(p, "Voice/Common/", 13)) continue;
+        if (!strchr(p + 6, '/')) continue;
+        RomFile *key = &rom_files[i], **hit = bsearch(&key, chosen, nc, sizeof *chosen, by_name_after);
+        if (!hit) continue;
+        uint8_t *meta = meta_copy(fd, fmeta, foff, fsz);
+        memcpy(meta + rom_files[i].meta + 8, fmeta + (*hit)->meta + 8, 16);  // (data offset, size)
+        n++;
+    }
+    free(chosen);
+    LOG("[fs] voices: %d files play %s's voices\n", n, vf);
+}
+
 static void rom_index(int fd) {
     uint64_t h[10];
     if (pread(fd, h, sizeof h, 0) != (ssize_t)sizeof h) return;
@@ -265,6 +315,7 @@ static void rom_index(int fd) {
         rom_files[rom_nfiles++] = (RomFile){rom_data_off + data, size, path, (uint32_t)o};
         o += 0x20 + ((namelen + 3) & ~3u);
     }
+    voice_redirect(fd, fmeta, foff, fsz);
     // Overlay: replacement files are served from the overlay folder. The file-meta table is patched
     // (in a copy) to point them at data appended past the end of the image; reads there go to host files.
     for (int i = 0; i < rom_nfiles; i++) {
@@ -272,15 +323,7 @@ static void rom_index(int fd) {
         if (!overlay_file(rom_files[i].path, host, sizeof host)) continue;
         struct stat sb;
         if (stat(host, &sb)) continue;
-        if (!ov_meta) {
-            ov_meta = malloc(fsz);
-            memcpy(ov_meta, fmeta, fsz);
-            ov_meta_off = foff;
-            ov_meta_size = fsz;
-            struct stat rs;
-            fstat(fd, &rs);
-            ov_end = (rs.st_size + 0xF) & ~0xFull;
-        }
+        meta_copy(fd, fmeta, foff, fsz);
         uint64_t rel = ov_end - rom_data_off, size = (uint64_t)sb.st_size;
         memcpy(ov_meta + rom_files[i].meta + 8, &rel, 8);
         memcpy(ov_meta + rom_files[i].meta + 0x10, &size, 8);
@@ -304,11 +347,11 @@ static void rom_index(int fd) {
 
 // Virtual RomFS image read: original bytes, with the patched file table and appended replacement files.
 static ssize_t romfs_read(int fd, uint8_t *dst, uint64_t size, uint64_t off) {
-    if (!ov_n) return pread(fd, dst, size, (off_t)off);
+    if (!ov_n && !npatches) return pread(fd, dst, size, (off_t)off);
     uint64_t done = 0;
     while (done < size) {
         uint64_t o = off + done, n = size - done;
-        if (o >= ov[0].start) {  // appended region
+        if (ov_n && o >= ov[0].start) {  // appended region
             int i = 0;
             while (i < ov_n && !(o >= ov[i].start && o < ov[i].start + ((ov[i].size + 0xF) & ~0xFull))) i++;
             if (i == ov_n) { memset(dst + done, 0, n); done += n; break; }
@@ -325,7 +368,7 @@ static ssize_t romfs_read(int fd, uint8_t *dst, uint64_t size, uint64_t off) {
             if (r < 0) r = 0;
             if ((uint64_t)r < n) memset(dst + done + r, 0, n - r);
         } else {
-            if (o + n > ov[0].start) n = ov[0].start - o;
+            if (ov_n && o + n > ov[0].start) n = ov[0].start - o;
             ssize_t r = pread(fd, dst + done, n, (off_t)o);
             if (r < 0) r = 0;
             if ((uint64_t)r < n) memset(dst + done + r, 0, n - r);

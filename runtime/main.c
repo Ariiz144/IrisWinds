@@ -153,6 +153,7 @@ static void boot(const char *root) {
     if (!gamelib_load(root, why, sizeof why)) FATAL("%s\n", why);
     loader_load(exefs);
     { extern void settings_load(void); settings_load(); }
+    { extern void language_booted(void); language_booted(); }  // (runtime/language.c)
     kernel_init();
     dispatch_init();
     { extern void jpeg_debug_init(void); jpeg_debug_init(); }

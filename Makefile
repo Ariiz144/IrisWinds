@@ -170,6 +170,7 @@ $(GAMELIB): $(GEN_OBJ) | $(EXE)
 	mv -f $@.tmp $@
 	echo $(GAMELIB_ID) > $@.id
 
+$(B)/rt/ui/i18n.o: $(wildcard runtime/ui/i18n/*.inc) runtime/ui/i18n.h
 $(B)/rt/ui/%.o: runtime/ui/%.mm $(RT_HDRS)
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) $(UIFLAGS) -c $< -o $@

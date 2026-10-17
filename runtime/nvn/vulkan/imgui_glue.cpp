@@ -32,6 +32,15 @@ extern "C" bool vk_imgui_backend_init(void) {
     return ok;
 }
 
+// The current context's fonts were made again: its font texture goes once no submitted frame can still read it, and
+// the next NewFrame makes the new one.
+extern "C" void vk_imgui_fonts_changed(void) {
+    if (!ImGui::GetIO().BackendRendererUserData) return;
+    uint64_t pending = vk_pending_seq();
+    if (pending > 1) vk_wait_seq(pending - 1);
+    ImGui_ImplVulkan_DestroyFontsTexture();
+}
+
 extern "C" void vk_imgui_backend_shutdown(void) {
     if (!ImGui::GetIO().BackendRendererUserData) return;
     vkDeviceWaitIdle(g_vk.dev);

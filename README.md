@@ -114,6 +114,15 @@ Every key and mouse button can be remapped in the overlay menu (Esc or F1), whic
 mouse sensitivity and Y inversion. F10 cycles the performance overlay (off, FPS, full: CPU, memory and GPU load and
 temperatures, frame times).
 
+## Languages
+
+The menu's Language tab picks the text language (any of the game's 15, or your system's) and, separately, the voice
+language (English, Latin American or European Spanish, French, German, Italian, Russian or Japanese), so you can for
+example read Spanish with Japanese voices. On the console the voices always follow the system language. The game
+reads both when it starts: in game, Restart now applies a change. The start screen and the overlay menu follow the
+text language at once, in all of the game's languages (Russian, Japanese, Korean and Chinese use a system font
+for their characters).
+
 ## How it works
 
 The game's AArch64 executables are translated to C (`tools/gen.py`) and compiled into a library next to the app. The

@@ -4,6 +4,7 @@
 
 #include "../hle.h"
 #include "../ipc.h"
+#include "../language.h"
 
 #define AM_NO_MESSAGE MAKE_RESULT(128, 3)
 #define AM_NO_DATA MAKE_RESULT(128, 2)
@@ -160,7 +161,14 @@ static void application_functions(Service *s, IpcReq *req, IpcResp *resp) {
         }
         break;
     case 20: OUT(uint64_t, 0) = 0; resp_size(resp, 8); break;  // EnsureSaveData
-    case 21: memcpy(resp->data, "en-US\0\0\0", 8); resp_size(resp, 8); break;  // GetDesiredLanguage
+    case 21: {  // GetDesiredLanguage: the text language (runtime/language.c)
+        const char *code = language_text_code();
+        memset(resp->data, 0, 8);
+        memcpy(resp->data, code, strlen(code) < 8 ? strlen(code) : 8);
+        resp_size(resp, 8);
+        LOG("[am] GetDesiredLanguage -> %s\n", code);
+        break;
+    }
     case 23: memcpy(resp->data, "1.0.0", 6); resp_size(resp, 0x10); break;
     case 40: OUT(uint8_t, 0) = 0; resp_size(resp, 1); break;  // NotifyRunning
     case 130: case 140: resp->copy_handles[resp->ncopy++] = new_event(); break;

@@ -237,6 +237,14 @@ Pendiente:
        mutex.
      - Kernel: `svcArbitrateUnlock` y `svcSignalProcessWideKey` ceden el núcleo después de soltar, no antes: el
        hilo que cedía primero dejaba esperando a los demás hasta recuperar su núcleo.
+   - Resuelto (2026-10-16, santuario):
+     - El pasillo marrón que lleva al pedestal se veía estirado a lo largo en casi todas las corridas: su textura
+       (1024x2048, UV que se repite) se muestreaba con un sampler de clamp. El juego copia objetos `NVNsampler`
+       por valor y registra la copia en el pool después de finalizar el original; cada objeto apuntaba a una
+       descripción propia que `nvnSamplerFinalize` liberaba, y la copia leía la memoria ya reusada por otro sampler.
+       Ahora las descripciones se comparten por configuración y no se liberan (`objects.c`).
+     - El shader de partículas que fallaba con "bindless tmml (handle not from c[2])" traduce (una burbuja pequeña
+       del santuario); no tenía que ver con lo anterior.
    - Ahora: el menú principal se ve bien. Con `Continue` (`SAVAGEWIND_INPUT="900:A:8,1400:A:8,1900:A:8"`) el
      Santuario de la Resurrección se ve iluminado: Link, el pedestal, la puerta, los pilares y el título del
      lugar. Lo conocido:
@@ -268,6 +276,27 @@ Pendiente:
      (cargado en tiempo de ejecución), y en Linux amdgpu por sysfs. Temperatura de CPU: hwmon en Linux; en Windows
      solo la zona térmica ACPI (este equipo no la tiene): la del encapsulado necesita un driver de kernel, que Savage
      Wind no instala. `runtime/perfmon.c`.
+   - Idiomas (2026-10-16): pestaña Language del menú, ajustes `text_language` (región-idioma de BOTW: USen, EUes,
+     JPja, ...; `auto`: el idioma de la interfaz del sistema, inglés si el juego no lo tiene) y `voice_language`
+     (carpeta de `Voice/`; `text`: las del idioma del texto). El texto es lo que responden `am`
+     `GetDesiredLanguage` y `set` `GetLanguageCode` (es-419 carga `Pack/Bootup_USes.pack` y `TitleBG_USes`). Las
+     voces se redirigen al indexar el RomFS (`voice_redirect` en `runtime/services/fs.c`): cada
+     `Voice/<idioma>/<ruta>` salvo `Common` toma los datos de la misma ruta en la carpeta elegida (los `.bars` y los
+     diálogos `Stream_*/…bfstm`, 6441 archivos con inglés), parcheando solo la tabla de archivos en la copia que ya
+     usa el overlay de mods. Ambos se leen al arrancar el juego: en juego, "Restart now" (reinicio en el sitio)
+     los aplica.
+   - Menús traducidos (2026-10-16): la pantalla de inicio y el menú del juego siguen al idioma de texto (Auto: el
+     del sistema). `tr("texto en inglés")` (`runtime/ui/i18n.mm`) busca el texto en la tabla del idioma,
+     `runtime/ui/i18n/<idioma>.inc` (`T("English", "...")`; `""` deja el inglés). Los widgets de
+     `option_rows.mm` y los helpers de `menu.mm` / `launcher.mm` traducen etiquetas, valores, descripciones y
+     títulos ellos mismos; los IDs de ImGui siguen en inglés. Mayúsculas en UTF-8 (`tr_upper`: latín, griego,
+     cirílico). Ruso, japonés, coreano y chino suman una fuente del sistema con solo los glifos que usan sus
+     textos (`ui_merge_fallback_font`), y cada contexto rehace sus fuentes al cambiar el idioma.
+     `tools/i18n_check.py` lista los textos que le faltan a cada tabla (`--missing <idioma>` los imprime como
+     líneas `T(...)`); `SAVAGEWIND_MENU_LANG=<código>` (p. ej. `ja`) fuerza el idioma de los menús para probar.
+     Las once tablas están completas (es, fr, de, it, nl, ru, pt, ja, ko, zh-Hans, zh-Hant). ImGui 1.91.9 solo
+     corta líneas en espacios: `third_party/imgui/imgui_draw.cpp` (`ImFont::CalcWordWrapPositionA`) lleva un
+     parche local que también corta entre caracteres CJK, respetando la puntuación.
    - setjmp / longjmp (2026-10-16): libjpeg y libpng de `nn::image` salen de sus errores con `longjmp`, que vuelve
      a la mitad de la función que llamó a `setjmp`; el código recompilado no puede retomar ahí ("no function at
      70023f1b14", al codificar la miniatura del guardado). `tools/gen.py` envuelve cada `bl` a `setjmp` (el
@@ -318,6 +347,20 @@ Pendiente:
      - `SAVAGEWIND_DBG_FS=<fs hex>:<pc hex>:<reg>`: ese registro tras esa instrucción como salida del fragment
        shader (`pc` ffffffff: 1.0 donde el shader corre), ahora también en Vulkan. `SAVAGEWIND_SAVE_MSL=1`
        guarda el GLSL de cada shader en `build/glsl/`.
+     - Nombrar un fragment shader sin su dirección (cambia en cada corrida): en `SAVAGEWIND_SKIP_FSHASH`,
+       `SAVAGEWIND_DBG_FS` y `SAVAGEWIND_DEBUG_TEXDUMP` vale `w<pc>=<palabra>`, los shaders cuya instrucción en ese
+       `pc` es esa palabra (los comentarios `// pc` del GLSL guardado), además del hash del log `[draw]`.
+     - F8: dibuja / vuelve a saltar los shaders de `SAVAGEWIND_SKIP_FSHASH` en vivo (A/B en la misma vista). F10 es
+       el overlay de rendimiento.
+     - `SAVAGEWIND_DEBUG_TEXDUMP=<fs>` (con F9): el primer draw de ese shader guarda sus texturas canal por canal
+       y capa por capa (`build/dtex_<hash>_<i>[_L<capa>]_<r|g|b|a>.png`, profundidad en `.pgm`), su layout de
+       vértices con los primeros vértices en hexadecimal, y sus uniform buffers enteros. Con
+       `SAVAGEWIND_DEBUG_TEXDUMP_ALL=1`, cada draw de ese shader guarda además sus texturas
+       (`build/dtex_<hash>_d<draw>_<i>.png`). El log `[draw]` del frame muestra el sampler (filtros, wrap, LOD),
+       el handle y el swizzle de cada textura, su forma (capas) y las vistas de los render targets.
+     - `SAVAGEWIND_DEBUG_PICK=<x>,<y>[;<x>,<y>...]` (hasta 4 puntos en coordenadas de 1600x900, con F9): después
+       de cada draw copia esos píxeles de su primer target; al terminar el frame, `[pick]` lista por punto los
+       draws que los cambiaron (el último es el que se ve) con su shader y hash.
      - En Git Bash, `VAR=1 timeout 60 ./build/savagewind.exe` no le pasa la variable al programa: usar
        `timeout 60 env VAR=1 ./build/savagewind.exe`.
      - `tools/ghidra/gq.py data <dirección> [n]` (palabras de 64 bits y a qué apuntan). Con gdb de MSYS2

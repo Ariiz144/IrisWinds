@@ -27,6 +27,8 @@ typedef struct {
     float mouse_sens;    // mouse camera speed, 1 = default
     bool mouse_invert_y; // mouse up looks down
     bool async_shaders;  // draw on while new shaders compile (no stutter; what needs them is skipped meanwhile)
+    int text_language;   // index in g_text_languages (runtime/language.h), 0: the host's
+    int voice_language;  // index in g_voice_languages, 0: the text language's voices
     bool menu_tip_seen;  // the start screen's one-time "how to open the menu" note was shown (first PLAY ever)
 } Settings;
 

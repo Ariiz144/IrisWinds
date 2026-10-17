@@ -6,6 +6,7 @@
 
 #include "hle.h"
 #include "input_bind.h"
+#include "language.h"
 
 #define SETTINGS_FILE settings_file()
 
@@ -56,6 +57,16 @@ void settings_load(void) {
         else if (!strcmp(key, "mouse_sensitivity")) g_settings.mouse_sens = (float)atof(val);
         else if (!strcmp(key, "mouse_invert_y")) g_settings.mouse_invert_y = atoi(val) != 0;
         else if (!strcmp(key, "async_shaders")) g_settings.async_shaders = atoi(val) != 0;
+        else if (!strcmp(key, "text_language")) {  // (a region language: USen, EUes, ...; auto)
+            g_settings.text_language = 0;
+            for (int i = 1; i < g_ntext_languages; i++)
+                if (!strcmp(val, g_text_languages[i].folder)) g_settings.text_language = i;
+        }
+        else if (!strcmp(key, "voice_language")) {  // (a Voice/ folder; text)
+            g_settings.voice_language = 0;
+            for (int i = 1; i < g_nvoice_languages; i++)
+                if (!strcmp(val, g_voice_languages[i].folder)) g_settings.voice_language = i;
+        }
         else if (!strcmp(key, "menu_tip_seen")) g_settings.menu_tip_seen = atoi(val) != 0, tip_key = true;
         else bind_settings_load(key, val);  // bind_pad_* / bind_key_*: runtime/hle/bindings.c
     }
@@ -89,6 +100,9 @@ void settings_save(void) {
     fprintf(f, "mouse_sensitivity = %.2f\n", g_settings.mouse_sens);
     fprintf(f, "mouse_invert_y = %d\n", g_settings.mouse_invert_y);
     fprintf(f, "async_shaders = %d\n", g_settings.async_shaders);
+    int tl = g_settings.text_language, vl = g_settings.voice_language;
+    fprintf(f, "text_language = %s\n", tl > 0 && tl < g_ntext_languages ? g_text_languages[tl].folder : "auto");
+    fprintf(f, "voice_language = %s\n", vl > 0 && vl < g_nvoice_languages ? g_voice_languages[vl].folder : "text");
     fprintf(f, "menu_tip_seen = %d\n", g_settings.menu_tip_seen);
     bind_settings_save(f);
     fclose(f);
