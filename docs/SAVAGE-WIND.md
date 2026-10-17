@@ -137,7 +137,9 @@ Pendiente:
    - `ui/launcher.mm` no comprueba la versión: falta el build id del `main` 1.8.2 (`tools/sw_probe.py`).
    - `hle/movie.c` solo deja saltar `movie/opening.webm` (nombre de LA).
    - `hle/framepace.c` y `hle/heaps.c` explican sus valores con casos de LA (siguen siendo genéricos).
-   - `README.md`, `CONTRIBUTING.md` y el ícono `docs/icon/` (isla y espada en la playa) son de LASRecomp.
+   - `CONTRIBUTING.md` es de LASRecomp. (El README y el ícono ya son propios: `docs/icon/icon.svg`, una montaña
+     helada con una espada clavada en la cima, dibujo original; `icon_1024.png`, `icon.ico` e `icon.icns` salen de
+     él con `rsvg-convert`.)
    - `tools/explore_far.sh`, `explore_input.sh`, `house_input.txt`, `dbgfs.sh`, `fresh_save.sh`: entradas
      de prueba pensadas para la pantalla de título de LA.
    - Pantalla ancha (aspecto desbloqueado) e iconos de botones por control: se fueron con

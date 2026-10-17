@@ -9,15 +9,14 @@
 
 **Savage Wind Recomp** is a work-in-progress static recompilation of *The Legend of Zelda: Breath of the Wild*
 (Nintendo Switch, version 1.8.2) into a native application for Windows and Linux. The goal is a full PC version of
-your own copy of the game: a launcher, PC-style graphics options, mods, any controller, keyboard and mouse.
+your own copy of the game: a launcher, PC-style graphics options, mods, any controller, keyboard and mouse, and
+its text and voices in any of its languages.
 
 > [!WARNING]
-> **Not playable yet.** This is early development. Today the game boots to its main menu, which renders correctly,
-> and goes into the first area with its HUD, but the 3D scenes are still mostly dark (the deferred lighting is being
-> fixed) and nothing past that has been tested. There are no releases. Building it is only useful if you want to
-> help develop it.
-
-![Savage Wind Recomp: development status and roadmap](docs/media/status.svg)
+> **Not playable yet.** This is early development. Today the game boots to its main menu and plays the opening in
+> the Shrine of Resurrection - lit, with its fog and effects, at the game's own 30 fps, with sound, voices and the
+> HUD - and saves. Nothing past the shrine has been tested yet. There are no releases. Building it is only useful if
+> you want to help develop it.
 
 > [!NOTE]
 > **No game files are included.** Savage Wind Recomp needs your own legally obtained copy of the game, updated to
@@ -25,6 +24,24 @@ your own copy of the game: a launcher, PC-style graphics options, mods, any cont
 > game files, keys, firmware, dumping or decryption tools, or instructions on how to obtain any of them. Savage Wind
 > never decrypts anything: it only reads files you have already extracted yourself. The recompilation of the game
 > code happens locally, on your machine, from your files.
+
+![Savage Wind Recomp: development status and roadmap](docs/media/status.svg)
+
+## What it does today
+
+- **Text and voices in different languages.** On the console the voices always follow the system language. Here
+  the menu's Language tab picks the text language (any of the game's 15, or your system's) and, separately, the
+  voice language (English, Latin American or European Spanish, French, German, Italian, Russian or Japanese): read
+  Spanish with Japanese voices, or English with Italian ones. The game reads both when it starts; in game, Restart
+  now applies a change.
+- **Menus in the game's 11 languages.** The start screen and the overlay menu follow the text language at once
+  (Russian, Japanese, Korean and Chinese use a system font for their characters).
+- **Keyboard and mouse.** Defaults made for BOTW (below), every key and mouse button remappable, a mouse camera
+  with sensitivity and Y inversion.
+- **Any controller** SDL knows, by button position, with its own button names (Nintendo, Xbox, PlayStation).
+- **Sound and voices** mixed by the game SDK's own audio renderer, with the room reverb.
+- **An overlay menu** (Esc or F1) with display, rendering, audio, language and control settings, and a
+  **performance overlay** (F10: FPS and frame times, or also CPU, memory and GPU load and temperatures).
 
 ## Respect copyright
 
@@ -86,14 +103,14 @@ switches - are in [docs/SAVAGE-WIND.md](docs/SAVAGE-WIND.md).
 
 ## Roadmap
 
-- Correct graphics in the opening and on the Great Plateau, then the rest of the game
+- Correct graphics on the Great Plateau, then the rest of the game
 - Always the latest game version (1.8.2 today); DLC support later
 - A launcher for Windows and Linux with PC-style graphics options
 - Higher internal resolutions, up to 4K and beyond
 - Upscaling with frame generation: AMD FSR and NVIDIA DLSS (each under its SDK's own license)
 - Mods
-- Automatic recognition of any controller
-- Keyboard and mouse, with every key and button remappable
+- Automatic recognition of any controller (today: any controller SDL knows, by button position)
+- Higher frame rates than the console's 30 fps (needs the game's timing patched)
 
 ## Controls
 
@@ -111,17 +128,7 @@ Any controller SDL knows works, by button position. Keyboard and mouse defaults:
 | Inventory (Plus) | Tab | Map (Minus) | M |
 
 Every key and mouse button can be remapped in the overlay menu (Esc or F1), which also frees the cursor and has the
-mouse sensitivity and Y inversion. F10 cycles the performance overlay (off, FPS, full: CPU, memory and GPU load and
-temperatures, frame times).
-
-## Languages
-
-The menu's Language tab picks the text language (any of the game's 15, or your system's) and, separately, the voice
-language (English, Latin American or European Spanish, French, German, Italian, Russian or Japanese), so you can for
-example read Spanish with Japanese voices. On the console the voices always follow the system language. The game
-reads both when it starts: in game, Restart now applies a change. The start screen and the overlay menu follow the
-text language at once, in all of the game's languages (Russian, Japanese, Korean and Chinese use a system font
-for their characters).
+mouse sensitivity and Y inversion. F10 cycles the performance overlay (off, FPS, full).
 
 ## How it works
 
@@ -160,7 +167,13 @@ only: it grants nothing for Nintendo's game, which you must supply yourself.
 ## Español (resumen)
 
 **Savage Wind Recomp** es una recompilación estática, en desarrollo, de *The Legend of Zelda: Breath of the Wild*
-(Switch, versión 1.8.2) para Windows y Linux. **Todavía no se puede jugar.**
+(Switch, versión 1.8.2) para Windows y Linux. **Todavía no se puede jugar**: hoy llega al menú principal y corre la
+introducción en el Santuario de la Vida, iluminado, a los 30 FPS del juego, con sonido y voces.
+
+- **Texto y voces en idiomas distintos**: en la consola las voces siguen siempre al idioma del sistema; aquí eliges
+  el idioma del texto (cualquiera de los 15 del juego) y, por separado, el de las voces (por ejemplo, texto en
+  español con voces en japonés). Los menús de Savage Wind están en los 11 idiomas del juego.
+- Teclado y ratón con todas las teclas reasignables, cualquier mando, y un indicador de rendimiento (F10).
 
 - No incluye archivos del juego, código del juego, assets, fuentes ni keys, y nunca los va a incluir.
 - Necesitas tu propia copia legal del juego actualizada a la **1.8.2**, extraída de **tu propia** consola. Este

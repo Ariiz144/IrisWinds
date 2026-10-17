@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1080" height="1960" viewBox="0 0 1080 1960" font-family="Segoe UI, Inter, Helvetica Neue, Arial, sans-serif">
+<svg xmlns="http://www.w3.org/2000/svg" width="1080" height="2109" viewBox="0 0 1080 2109" font-family="Segoe UI, Inter, Helvetica Neue, Arial, sans-serif">
   <defs>
     <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
       <stop offset="0" stop-color="#0d1a2e"/>
@@ -32,7 +32,7 @@
   </defs>
 
   <!-- background and header art (original: wind over mountains) -->
-  <rect width="1080" height="1960" fill="url(#bg)"/>
+  <rect width="1080" height="2109" fill="url(#bg)"/>
   <rect width="1080" height="330" fill="url(#sky)"/>
   <rect width="1080" height="330" fill="url(#glow)"/>
   <path d="M0 250 L90 200 L160 228 L250 160 L330 205 L410 175 L500 222 L590 150 L680 198 L760 168 L850 214 L940 176 L1080 226 L1080 330 L0 330 Z" fill="url(#far)" opacity="0.85"/>
@@ -58,15 +58,15 @@
 
   <!-- status table -->
   <text x="40" y="378" font-size="26" font-weight="700" fill="#ffffff">Where it stands</text>
-  <rect x="28" y="398" width="1024" height="930" rx="16" fill="url(#card)" stroke="#27486b" stroke-width="2"/>
+  <rect x="28" y="398" width="1024" height="1017" rx="16" fill="url(#card)" stroke="#27486b" stroke-width="2"/>
   <g font-size="21" font-weight="700" fill="#dce8f5">
     <text x="56" y="440">Component</text>
     <text x="382" y="440">Status</text>
     <text x="624" y="440">What it means</text>
   </g>
   <line x1="28" y1="460" x2="1052" y2="460" stroke="#27486b" stroke-width="2"/>
-  <line x1="362" y1="398" x2="362" y2="1328" stroke="#1f3a59" stroke-width="1.5"/>
-  <line x1="604" y1="398" x2="604" y2="1328" stroke="#1f3a59" stroke-width="1.5"/>
+  <line x1="362" y1="398" x2="362" y2="1415" stroke="#1f3a59" stroke-width="1.5"/>
+  <line x1="604" y1="398" x2="604" y2="1415" stroke="#1f3a59" stroke-width="1.5"/>
 
   <g stroke="#1f3a59" stroke-width="1.5">
     <line x1="28" y1="547" x2="1052" y2="547"/>
@@ -78,6 +78,7 @@
     <line x1="28" y1="1069" x2="1052" y2="1069"/>
     <line x1="28" y1="1156" x2="1052" y2="1156"/>
     <line x1="28" y1="1243" x2="1052" y2="1243"/>
+    <line x1="28" y1="1330" x2="1052" y2="1330"/>
   </g>
 
   <!-- icons (line art) -->
@@ -102,6 +103,8 @@
     <g transform="translate(52,1178)"><path d="M10 10h20a8 8 0 0 1 8 8l1 9a5 5 0 0 1-9 3l-3-4H13l-3 4a5 5 0 0 1-9-3l1-9a8 8 0 0 1 8-8z"/><path d="M11 16v6M8 19h6"/><circle cx="28" cy="17" r="1.2"/><circle cx="31" cy="21" r="1.2"/></g>
     <!-- 10 audio: speaker -->
     <g transform="translate(52,1265)"><path d="M4 14h7l9-8v28l-9-8H4z"/><path d="M26 13a9 9 0 0 1 0 14M30 8a15 15 0 0 1 0 24"/></g>
+    <!-- 11 languages: globe with a speech bubble -->
+    <g transform="translate(52,1352)"><circle cx="17" cy="20" r="15"/><path d="M2 20h30M17 5c-6 8-6 22 0 30M17 5c6 8 6 22 0 30"/><path d="M27 3h11v9h-5l-3 3v-3h-3z"/></g>
   </g>
 
   <!-- component names -->
@@ -114,8 +117,9 @@
     <text x="108" y="934">RomFS Game</text><text x="108" y="960">Files</text>
     <text x="108" y="1021">NVN Graphics</text><text x="108" y="1047">on Vulkan</text>
     <text x="108" y="1108">Maxwell Shader</text><text x="108" y="1134">Translator</text>
-    <text x="108" y="1195">Controller</text><text x="108" y="1221">Input</text>
+    <text x="108" y="1195">Controller,</text><text x="108" y="1221">Keyboard &amp; Mouse</text>
     <text x="108" y="1282">Audio</text>
+    <text x="108" y="1369">Text &amp; Voice</text><text x="108" y="1395">Languages</text>
   </g>
 
   <!-- status pills: done (green), working (blue), in progress (amber) -->
@@ -129,7 +133,8 @@
     <g transform="translate(382,1003)"><rect width="200" height="44" rx="22" fill="#33240b" stroke="#ffb547" stroke-width="2"/><circle cx="24" cy="22" r="11" fill="#ffb547"/><circle cx="19" cy="22" r="1.8" fill="#33240b"/><circle cx="24" cy="22" r="1.8" fill="#33240b"/><circle cx="29" cy="22" r="1.8" fill="#33240b"/><text x="46" y="29" fill="#ffe2b0">In Progress</text></g>
     <g transform="translate(382,1090)"><rect width="200" height="44" rx="22" fill="#0d2740" stroke="#4cc3ff" stroke-width="2"/><circle cx="24" cy="22" r="11" fill="none" stroke="#4cc3ff" stroke-width="3"/><path d="M24 15v7l5 3" fill="none" stroke="#4cc3ff" stroke-width="2.5" stroke-linecap="round"/><text x="46" y="29" fill="#c6ebff">Working</text></g>
     <g transform="translate(382,1177)"><rect width="200" height="44" rx="22" fill="#0d2740" stroke="#4cc3ff" stroke-width="2"/><circle cx="24" cy="22" r="11" fill="none" stroke="#4cc3ff" stroke-width="3"/><path d="M24 15v7l5 3" fill="none" stroke="#4cc3ff" stroke-width="2.5" stroke-linecap="round"/><text x="46" y="29" fill="#c6ebff">Working</text></g>
-    <g transform="translate(382,1264)"><rect width="200" height="44" rx="22" fill="#33240b" stroke="#ffb547" stroke-width="2"/><circle cx="24" cy="22" r="11" fill="#ffb547"/><circle cx="19" cy="22" r="1.8" fill="#33240b"/><circle cx="24" cy="22" r="1.8" fill="#33240b"/><circle cx="29" cy="22" r="1.8" fill="#33240b"/><text x="46" y="29" fill="#ffe2b0">In Progress</text></g>
+    <g transform="translate(382,1264)"><rect width="200" height="44" rx="22" fill="#0d2740" stroke="#4cc3ff" stroke-width="2"/><circle cx="24" cy="22" r="11" fill="none" stroke="#4cc3ff" stroke-width="3"/><path d="M24 15v7l5 3" fill="none" stroke="#4cc3ff" stroke-width="2.5" stroke-linecap="round"/><text x="46" y="29" fill="#c6ebff">Working</text></g>
+    <g transform="translate(382,1351)"><rect width="200" height="44" rx="22" fill="#0f2f22" stroke="#3fd47a" stroke-width="2"/><circle cx="24" cy="22" r="11" fill="#3fd47a"/><path d="M18.5 22.5l4 4 7.5-8" fill="none" stroke="#0f2f22" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/><text x="46" y="29" fill="#bff5d4">Complete</text></g>
   </g>
 
   <!-- what it means -->
@@ -140,16 +145,18 @@
     <text x="624" y="751">Threads, locks, condition variables,</text><text x="624" y="775">memory and 4-core scheduling run the</text><text x="624" y="799">game's own job system.</text>
     <text x="624" y="850">Files, controllers, applets, time and</text><text x="624" y="874">accounts: enough to boot into the game.</text>
     <text x="624" y="937">41,056 game files (15 GB), read from an</text><text x="624" y="961">image built from your own RomFS.</text>
-    <text x="624" y="1012">The main menu renders correctly. In 3D</text><text x="624" y="1036">scenes geometry and textures are right;</text><text x="624" y="1060">the deferred lighting is being fixed.</text>
-    <text x="624" y="1111">Every shader of the opening translates to</text><text x="624" y="1135">Vulkan, gathers and shared memory included.</text>
-    <text x="624" y="1198">The controller reaches the game: the</text><text x="624" y="1222">menus and the HUD respond.</text>
-    <text x="624" y="1285">Plays through a rewritten renderer; moving</text><text x="624" y="1309">to the game SDK's own audio renderer.</text>
+    <text x="624" y="1012">Menus and the Shrine of Resurrection</text><text x="624" y="1036">render lit, with fog and effects, at the</text><text x="624" y="1060">game's 30 fps. The open world is next.</text>
+    <text x="624" y="1111">Every shader of the opening and the shrine</text><text x="624" y="1135">translates to Vulkan.</text>
+    <text x="624" y="1186">Any controller, by button position.</text><text x="624" y="1210">Keyboard and mouse: every key</text><text x="624" y="1234">remappable, a mouse camera.</text>
+    <text x="624" y="1285">Music, sound effects and voices, mixed by</text><text x="624" y="1309">the game SDK's own audio renderer.</text>
+    <text x="624" y="1360">Text and voices chosen separately: e.g.</text><text x="624" y="1384">Spanish text, Japanese voices. Menus in</text><text x="624" y="1408">all 11 of the game's languages.</text>
   </g>
 
+  <g transform="translate(0,87)">
   <!-- roadmap -->
   <text x="40" y="1384" font-size="26" font-weight="700" fill="#ffffff">Roadmap</text>
-  <rect x="28" y="1404" width="1024" height="336" rx="16" fill="url(#card)" stroke="#27486b" stroke-width="2"/>
-  <line x1="540" y1="1420" x2="540" y2="1724" stroke="#1f3a59" stroke-width="1.5"/>
+  <rect x="28" y="1404" width="1024" height="398" rx="16" fill="url(#card)" stroke="#27486b" stroke-width="2"/>
+  <line x1="540" y1="1420" x2="540" y2="1786" stroke="#1f3a59" stroke-width="1.5"/>
   <g font-size="19.5" font-weight="600" fill="#ffffff">
     <text x="56" y="1452">Native launcher for Windows &amp; Linux</text>
     <text x="56" y="1514">PC graphics options</text>
@@ -161,6 +168,8 @@
     <text x="566" y="1576">Keyboard &amp; mouse, remappable keys</text>
     <text x="566" y="1638">Latest game version (1.8.2)</text>
     <text x="566" y="1700">DLC</text>
+    <text x="56" y="1762">Text &amp; voice languages, separately</text>
+    <text x="566" y="1762">Menus in the game's 11 languages</text>
   </g>
   <g font-size="15" font-weight="700" text-anchor="middle">
     <!-- left column chips: planned -->
@@ -171,16 +180,22 @@
     <g transform="translate(430,1678)"><rect width="92" height="30" rx="15" fill="#1a2638" stroke="#8ea3c0" stroke-width="1.5"/><text x="46" y="20" fill="#cbd7e6">PLANNED</text></g>
     <!-- right column -->
     <g transform="translate(942,1430)"><rect width="92" height="30" rx="15" fill="#1a2638" stroke="#8ea3c0" stroke-width="1.5"/><text x="46" y="20" fill="#cbd7e6">PLANNED</text></g>
-    <g transform="translate(942,1492)"><rect width="92" height="30" rx="15" fill="#1a2638" stroke="#8ea3c0" stroke-width="1.5"/><text x="46" y="20" fill="#cbd7e6">PLANNED</text></g>
-    <g transform="translate(942,1554)"><rect width="92" height="30" rx="15" fill="#0d2740" stroke="#4cc3ff" stroke-width="1.5"/><text x="46" y="20" fill="#c6ebff">PARTIAL</text></g>
+    <g transform="translate(942,1492)"><rect width="92" height="30" rx="15" fill="#0d2740" stroke="#4cc3ff" stroke-width="1.5"/><text x="46" y="20" fill="#c6ebff">PARTIAL</text></g>
+    <g transform="translate(942,1554)"><rect width="92" height="30" rx="15" fill="#0f2f22" stroke="#3fd47a" stroke-width="1.5"/><text x="46" y="20" fill="#bff5d4">YES</text></g>
     <g transform="translate(942,1616)"><rect width="92" height="30" rx="15" fill="#0f2f22" stroke="#3fd47a" stroke-width="1.5"/><text x="46" y="20" fill="#bff5d4">YES</text></g>
     <g transform="translate(942,1678)"><rect width="92" height="30" rx="15" fill="#261a3d" stroke="#b48cff" stroke-width="1.5"/><text x="46" y="20" fill="#e2d3ff">LATER</text></g>
+    <g transform="translate(430,1740)"><rect width="92" height="30" rx="15" fill="#0f2f22" stroke="#3fd47a" stroke-width="1.5"/><text x="46" y="20" fill="#bff5d4">YES</text></g>
+    <g transform="translate(942,1740)"><rect width="92" height="30" rx="15" fill="#0f2f22" stroke="#3fd47a" stroke-width="1.5"/><text x="46" y="20" fill="#bff5d4">YES</text></g>
   </g>
   <g stroke="#1f3a59" stroke-width="1.2">
     <line x1="44" y1="1476" x2="524" y2="1476"/><line x1="44" y1="1538" x2="524" y2="1538"/><line x1="44" y1="1600" x2="524" y2="1600"/><line x1="44" y1="1662" x2="524" y2="1662"/>
     <line x1="556" y1="1476" x2="1036" y2="1476"/><line x1="556" y1="1538" x2="1036" y2="1538"/><line x1="556" y1="1600" x2="1036" y2="1600"/><line x1="556" y1="1662" x2="1036" y2="1662"/>
+    <line x1="44" y1="1724" x2="524" y2="1724"/><line x1="556" y1="1724" x2="1036" y2="1724"/>
   </g>
 
+  </g>
+
+  <g transform="translate(0,149)">
   <!-- callout -->
   <rect x="28" y="1768" width="1024" height="128" rx="16" fill="url(#callout)" stroke="#4cc3ff" stroke-width="2"/>
   <g transform="translate(56,1800)" fill="none" stroke="#5fd4ff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round">
@@ -188,11 +203,12 @@
     <path d="M30 14a11 11 0 0 0-6 20v5h12v-5a11 11 0 0 0-6-20zM25 44h10"/>
   </g>
   <text x="136" y="1812" font-size="27" font-weight="700" fill="#5fd4ff">What this means right now</text>
-  <text x="136" y="1848" font-size="19.5" fill="#e6eef7">The game boots on PC to its main menu and into the first area. Correct</text>
-  <text x="136" y="1874" font-size="19.5" fill="#e6eef7">3D lighting is the main step left before it becomes playable.</text>
+  <text x="136" y="1848" font-size="19.5" fill="#e6eef7">It boots to the main menu and plays the opening in the lit Shrine of</text>
+  <text x="136" y="1874" font-size="19.5" fill="#e6eef7">Resurrection at 30 fps. Next: the Great Plateau and the open world.</text>
 
   <!-- footer -->
   <line x1="60" y1="1922" x2="140" y2="1922" stroke="#3a5577"/>
   <line x1="940" y1="1922" x2="1020" y2="1922" stroke="#3a5577"/>
   <text x="540" y="1928" font-size="16" fill="#9fb2c8" text-anchor="middle">Bring your own dump: no game files, keys or tools included. Fan project, not affiliated with Nintendo.</text>
+  </g>
 </svg>
