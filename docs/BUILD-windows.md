@@ -26,9 +26,17 @@ files (as for players), given the generator and the compiler (`make gen-helper`,
 Run from a shell that has `C:\msys64\ucrt64\bin` on PATH (SDL3, FFmpeg, Vulkan, shaderc DLLs).
 
 ## Package
+    make deps-windows   # once: FFmpeg built as LGPL only (build/deps-win; downloads its source, needs nasm)
     make gen-helper     # the game code generator without Python (build/helper/swgen)
     tools/fetch_zig.sh  # the compiler the start screen builds the game code with (build/zig)
-    make dist           # -> build/dist/Savage Wind-<version>-windows.zip (no game code inside)
+    make dist           # -> build/dist/SavageWind-<version>-windows.zip (no game code inside)
+
+`make gen-helper` freezes the generator with a python.org CPython (`py -3.12` by default; another one with
+`GEN_PY="py -3.14"`, as long as unicorn and capstone have wheels for it). `make dist` also makes the slim compiler
+(`tools/zig_slim.sh`: only the headers the game code includes, and zig's runtime built ahead of time), so the
+start screen's build doesn't compile zig's own libraries on the player's machine. The version is
+`SAVAGEWIND_VERSION` in `runtime/ui/launcher.mm`. Before a release, test the zip as a player would: extract it to a
+new folder, run it with a PATH without MSYS2, set up the game files from the start screen and play.
 
 The zip's `Savage Wind/` folder holds `savagewind.exe` (icon from `docs/icon/icon.ico`, via windres), `swgen/`,
 `zig/` and the MSYS2 DLLs. No installer: game files, saves and settings are kept next to the exe, so

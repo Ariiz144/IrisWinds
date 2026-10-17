@@ -84,7 +84,7 @@ static void save_png(id<MTLTexture> tex, const char *path) {
 #endif
 
 // The version this build is (also names the release files; Makefile / tools/bundle_macos.sh / make_dmg.sh read it).
-#define SAVAGEWIND_VERSION "dev"
+#define SAVAGEWIND_VERSION "0.1.0-alpha.1"
 
 // ------------------------------------------------------------------ game files
 static std::string g_root;  // extracted game: <root>/exefs, <root>/romfs
@@ -115,11 +115,21 @@ static bool nso_build_id(const std::string &main_path, std::string *hex) {
     return true;
 }
 
-// The copied game files alone ("" = there), without the game code built from them. (No version check yet: the
-// supported main module's build id is to be added once known - tools/sw_probe.py prints it.)
+// The game version this build is made for: BOTW 1.8.2, told by its main module's build id (the first 8 bytes;
+// tools/sw_probe.py prints it). Other versions would need their own recompilation work.
+static const char *const SUPPORTED_MAIN[] = {"de0b6ac4efc1dda7"};
+static bool supported_main(const std::string &id) {
+    for (const char *s : SUPPORTED_MAIN)
+        if (id == s) return true;
+    return false;
+}
+
+// The copied game files alone ("" = there), without the game code built from them.
 static std::string check_copied_files(const std::string &root) {
     if (!file_exists(root + "/exefs/main")) return "No game files";
-    if (!nso_build_id(root + "/exefs/main", NULL)) return "Game files unreadable (exefs/main is not an NSO)";
+    std::string id;
+    if (!nso_build_id(root + "/exefs/main", &id)) return "Game files unreadable (exefs/main is not an NSO)";
+    if (!supported_main(id)) return "Game files aren't version 1.8.2";
     if (!is_dir(root + "/romfs") || !file_exists(root + "/romfs.bin")) return "Game data missing";
     return "";
 }
@@ -150,12 +160,12 @@ static void set_job(const std::string &s, bool failed = false, const std::string
     pthread_mutex_unlock(&g_lock);
 }
 
-// Setup failures: a short headline and what to do next (also SAVAGEWIND_LAUNCHER_SHOT=<f>:fail<1-6>, screenshots)
-enum { FAIL_NOT_FOUND = 1, FAIL_UNUSABLE, FAIL_COPY, FAIL_VERSION, FAIL_MISSING, FAIL_BUILD };
+// Setup failures: a short headline and what to do next (also SAVAGEWIND_LAUNCHER_SHOT=<f>:fail<1-7>, screenshots)
+enum { FAIL_NOT_FOUND = 1, FAIL_UNUSABLE, FAIL_COPY, FAIL_VERSION, FAIL_MISSING, FAIL_BUILD, FAIL_NOT_182 };
 static void set_failure(int k) {
     static const char *const head[] = {"", "No game files found in that folder", "Those files can't be used",
                                        "Setup didn't finish", "The game's main module can't be read", "Game files incomplete",
-                                       "The game code didn't build"};
+                                       "The game code didn't build", "Not version 1.8.2"};
     static const char *const hint[] = {
         "",
         "Choose the folder that holds the extracted game files (exefs and romfs).",
@@ -163,8 +173,10 @@ static void set_failure(int k) {
         "Make sure there's enough free space for a copy of the game files and try again.",
         "exefs/main must be the decrypted, extracted main module (an NSO file).",
         "Some files are missing. Choose the folder again; if it happens again, extract the game again.",
-        "Make sure there's enough free space and try again. The log has the details."};
-    if (k >= 1 && k <= 6) set_job(head[k], true, hint[k]);
+        "Make sure there's enough free space and try again. The log has the details.",
+        "Savage Wind needs the game updated to version 1.8.2: the 1.8.2 ExeFS and the RomFS with the update merged "
+        "in. Update the game on your console, extract it again and choose that folder."};
+    if (k >= 1 && k <= 7) set_job(head[k], true, hint[k]);
 }
 
 // exefs: the folder with main and main.npdm; romfs: a folder named romfs (the game's data root). Found in the picked
@@ -247,6 +259,7 @@ static void *extract_thread(void *) {
         std::string id;
         if (!nso_build_id(exefs + "/main", &id)) { set_failure(FAIL_VERSION); goto done; }
         fprintf(stderr, "[launcher] main build id %s\n", id.c_str());
+        if (!supported_main(id)) { set_failure(FAIL_NOT_182); goto done; }  // (before copying 15 GB)
     }
     {
         // (the picked folder can't be Savage Wind's own copy: setting up again deletes that first)
@@ -281,7 +294,8 @@ check:
     {
         std::string why = check_game_files(g_root);
         if (why.empty()) set_job("Game files ready.");
-        else set_failure(why.find("NSO") != std::string::npos ? FAIL_VERSION : FAIL_MISSING);
+        else set_failure(why.find("NSO") != std::string::npos ? FAIL_VERSION
+                         : why.find("1.8.2") != std::string::npos ? FAIL_NOT_182 : FAIL_MISSING);
     }
 done:
     pthread_mutex_lock(&g_lock);

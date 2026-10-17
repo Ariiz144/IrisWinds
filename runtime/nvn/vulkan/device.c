@@ -352,7 +352,8 @@ bool vk_frame_begin(const float clear[4]) {
     cur_frame.ok = false;
     int w, h;
     SDL_GetWindowSizeInPixels(window, &w, &h);
-    if (!w || !h) return false;  // minimised
+    // minimised (Windows keeps the window's size then, but its surface is 0 x 0: every acquire was out of date)
+    if (!w || !h || (SDL_GetWindowFlags(window) & SDL_WINDOW_MINIMIZED)) return false;
     if (!g_vk.swapchain || (uint32_t)w != g_vk.sc_extent.width || (uint32_t)h != g_vk.sc_extent.height) recreate_swapchain();
     if (!g_vk.swapchain) return false;
     static int trace = -1;
@@ -366,7 +367,11 @@ bool vk_frame_begin(const float clear[4]) {
         recreate_swapchain();
         r = vkAcquireNextImageKHR(g_vk.dev, g_vk.swapchain, UINT64_MAX, acquire_sem[slot], VK_NULL_HANDLE, &cur_frame.image);
     }
-    if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) { LOG("[vk] acquire failed: %d\n", r); return false; }
+    if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) {
+        static unsigned failed;  // (a few, then every 1000th: one a frame filled the log)
+        if (failed++ < 5 || failed % 1000 == 0) LOG("[vk] acquire failed: %d (%u times)\n", r, failed);
+        return false;
+    }
     cur_frame.acquired = acquire_sem[slot];
     slot_seq[slot] = vk_pending_seq();
     VkCommandBuffer cb = vk_cmd();

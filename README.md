@@ -15,8 +15,8 @@ its text and voices in any of its languages.
 > [!WARNING]
 > **Not playable yet.** This is early development. Today the game boots to its main menu and plays the opening in
 > the Shrine of Resurrection - lit, with its fog and effects, at the game's own 30 fps, with sound, voices and the
-> HUD - and saves. Nothing past the shrine has been tested yet. There are no releases. Building it is only useful if
-> you want to help develop it.
+> HUD - and saves. Nothing past the shrine has been tested yet. **Alpha 1** (Windows) is a preview for testers, not
+> a way to play the game through.
 
 > [!NOTE]
 > **No game files are included.** Savage Wind Recomp needs your own legally obtained copy of the game, updated to
@@ -55,6 +55,19 @@ its text and voices in any of its languages.
   will be removed. Piracy is not supported in any way.
 - Follow the copyright laws of your country. Dumping a game you own for personal use is legal in some countries and
   not in others; that is your responsibility.
+
+## Getting started (Alpha 1, Windows)
+
+1. Download `SavageWind-0.1.0-alpha.1-windows.zip` from [Releases](https://github.com/Revivedx/SavageWindRecomp/releases)
+   and extract it to a folder you can write to (not Program Files): your game files, saves and settings are kept in
+   that folder.
+2. Run `savagewind.exe`. On the start screen choose **Set up game files**, pick the folder with your own extracted
+   game (`exefs/` and `romfs/`, version 1.8.2, see below) and start the setup. It checks the version, copies the
+   files, builds the data image and recompiles the game code on your machine - once, and it takes a while (about 40
+   minutes with a 12-thread CPU). Your own files aren't changed.
+3. **Play**. The overlay menu (Esc or F1) has the settings, including the text and voice languages.
+
+Needs Windows 10 or later, a CPU with AVX2, a GPU with Vulkan 1.3 and about 35 GB of free disk space.
 
 ## What you need
 
@@ -105,7 +118,7 @@ switches - are in [docs/SAVAGE-WIND.md](docs/SAVAGE-WIND.md).
 
 - Correct graphics on the Great Plateau, then the rest of the game
 - Always the latest game version (1.8.2 today); DLC support later
-- A launcher for Windows and Linux with PC-style graphics options
+- A launcher for Windows and Linux with PC-style graphics options (the start screen: Windows in Alpha 1, Linux next)
 - Higher internal resolutions, up to 4K and beyond
 - Upscaling with frame generation: AMD FSR and NVIDIA DLSS (each under its SDK's own license)
 - Mods
@@ -162,6 +175,22 @@ Savage Wind Recomp's own code is open source under the [MIT License](LICENSE), a
 builds. Third-party components in `third_party/` keep their own licenses. The license covers this project's code
 only: it grants nothing for Nintendo's game, which you must supply yourself.
 
+The Windows release zip also bundles, unchanged unless noted, under their own licenses:
+
+- FFmpeg 9.0.2 (libavcodec, libavformat, libavutil, libswscale), LGPL 2.1 or later: built from the official
+  [source](https://ffmpeg.org/releases/ffmpeg-9.0.2.tar.xz) as LGPL only, without GPL or nonfree parts, by
+  [tools/build_deps_windows.sh](tools/build_deps_windows.sh). They are separate DLLs: you can replace them with your
+  own build of the same version.
+- From [MSYS2](https://packages.msys2.org) (UCRT64, sources there): SDL 3.4.18 (zlib), shaderc 2026.4 (Apache 2.0),
+  libiconv 1.19 (LGPL 2.1 or later), the GCC 16.2 runtime (libgcc, libstdc++: GPL 3 with the GCC Runtime Library
+  Exception) and winpthreads (MIT and BSD).
+- Zig 0.17.0 (MIT; its bundled LLVM, Clang and LLD: Apache 2.0 with LLVM Exceptions; the MinGW-w64 headers and
+  runtime: their own permissive licenses), trimmed to what the game code build uses.
+- `swgen/`, this project's generator frozen with PyInstaller 6.22 (GPL 2.0 with the bootloader exception): Python
+  3.14 (PSF License), Capstone 5.0.9 (BSD), [Unicorn 2.1.4](https://github.com/unicorn-engine/unicorn/tree/2.1.4)
+  (GPL 2.0, source at that link) and python-lz4 4.4.5 (BSD).
+- The Baloo 2 font (SIL OFL 1.1, `Baloo2-OFL.txt`).
+
 ---
 
 ## Español (resumen)
@@ -174,6 +203,10 @@ introducción en el Santuario de la Vida, iluminado, a los 30 FPS del juego, con
   el idioma del texto (cualquiera de los 15 del juego) y, por separado, el de las voces (por ejemplo, texto en
   español con voces en japonés). Los menús de Savage Wind están en los 11 idiomas del juego.
 - Teclado y ratón con todas las teclas reasignables, cualquier mando, y un indicador de rendimiento (F10).
+- **Alpha 1** (Windows), una versión de prueba: descarga el zip desde
+  [Releases](https://github.com/Revivedx/SavageWindRecomp/releases), extráelo en una carpeta donde puedas escribir,
+  abre `savagewind.exe`, elige **Set up game files** con tu juego extraído (1.8.2) y después **Play**. La preparación
+  se hace una sola vez y tarda unos 40 minutos; necesita unos 35 GB libres.
 
 - No incluye archivos del juego, código del juego, assets, fuentes ni keys, y nunca los va a incluir.
 - Necesitas tu propia copia legal del juego actualizada a la **1.8.2**, extraída de **tu propia** consola. Este

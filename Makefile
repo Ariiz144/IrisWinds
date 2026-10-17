@@ -220,7 +220,7 @@ app:
 dmg: app
 	tools/make_dmg.sh
 
-# Windows: build/dist/Savage Wind-<version>-windows.zip, top folder "Savage Wind/": the exe, what the start screen
+# Windows: build/dist/SavageWind-<version>-windows.zip, top folder "Savage Wind/": the exe, what the start screen
 # builds the game code with on the player's machine (make gen-helper, tools/fetch_zig.sh slimmed by
 # tools/zig_slim.sh: its runtime built ahead of time, gamelib-src/, the exe's import library)
 # and the DLLs they load (runs without MSYS2). No game code. The exe is a release build in $(WIN_B):
@@ -253,9 +253,9 @@ dist:
 	PATH="$(CURDIR)/build/deps-win/bin:$$PATH" ldd $(WIN_B)/savagewind.exe | awk '(/ucrt64/ || /deps-win/) && !/vulkan-1/ {print $$3}' | sort -u | \
 	    xargs -I{} cp -u {} "$(DIST)/"
 	! ls "$(DIST)" | grep -iE 'x264|x265|xvid|postproc'  # (no GPL codec libraries in the release)
-	cd build/dist && if command -v zip >/dev/null; then zip -qr "Savage Wind-$(VERSION)-windows.zip" "Savage Wind"; \
-	    else /c/Windows/System32/tar.exe -a -cf "Savage Wind-$(VERSION)-windows.zip" "Savage Wind"; fi
-	@echo "build/dist/Savage Wind-$(VERSION)-windows.zip"
+	cd build/dist && if command -v zip >/dev/null; then zip -qr "SavageWind-$(VERSION)-windows.zip" "Savage Wind"; \
+	    else /c/Windows/System32/tar.exe -a -cf "SavageWind-$(VERSION)-windows.zip" "Savage Wind"; fi
+	@echo "build/dist/SavageWind-$(VERSION)-windows.zip"
 
 # The game code generator as a standalone helper, so players need no Python: build/helper/swgen/ (swgen[.exe] +
 # _internal/), frozen by PyInstaller from tools/swgen.spec in its own venv (build/gen-venv). Shipped as swgen/ next to

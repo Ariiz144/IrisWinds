@@ -54,7 +54,7 @@
   <!-- title -->
   <text x="44" y="96" font-size="64" font-weight="800" fill="#ffffff">Savage Wind Recomp</text>
   <text x="46" y="148" font-size="31" font-weight="700" fill="#5fd4ff">Native PC port of Breath of the Wild 1.8.2</text>
-  <text x="46" y="188" font-size="22" fill="#b8c9de">Development status and roadmap for non-technical readers · October 2026</text>
+  <text x="46" y="188" font-size="22" fill="#b8c9de">Development status and roadmap for non-technical readers · Alpha 1, October 2026</text>
 
   <!-- status table -->
   <text x="40" y="378" font-size="26" font-weight="700" fill="#ffffff">Where it stands</text>
@@ -173,7 +173,7 @@
   </g>
   <g font-size="15" font-weight="700" text-anchor="middle">
     <!-- left column chips: planned -->
-    <g transform="translate(430,1430)"><rect width="92" height="30" rx="15" fill="#1a2638" stroke="#8ea3c0" stroke-width="1.5"/><text x="46" y="20" fill="#cbd7e6">PLANNED</text></g>
+    <g transform="translate(430,1430)"><rect width="92" height="30" rx="15" fill="#0d2740" stroke="#4cc3ff" stroke-width="1.5"/><text x="46" y="20" fill="#c6ebff">PARTIAL</text></g>
     <g transform="translate(430,1492)"><rect width="92" height="30" rx="15" fill="#1a2638" stroke="#8ea3c0" stroke-width="1.5"/><text x="46" y="20" fill="#cbd7e6">PLANNED</text></g>
     <g transform="translate(430,1554)"><rect width="92" height="30" rx="15" fill="#1a2638" stroke="#8ea3c0" stroke-width="1.5"/><text x="46" y="20" fill="#cbd7e6">PLANNED</text></g>
     <g transform="translate(430,1616)"><rect width="92" height="30" rx="15" fill="#1a2638" stroke="#8ea3c0" stroke-width="1.5"/><text x="46" y="20" fill="#cbd7e6">PLANNED</text></g>

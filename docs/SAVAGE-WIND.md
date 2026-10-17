@@ -32,6 +32,14 @@ git -c credential.helper= -c "credential.helper=!gh auth git-credential" push or
 Antes de cada publicación: `git ls-tree -r --name-only main` no debe tener archivos del juego, código generado,
 keys ni rutas personales.
 
+Releases: el zip de `make dist` (ver `docs/BUILD-windows.md`) se sube con `gh release create v<versión>
+--prerelease` sobre el commit de `public`. Alpha 1 (`0.1.0-alpha.1`, 2026-10-17) se probó como jugador: zip
+extraído en una carpeta nueva, PATH sin MSYS2, preparación desde la pantalla de inicio (copia, `romfs.bin`,
+generación y compilación con swgen + zig: 2308 s con 12 hilos) y PLAY hasta tener a Link en el Santuario, a 30
+fps. La carpeta queda en ~30,5 GB (romfs 15 GB, `romfs.bin` 15,1 GB, `swgame.dll` 209 MB), ~32 GB durante la
+compilación. Para la prueba sirve `SAVAGEWIND_LAUNCHER_AUTOPLAY=1` con `SAVAGEWIND_HOST_INPUT` (la tecla E es A)
+y `SAVAGEWIND_SCREENSHOT_EVERY` (capturas en `build/` de la carpeta de trabajo).
+
 ## Estructura de entrada esperada
 
 ```

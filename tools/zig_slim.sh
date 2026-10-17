@@ -21,8 +21,9 @@ for f in "$@"; do
     case $f in -march=*) c=${f#-march=}; flags+=("-mcpu=${c//-/_}") ;; *) flags+=("$f") ;; esac
 done
 
-# 1. the headers: what the generated C (cpu.h, simd.h) and tools/gamelib_entry.c include
-printf '#include "cpu.h"\n#include "simd.h"\n' > $W/probe.c
+# 1. the headers: what the generated C (cpu.h, simd.h; setjmp.h where it calls the guest setjmp: tools/gen.py
+#    setjmp_call) and tools/gamelib_entry.c include
+printf '#include "cpu.h"\n#include "simd.h"\n#include <setjmp.h>\n' > $W/probe.c
 $Z/zig.exe cc "${flags[@]}" -Iruntime -c $W/probe.c -o $W/probe.o -MD -MF $W/probe.d
 $Z/zig.exe cc "${flags[@]}" -Iruntime '-DGAMELIB_ID="0"' -c tools/gamelib_entry.c -o $W/entry.o -MD -MF $W/entry.d
 n=0
@@ -36,7 +37,7 @@ cp $Z/lib/std/std.zig $O/lib/std/
 
 # 2. the runtime: a probe DLL importing from the exe, linked the way the full zig does it (-v: its lld-link line)
 printf 'LIBRARY savagewind.exe\nEXPORTS\nprobe_host\n' > $W/host.def
-printf 'void probe_host(void);\n__declspec(dllexport) void probe(void) { probe_host(); }\n' > $W/dll.c
+printf '#include <setjmp.h>\nvoid probe_host(void);\nstatic jmp_buf jb;\n__declspec(dllexport) void probe(void) { if (!setjmp(jb)) probe_host(); }\n' > $W/dll.c
 ZA=$PWD/$Z/zig.exe
 (cd $W && $ZA dlltool -d host.def -l host.a -m i386:x86-64 && $ZA cc "${flags[@]}" -c dll.c -o dll.o &&
     $ZA cc -shared -o probe.dll dll.o host.a -v 2> link.log) || { echo "tools/zig_slim.sh: probe link failed ($W/link.log)"; exit 1; }
