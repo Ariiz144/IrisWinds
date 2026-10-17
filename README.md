@@ -95,6 +95,25 @@ switches - are in [docs/SAVAGE-WIND.md](docs/SAVAGE-WIND.md).
 - Automatic recognition of any controller
 - Keyboard and mouse, with every key and button remappable
 
+## Controls
+
+Any controller SDL knows works, by button position. Keyboard and mouse defaults:
+
+| Action | Key | Action | Key |
+|---|---|---|---|
+| Move | W A S D | Camera | Mouse (or I J K L) |
+| Walk (hold) | C | Crouch | Left Ctrl |
+| Jump (X) | Space | Sprint / back (B) | Left Shift |
+| Interact / confirm (A) | E | Attack (Y) | Left click |
+| Shield / lock on (ZL) | Right click | Bow (ZR) | F |
+| Rune (L) | Q | Throw (R) | R |
+| Look (right stick press) | Middle click | D-pad | Arrow keys |
+| Inventory (Plus) | Tab | Map (Minus) | M |
+
+Every key and mouse button can be remapped in the overlay menu (Esc or F1), which also frees the cursor and has the
+mouse sensitivity and Y inversion. F10 cycles the performance overlay (off, FPS, full: CPU, memory and GPU load and
+temperatures, frame times).
+
 ## How it works
 
 The game's AArch64 executables are translated to C (`tools/gen.py`) and compiled into a library next to the app. The

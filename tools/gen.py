@@ -27,7 +27,7 @@ from unicorn import arm64_const as A
 import layout
 from analyze import eh_frame_extents, eh_frame_functions
 from lifter import Insn, Lifter, Unsupported, bits, emit_asm_batch, hx, sext
-from nso import Nso, R_AARCH64_RELATIVE, header
+from nso import Nso, R_AARCH64_JUMP_SLOT, R_AARCH64_RELATIVE, header
 
 SCRATCH_MEM = 0x7300000000
 
@@ -39,6 +39,17 @@ def sext26(w):
 
 def fname(a):
     return f'f_{a:x}'
+
+
+SETJMP_SYMS = ('setjmp', '_setjmp', '__setjmp')
+
+
+def setjmp_call(t, ret):
+    """A call to the guest setjmp. The recompiled code can't resume in the middle of a function, where the guest
+    longjmp returns to, so the call gets a host setjmp in the C function of the caller (runtime/hle/setjmp.c):
+    the guest longjmp (HLE) restores the registers the guest setjmp saved and jumps back here with x0 set."""
+    return (f'{{ jmp_buf *hb_ = rt_setjmp_slot(c, c->x[0]); '
+            f'if (!setjmp(*hb_)) {{ c->x[30] = {hx(ret)}; {fname(t)}(c); }} }}')
 
 
 def sanitize(sym):
@@ -62,6 +73,7 @@ class Module:
         self.fdes = sorted((base + a, base + b) for a, b in eh_frame_extents(n) if b > a)
         self.fde_starts = [a for a, _ in self.fdes]
         self.jt_cache = {}
+        self.setjmps = self.setjmp_targets()
 
     def in_text(self, a):
         return self.lo <= a < self.hi and a % 4 == 0
@@ -75,6 +87,27 @@ class Module:
 
     def word(self, a):
         return self.words[(a - self.lo) // 4]
+
+    def setjmp_targets(self):
+        """Addresses whose call is a call to setjmp: the function itself (a module defining it) and the PLT stubs
+        bound to it (adrp x16; ldr x17, [x16, #o]; add x16, x16, #o; br x17 through a JUMP_SLOT slot of it)."""
+        n, b = self.nso, self.base
+        out = {b + v for s, info, shndx, v, size in n.syms if shndx and s in SETJMP_SYMS}
+        slots = {b + off for off, typ, si, add in n.relocs
+                 if typ == R_AARCH64_JUMP_SLOT and si < len(n.syms) and n.syms[si][0] in SETJMP_SYMS}
+        if not slots:
+            return out
+        for a in range(self.lo, self.hi - 12, 4):
+            w = self.word(a)
+            if (w & 0x9F00001F) != 0x90000010 or self.word(a + 12) != 0xD61F0220:  # adrp x16 ... br x17
+                continue
+            ld = self.word(a + 4)
+            if (ld & 0xFFC003FF) != 0xF9400211:  # ldr x17, [x16, #imm]
+                continue
+            page = sext(((w >> 29) & 3) | ((w >> 5) & 0x7FFFF) << 2, 21) << 12
+            if (a & ~0xFFF) + page + ((ld >> 10) & 0xFFF) * 8 in slots:
+                out.add(a)
+        return out
 
     def lift(self, a):
         ins = self.cache.get(a)
@@ -340,6 +373,9 @@ class Module:
             return [f'if ({ins.cond}) {{ {jump(ins.target)} }}']
         if k == 'bl':
             t = ins.target
+            if t in self.setjmps:
+                refs.add(t)
+                return [setjmp_call(t, a + 4)]
             if self.in_text(t):
                 refs.add(t)
                 return [f'c->x[30] = {hx(a + 4)}; {fname(t)}(c);']
@@ -413,7 +449,10 @@ class Module:
                 out.append(f'    if ({ins.cond}) {{ {jump(ins.target)} }}')
             elif k == 'bl':
                 t = ins.target
-                if self.in_text(t):
+                if t in self.setjmps:
+                    refs.add(t)
+                    out.append('    ' + setjmp_call(t, a + 4))
+                elif self.in_text(t):
                     refs.add(t)
                     out.append(f'    c->x[30] = {hx(a + 4)}; {fname(t)}(c);')
                 else:
@@ -573,6 +612,8 @@ def generate(name, nso, base, outdir, opts):
                 break
         path = os.path.join(outdir, f'{name}_{nchunks:03d}.c')
         text = ['#include "cpu.h"\n' + ('#include "simd.h"\n' if m.lifter.sc else '')]
+        if any('rt_setjmp_slot(' in l for l in body):
+            text += ['#include <setjmp.h>\njmp_buf *rt_setjmp_slot(Cpu *c, uint64_t gbuf);\n']
         text += [f'void {fname(r)}(Cpu *c);\n' for r in sorted(refs)]
         text += [f'void {sanitize(hle[a])}(Cpu *c);\n' for a in sorted(set(hle) & set(fns))]
         text += ['\n'.join(body), '\n']

@@ -4,7 +4,7 @@
 //
 //   opt_begin("##video", scale);
 //   opt_section("Display");
-//   if (opt_toggle("Show FPS", &g_settings.show_fps, false, "Shows the frame rate.")) settings_save();
+//   if (opt_toggle("Room reverb", &g_settings.reverb, true, "The room reverb effect.")) settings_save();
 //   opt_end();
 #pragma once
 

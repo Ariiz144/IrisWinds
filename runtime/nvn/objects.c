@@ -3,6 +3,7 @@
 #include <string.h>
 
 #include "../kernel.h"
+#include "../perfmon.h"
 #include "nvn.h"
 
 void renderer_sync(void);
@@ -423,45 +424,22 @@ static bool tex_set_has(uintptr_t p) {  // (lock held)
         if (g_tex_set[i] == p) return true;
     return false;
 }
-// The texture initialized last at each storage address. A finalized texture still named by a texture pool entry
-// or a copy of its NVNtexture stands for whatever is in its memory now: the texture made there since, if it has
-// the same shape (nvn_texture_current).
-typedef struct { uint64_t addr; NvnTexture *t; } TexAt;
-static TexAt *g_tex_at;
-static uint32_t g_tex_at_cap, g_tex_at_n;
-static void tex_at_put(uint64_t addr, NvnTexture *t) {  // (lock held)
-    if ((g_tex_at_n + 1) * 2 > g_tex_at_cap) {
-        TexAt *old = g_tex_at;
-        uint32_t oc = g_tex_at_cap;
-        g_tex_at_cap = g_tex_at_cap ? g_tex_at_cap * 2 : 4096;
-        g_tex_at = calloc(g_tex_at_cap, sizeof *g_tex_at);
-        g_tex_at_n = 0;
-        for (uint32_t i = 0; i < oc; i++)
-            if (old[i].addr) tex_at_put(old[i].addr, old[i].t);
-        free(old);
-    }
-    uint32_t i = (uint32_t)((addr >> 8) * 0x9E3779B97F4A7C15ull >> 32) & (g_tex_at_cap - 1);
-    while (g_tex_at[i].addr && g_tex_at[i].addr != addr) i = (i + 1) & (g_tex_at_cap - 1);
-    if (!g_tex_at[i].addr) g_tex_at_n++;
-    g_tex_at[i] = (TexAt){addr, t};
-}
-static NvnTexture *tex_at_get(uint64_t addr) {  // (lock held)
-    if (!g_tex_at_cap) return NULL;
-    for (uint32_t i = (uint32_t)((addr >> 8) * 0x9E3779B97F4A7C15ull >> 32) & (g_tex_at_cap - 1); g_tex_at[i].addr;
-         i = (i + 1) & (g_tex_at_cap - 1))
-        if (g_tex_at[i].addr == addr) return g_tex_at[i].t;
-    return NULL;
-}
 
-NvnTexture *nvn_texture_current(NvnTexture *t) {
-    if (!t || !t->finalized || !t->addr) return t;
+// (debugging) log the textures whose storage holds guest address a
+void nvn_debug_textures_at(uint64_t a) {
     pthread_mutex_lock(&g_tex_lock);
-    NvnTexture *u = tex_at_get(t->addr);
+    for (uint32_t i = 0; i < g_tex_cap; i++) {
+        NvnTexture *t = (NvnTexture *)g_tex_set[i];
+        if (!t || !t->addr) continue;
+        uint64_t size = tegra_total_size(&t->layout);
+        if (t->stride * t->height > size) size = t->stride * t->height;
+        if (a >= t->addr && a < t->addr + size)
+            LOG("[debug]   texture #%llu '%s' %ux%u format %#x flags %#x stride %llu at %llx (+%llx)%s\n",
+                (unsigned long long)t->debug_id, t->label, t->width, t->height, t->format, t->flags,
+                (unsigned long long)t->stride, (unsigned long long)t->addr, (unsigned long long)(a - t->addr),
+                t->finalized ? " finalized" : "");
+    }
     pthread_mutex_unlock(&g_tex_lock);
-    if (u && !u->finalized && u->target == t->target && u->format == t->format && u->width == t->width &&
-        u->height == t->height && u->depth == t->depth && u->levels == t->levels && u->samples == t->samples)
-        return u;
-    return t;
 }
 
 RT_ON_RESET(tex_set_reset) {  // (after the renderer's reset: no image is left)
@@ -469,9 +447,6 @@ RT_ON_RESET(tex_set_reset) {  // (after the renderer's reset: no image is left)
     free(g_tex_set);
     g_tex_set = NULL;
     g_tex_cap = g_tex_n = 0;
-    free(g_tex_at);
-    g_tex_at = NULL;
-    g_tex_at_cap = g_tex_at_n = 0;
 }
 
 NVN(nvnTextureInitialize) {
@@ -481,20 +456,22 @@ NVN(nvnTextureInitialize) {
             t->format, t->flags, t->target, t->addr, t->stride);
     pthread_mutex_lock(&g_tex_lock);
     tex_set_put((uintptr_t)t);
-    if (t->addr) tex_at_put(t->addr, t);
     pthread_mutex_unlock(&g_tex_lock);
     SET_HOST(A(0), t);
     RET(1);
 }
-// The live host texture of a guest NVNtexture, or NULL (finalized, never initialized, or not a texture).
-NvnTexture *nvn_texture_live(uint64_t guest) {
+// The host texture a guest NVNtexture holds now (finalized ones too), or NULL (never initialized, or not a texture).
+// Commands take it when they are recorded: on hardware a command buffer holds the texture's address and shape as they
+// were then. BOTW initializes one NVNtexture object again for each step of a chain (exposure: 192x192 down to 3x3)
+// within one command buffer; resolved when executed, every step drew into the last one.
+NvnTexture *nvn_texture_host(uint64_t guest) {
     if (guest < GUEST_LO || guest + 8 > GUEST_HI) return NULL;
     uintptr_t h = (uintptr_t)*(uint64_t *)(uintptr_t)guest;
     if (!h) return NULL;
     pthread_mutex_lock(&g_tex_lock);
-    bool live = tex_set_has(h);
+    bool known = tex_set_has(h);
     pthread_mutex_unlock(&g_tex_lock);
-    return live ? nvn_texture_current((NvnTexture *)h) : NULL;
+    return known ? (NvnTexture *)h : NULL;
 }
 
 // Only the renderer's image goes; the host object stays, and so does the guest object's pointer to it. BOTW copies
@@ -819,9 +796,31 @@ NVN(nvnQueueAcquireTexture) {
     w->next = (w->next + 1) % (w->active ? w->active : 1);
     RET(0);
 }
+// Presentation pace. On the console a frame reaches the screen at a vsync, and the window's present interval
+// (vsyncs per frame) sets the pace: the next acquire waits for a free texture. The HLE presented at once, so the
+// game ran as fast as the host let it (BOTW's main menu at 130 fps, its animations too fast). A present now waits
+// for its frame's turn: interval x 1/60 s after the last one, and never sooner than the frame rate cap allows
+// (SAVAGEWIND_FPS_CAP, default 60: unlocked frame rates need the game's own timing patched first; 0 = no cap).
+static void present_pace(int interval) {
+    static int cap = -1;
+    static uint64_t last;
+    if (cap < 0) cap = getenv("SAVAGEWIND_FPS_CAP") ? atoi(getenv("SAVAGEWIND_FPS_CAP")) : 60;
+    uint64_t period = 16666667ull * (uint64_t)(interval > 0 ? interval : 0);
+    if (cap > 0 && period < 1000000000ull / (uint64_t)cap) period = 1000000000ull / (uint64_t)cap;
+    if (!period) return;
+    uint64_t target = last + period, now = plat_now_ns();
+    if (last && now < target) kernel_sleep_until_ns(target);
+    now = plat_now_ns();
+    last = last && now < target + period ? target : now;  // (steady cadence; after a long frame, start again)
+}
+
 NVN(nvnQueuePresentTexture) {
     NvnWindow *w = HOST(NvnWindow, A(1));
     int i = (int)A(2);
+    static int logged = -1;
+    if (logged != w->interval) { logged = w->interval; LOG("[nvn] window present interval %d\n", w->interval); }
+    present_pace(w->interval);
+    perfmon_frame();
     if (i >= 0 && i < w->num) backend_present(HOST(NvnTexture, w->textures[i]));
 }
 

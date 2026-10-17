@@ -2,6 +2,7 @@
 // (counterpart of the texture half of metal.m and the view helpers of renderer.m).
 #include <SDL3/SDL_timer.h>
 #include <float.h>
+#include <stdarg.h>
 #include <math.h>
 #include <pthread.h>
 #include <stdlib.h>
@@ -353,73 +354,93 @@ static void destroy_image(TexBackend *b) {
     b->mem = VK_NULL_HANDLE;
 }
 
-// Live game textures: an in-place reboot (vk_textures_reset) destroys them all.
-static NvnTexture **g_live;
-static int g_nlive, g_cap_live;
-static void live_add(NvnTexture *t, TexBackend *b) {
-    if (g_nlive == g_cap_live) { g_cap_live = g_cap_live ? g_cap_live * 2 : 1024; g_live = realloc(g_live, g_cap_live * sizeof *g_live); }
-    g_live[g_nlive++] = t;
-    b->reg = g_nlive;
-}
-static void live_remove(TexBackend *b) {
-    if (!b->reg) return;
-    NvnTexture *last = g_live[--g_nlive];
-    g_live[b->reg - 1] = last;
-    if (last->backend) ((TexBackend *)last->backend)->reg = b->reg;
-    b->reg = 0;
-}
-
-// Parked images: a finalized texture's image waits here, keyed by its memory and shape. BOTW 1.8.2 finalizes and
-// initializes its frame's render targets again in the same memory every frame (and samples last frame's): on
-// hardware what was rendered there is still in that memory, so the next texture made with the same memory and
-// shape takes the image over. Unclaimed ones go after a few frames.
-typedef struct {
-    TexBackend *b;
-    uint64_t addr, frame;
-    uint32_t target, format, width, height, depth, levels, samples;
-} Parked;
-static Parked *g_parked;
-static int g_nparked, g_cap_parked;
+// One image per memory and shape. On hardware a texture is its memory: every NVNtexture made over the same memory
+// with the same shape reads and writes the same texels. BOTW 1.8.2 has several such objects at once (pool entries
+// registered with an object it finalized, copies of NVNtexture objects, command buffers recorded before it made its
+// frame's render targets again in the same memory), so they all take the same image. An image no texture holds any
+// more waits a few frames for the next texture made there, then goes.
 #define PARK_FRAMES 4
-
-static bool parked_fits(const Parked *p, const NvnTexture *t) {
-    return p->addr == t->addr && p->target == t->target && p->format == t->format && p->width == t->width &&
-           p->height == t->height && p->depth == t->depth && p->levels == t->levels && p->samples == t->samples;
+#define KEY_BUCKETS 4096
+static TexBackend *g_keyed[KEY_BUCKETS];
+static uint32_t key_bucket(uint64_t addr) { return (uint32_t)((addr >> 9) * 0x9E3779B97F4A7C15ull >> 40) & (KEY_BUCKETS - 1); }
+static void key_of(const NvnTexture *t, uint32_t k[7]) {
+    k[0] = t->target; k[1] = t->format; k[2] = t->width; k[3] = t->height; k[4] = t->depth; k[5] = t->levels; k[6] = t->samples;
 }
+static TexBackend *keyed_find(const NvnTexture *t) {
+    uint32_t k[7];
+    key_of(t, k);
+    for (TexBackend *b = g_keyed[key_bucket(t->addr)]; b; b = b->key_next)
+        if (b->key_addr == t->addr && !memcmp(b->key, k, sizeof k)) return b;
+    return NULL;
+}
+static void keyed_add(TexBackend *b, const NvnTexture *t) {
+    b->key_addr = t->addr;
+    key_of(t, b->key);
+    uint32_t i = key_bucket(t->addr);
+    b->key_next = g_keyed[i];
+    g_keyed[i] = b;
+}
+static void keyed_remove(TexBackend *b) {
+    if (!b->key_addr) return;
+    for (TexBackend **p = &g_keyed[key_bucket(b->key_addr)]; *p; p = &(*p)->key_next)
+        if (*p == b) { *p = b->key_next; break; }
+    b->key_addr = 0;
+}
+
+// Lists that know each element's slot (index + 1, kept in the element; removal swaps the last one in)
+#define SLOT_LIST(name, T, slot)                                                                                    \
+    static T **g_##name;                                                                                            \
+    static int g_n##name, g_cap_##name;                                                                             \
+    static void name##_add(T *x) {                                                                                  \
+        if (g_n##name == g_cap_##name) {                                                                            \
+            g_cap_##name = g_cap_##name ? g_cap_##name * 2 : 1024;                                                  \
+            g_##name = realloc(g_##name, g_cap_##name * sizeof *g_##name);                                          \
+        }                                                                                                           \
+        g_##name[g_n##name++] = x;                                                                                  \
+        x->slot = g_n##name;                                                                                        \
+    }                                                                                                               \
+    static void name##_remove(T *x) {                                                                               \
+        if (!x->slot) return;                                                                                       \
+        T *last = g_##name[--g_n##name];                                                                            \
+        g_##name[x->slot - 1] = last;                                                                               \
+        last->slot = x->slot;                                                                                       \
+        x->slot = 0;                                                                                                \
+    }
+SLOT_LIST(images, TexBackend, all)           // every image (an in-place reboot destroys them all)
+SLOT_LIST(idle, TexBackend, idle)            // images no texture holds
+SLOT_LIST(holders, NvnTexture, backend_slot) // textures holding an image
 
 static void free_backend(TexBackend *b) {
+    keyed_remove(b);
+    idle_remove(b);
+    images_remove(b);
     destroy_image(b);
     free(b->pending_rgba);
     free(b);
 }
 
-static void parked_expire(void) {  // (gpu lock held)
+static void idle_expire(void) {  // (gpu lock held)
     uint64_t now = renderer_present_count();
-    int k = 0;
-    for (int i = 0; i < g_nparked; i++) {
-        if (now - g_parked[i].frame > PARK_FRAMES) free_backend(g_parked[i].b);
-        else g_parked[k++] = g_parked[i];
-    }
-    g_nparked = k;
+    for (int i = g_nidle - 1; i >= 0; i--)
+        if (now - g_idle[i]->idle_frame > PARK_FRAMES) free_backend(g_idle[i]);
 }
 
-static TexBackend *parked_take(const NvnTexture *t) {  // (gpu lock held)
-    if (!t->addr) return NULL;
-    for (int i = g_nparked - 1; i >= 0; i--)
-        if (parked_fits(&g_parked[i], t)) {
-            TexBackend *b = g_parked[i].b;
-            g_parked[i] = g_parked[--g_nparked];
-            return b;
-        }
-    return NULL;
+static void release_backend(NvnTexture *t) {  // (gpu lock held)
+    TexBackend *b = t->backend;
+    if (!b) return;
+    holders_remove(t);
+    t->backend = NULL;
+    if (--b->refs > 0) return;
+    if (!b->key_addr || !b->image) { free_backend(b); return; }
+    b->idle_frame = renderer_present_count();
+    idle_add(b);
 }
 
-// Zombies: finalized textures that still got an image (sampled through an old pool entry or a copy, with nothing
-// made in their memory since). Nothing will finalize them again, so their images go back to the parked ones once
-// unused for a few frames (BOTW's main menu, cycling its artwork, ran the GPU out of memory without this).
+// Zombies: finalized textures that still got an image (sampled through an old pool entry or a copy). Nothing will
+// finalize them again, so they let it go once unused for a few frames (BOTW's main menu, cycling its artwork, ran the
+// GPU out of memory without this).
 static NvnTexture **g_zombies;
 static int g_nzombies, g_cap_zombies;
-static void park_backend(NvnTexture *t);
 
 static void zombies_expire(void) {  // (gpu lock held)
     uint64_t now = renderer_present_count();
@@ -428,7 +449,7 @@ static void zombies_expire(void) {  // (gpu lock held)
         NvnTexture *t = g_zombies[i];
         TexBackend *b = t->backend;
         if (!b) continue;
-        if (now - b->used_frame > PARK_FRAMES) park_backend(t);
+        if (now - b->used_frame > PARK_FRAMES) release_backend(t);
         else g_zombies[k++] = t;
     }
     g_nzombies = k;
@@ -446,16 +467,20 @@ static TexBackend *tex_backend(NvnTexture *t) {
     }
     vk_collect_dead();
     zombies_expire();
-    parked_expire();
-    b = parked_take(t);
+    idle_expire();
+    b = t->addr ? keyed_find(t) : NULL;
     if (b && b->scalable && (b->sx != g_rs_x || b->sy != g_rs_y)) { destroy_image(b); create_image(t, b); }
     if (!b) {
         b = calloc(1, sizeof *b);
         b->scalable = tex_scalable(t);
         create_image(t, b);
+        images_add(b);
+        if (t->addr) keyed_add(b, t);
     }
+    idle_remove(b);
+    b->refs++;
     t->backend = b;
-    live_add(t, b);
+    holders_add(t);
     if (t->finalized) {
         b->used_frame = renderer_present_count();
         if (g_nzombies == g_cap_zombies) {
@@ -467,39 +492,20 @@ static TexBackend *tex_backend(NvnTexture *t) {
     return b;
 }
 
-static void park_backend(NvnTexture *t) {  // (gpu lock held) its image waits for the next texture made in its memory
-    TexBackend *b = t->backend;
-    if (b) {
-        live_remove(b);
-        if (t->addr && b->image) {
-            if (g_nparked == g_cap_parked) {
-                g_cap_parked = g_cap_parked ? g_cap_parked * 2 : 256;
-                g_parked = realloc(g_parked, g_cap_parked * sizeof *g_parked);
-            }
-            g_parked[g_nparked++] = (Parked){b, t->addr, renderer_present_count(), t->target, t->format, t->width,
-                                             t->height, t->depth, t->levels, t->samples};
-        } else {
-            free_backend(b);
-        }
-    }
-    t->backend = NULL;
-}
-
 void backend_texture_destroyed(NvnTexture *t) {
     gpu_lock();
-    park_backend(t);
+    release_backend(t);
     gpu_unlock();
 }
 
 // Reboot (device.c backend_reset; GPU idle): every game texture and its views go.
 void vk_textures_reset(void) {
-    int n = g_nlive;
-    while (g_nlive > 0) backend_texture_destroyed(g_live[g_nlive - 1]);
-    for (int i = 0; i < g_nparked; i++) free_backend(g_parked[i].b);
-    g_nparked = 0;
+    int n = g_nimages;
+    while (g_nholders > 0) release_backend(g_holders[g_nholders - 1]);
+    while (g_nimages > 0) free_backend(g_images[g_nimages - 1]);
     g_nzombies = 0;
     vk_collect_dead();
-    LOG("[vk] reboot: %d textures released\n", n);
+    LOG("[vk] reboot: %d images released\n", n);
 }
 
 // ================================================================== uploads (same change detection as metal.m)
@@ -657,8 +663,109 @@ static void upload_texture(NvnTexture *t, TexBackend *b) {
     }
 }
 
+// (debugging) SAVAGEWIND_TRACE_TEX=<w>x<h>[,<w>x<h>...] or all: textures keep a history of their last writes (draws
+// into them with the textures those sample, copies, guest-memory uploads). When one is copied to a buffer (the CPU
+// reads it: a screenshot), its history is logged, then those of the textures it was made from, 4 levels deep.
+static int trace_mode = -1;  // 0 off, 1 the listed sizes, 2 every texture
+static int trace_w[8], trace_h[8], trace_nsizes;
+bool vk_trace_tex(NvnTexture *t) {
+    if (trace_mode < 0) {
+        const char *e = getenv("SAVAGEWIND_TRACE_TEX");
+        trace_mode = !e ? 0 : !strcmp(e, "all") ? 2 : 1;
+        for (const char *p = e; trace_mode == 1 && p && *p && trace_nsizes < 8;) {
+            if (sscanf(p, "%dx%d", &trace_w[trace_nsizes], &trace_h[trace_nsizes]) == 2) trace_nsizes++;
+            p = strchr(p, ',');
+            if (p) p++;
+        }
+    }
+    if (!trace_mode || !t) return false;
+    if (trace_mode == 2) return true;
+    for (int i = 0; i < trace_nsizes; i++)
+        if ((int)t->width == trace_w[i] && (int)t->height == trace_h[i]) return true;
+    return false;
+}
+#define TRACE_EVENTS 8
+#define TRACE_SRCS 6
+typedef struct {
+    uint64_t mem;  // the texels' guest address (objects over the same memory share it), else the object
+    unsigned n;
+    uint64_t last_frame, last_key;  // an event repeated in a frame with the same key (a draw's shader) is kept once
+    NvnTexture *src[TRACE_SRCS];    // the textures it was last made from (sampled by draws into it, copied)
+    unsigned nsrc;
+    char ev[TRACE_EVENTS][320];
+} TraceHist;
+static TraceHist *trace_tab;
+#define TRACE_CAP (1u << 14)
+static pthread_mutex_t trace_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t trace_mem(NvnTexture *t) { return t->addr ? t->addr : (uint64_t)(uintptr_t)t; }
+static TraceHist *trace_entry(NvnTexture *t) {  // (lock held)
+    if (!trace_tab && !(trace_tab = calloc(TRACE_CAP, sizeof *trace_tab))) return NULL;
+    uint64_t m = trace_mem(t);
+    uint32_t i = (uint32_t)((m >> 4) * 0x9E3779B97F4A7C15ull >> 40) & (TRACE_CAP - 1);
+    for (uint32_t k = 0; k < 64; k++, i = (i + 1) & (TRACE_CAP - 1)) {
+        if (trace_tab[i].mem == m) return &trace_tab[i];
+        if (!trace_tab[i].mem) { trace_tab[i].mem = m; return &trace_tab[i]; }
+    }
+    return NULL;
+}
+void vk_trace_event(NvnTexture *t, uint64_t key, NvnTexture *const *srcs, int nsrcs, const char *fmt, ...) {
+    if (!vk_trace_tex(t)) return;
+    pthread_mutex_lock(&trace_lock);
+    TraceHist *h = trace_entry(t);
+    uint64_t frame = vk_frame_counter();
+    if (h && !(key && h->n && h->last_frame == frame && h->last_key == key)) {
+        h->last_frame = frame;
+        h->last_key = key;
+        char *e = h->ev[h->n++ % TRACE_EVENTS];
+        int o = snprintf(e, sizeof h->ev[0], "frame %llu: #%llu f%#x ", (unsigned long long)frame,
+                         (unsigned long long)t->debug_id, t->format);
+        va_list ap;
+        va_start(ap, fmt);
+        vsnprintf(e + o, sizeof h->ev[0] - (size_t)o, fmt, ap);
+        va_end(ap);
+        for (int i = 0; i < nsrcs; i++) {
+            bool have = !srcs[i] || trace_mem(srcs[i]) == trace_mem(t);
+            for (unsigned k = 0; k < TRACE_SRCS && !have; k++) have = h->src[k] == srcs[i];
+            if (!have) h->src[h->nsrc++ % TRACE_SRCS] = srcs[i];
+        }
+    }
+    pthread_mutex_unlock(&trace_lock);
+}
+static void trace_dump(NvnTexture *t, int depth, NvnTexture **done, int *ndone) {  // (lock held)
+    for (int i = 0; i < *ndone; i++) if (trace_mem(done[i]) == trace_mem(t)) return;
+    if (*ndone < 64) done[(*ndone)++] = t;
+    TraceHist *h = trace_entry(t);
+    unsigned n = h ? h->n : 0, first = n > TRACE_EVENTS ? n - TRACE_EVENTS : 0;
+    LOG("[trace] %*s#%llu %ux%u f%#x flags %#x target %u levels %u at %llx: last %u of %u events\n", depth * 2, "",
+        (unsigned long long)t->debug_id, t->width, t->height, t->format, t->flags, t->target, t->levels,
+        (unsigned long long)t->addr, n - first, n);
+    for (unsigned j = first; j < n; j++) LOG("[trace] %*s  %s\n", depth * 2, "", h->ev[j % TRACE_EVENTS]);
+    if (depth < 4 && h)
+        for (unsigned k = 0; k < TRACE_SRCS && k < h->nsrc; k++) trace_dump(h->src[k], depth + 1, done, ndone);
+}
+void vk_trace_dump(NvnTexture *t) {
+    if (!vk_trace_tex(t)) return;
+    NvnTexture *done[64];
+    int ndone = 0;
+    pthread_mutex_lock(&trace_lock);
+    trace_dump(t, 0, done, &ndone);
+    pthread_mutex_unlock(&trace_lock);
+    // and what they hold now: build/trace_<n>_<id>.png (the copied texture first, then its sources in dump order)
+    extern void renderer_save_texture_tex(TexBackend *b, const char *path);
+    static int saves;
+    for (int i = 0; i < ndone && i < 6 && saves < 4; i++) {
+        if (!done[i]->backend) continue;
+        char path[96];
+        snprintf(path, sizeof path, "build/trace_%d_%llu.png", saves * 10 + i, (unsigned long long)done[i]->debug_id);
+        renderer_save_texture_tex(done[i]->backend, path);
+    }
+    saves++;
+}
+
 TexBackend *vk_tex(NvnTexture *t, bool for_render) {
     TexBackend *b = tex_backend(t);
+    if (!for_render && !b->gpu_owned && vk_trace_tex(t))  // (CPU-owned: guest memory is uploaded when it changed)
+        vk_trace_event(t, 1, NULL, 0, "use: CPU-owned, uploaded %d dynamic %d", b->uploaded, b->dynamic);
     if (b->pending_rgba) upload_pending(b);
     if (for_render) b->gpu_owned = true;
     else if (!b->gpu_owned) {
@@ -808,6 +915,10 @@ VkImageView vk_view(NvnTexture *t, const NvnTextureView *v, bool has_view, bool 
         return vk_image_view(b, want, fmt, lv0, nlv, ly0, have == VK_IMAGE_VIEW_TYPE_CUBE ? nly : 1, sw, aspect);
     if (want == VK_IMAGE_VIEW_TYPE_CUBE && have == VK_IMAGE_VIEW_TYPE_2D_ARRAY && b->layers >= 6 && b->width == b->height)
         return vk_image_view(b, want, fmt, lv0, nlv, ly0 + 6 <= b->layers ? ly0 : 0, 6, sw, aspect);
+    // a cube read as a cube array of one (BOTW's 64x64 R11G11B10 light probes): it was black
+    if (want == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY && (have == VK_IMAGE_VIEW_TYPE_CUBE || have == VK_IMAGE_VIEW_TYPE_2D_ARRAY) &&
+        b->layers >= 6 && b->width == b->height)
+        return vk_image_view(b, want, fmt, lv0, nlv, 0, b->layers / 6 * 6, sw, aspect);
     if (want == VK_IMAGE_VIEW_TYPE_1D_ARRAY && have == VK_IMAGE_VIEW_TYPE_1D)
         return vk_image_view(b, want, fmt, lv0, nlv, 0, 1, sw, aspect);
     static int nlog;

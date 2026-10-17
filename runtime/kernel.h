@@ -40,6 +40,7 @@ struct KThread {
     // core scheduling (runtime/kernel.c "cores"): the core it runs on, the one it holds (-1: none) and its turn
     int core_held;
     uint64_t core_ticket;
+    bool off_cores;  // runs beside the cores, never holding one (kernel_thread_off_cores)
 };
 
 typedef struct KSharedMem {
@@ -66,4 +67,9 @@ void kernel_signal(KObject *o);  // caller holds g_klock
 void kernel_watch_write(const char *what, uint64_t addr, uint64_t len);
 KEvent *kernel_create_event_pair(uint32_t *writable, uint32_t *readable);
 KThread *kernel_current_thread(void);
+void kernel_thread_off_cores(void);  // the current thread stops taking part in core scheduling (runtime/kernel.c)
+void kernel_sleep_until_ns(uint64_t t);  // host code on a guest thread waits until t (plat_now_ns), its core let go
+// (profiling, runtime/sampler.c) the host threads of the guest threads running now: up to max, with their handles
+// and entry points; returns how many
+int kernel_running_threads(pthread_t *host, uint32_t *handle, uint64_t *entry, int max);
 uint64_t kernel_heap_size(void);  // bytes from HEAP_BASE set by SetHeapSize

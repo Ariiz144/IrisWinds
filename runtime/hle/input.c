@@ -1,8 +1,8 @@
 // Controller input: SDL keyboard/gamepad -> nn::hid Npad state.
 //
-// Both go through the player's bindings (runtime/hle/bindings.c, defaults there: keyboard WASD left stick, arrows
-// d-pad, K/J/L/I = A/B/X/Y, Q/E = L/R, 1/3 = ZL/ZR, Enter / Backspace = Plus / Minus, numpad 8/4/5/6 right stick;
-// controller by position, Switch A = east).
+// Both go through the player's bindings (runtime/hle/bindings.c has the defaults: keyboard and mouse laid out for
+// BOTW, controller by position, Switch A = east). Keyboard bindings can name mouse buttons; the mouse's motion turns
+// the camera (the right stick) while the cursor is held in the window.
 #include <SDL3/SDL.h>
 #include <ctype.h>
 #include <math.h>
@@ -26,6 +26,7 @@ _Static_assert(BTN_DOWN == BIND_DOWN && BTN_ZL == BIND_ZL, "bindings follow the 
 static _Atomic uint64_t key_buttons, pad_buttons;
 static _Atomic int32_t key_lx, key_ly, key_rx, key_ry, pad_lx, pad_ly, pad_rx, pad_ry;
 static uint8_t keys_down[SDL_SCANCODE_COUNT];
+static uint8_t mouse_down[8];  // SDL_BUTTON_LEFT .. X2 (keyboard bindings BIND_MOUSE + button)
 static SDL_Gamepad *pad;
 static _Atomic int64_t sampling;
 
@@ -35,7 +36,10 @@ static _Atomic uint32_t test_pad;
 static _Atomic int32_t test_lx, test_ly;  // (a resting stick's drift: "lstick" in SAVAGEWIND_HOST_INPUT)
 static bool host_test;  // (then a real controller is left out: the player's own pad must not spoil the test)
 
-static int held_key(int sc) { return sc > 0 && sc < SDL_SCANCODE_COUNT && (keys_down[sc] || test_keys[sc]); }
+static int held_key(int sc) {
+    if (sc > BIND_MOUSE && sc <= BIND_MOUSE_LAST) return mouse_down[sc - BIND_MOUSE];
+    return sc > 0 && sc < SDL_SCANCODE_COUNT && (keys_down[sc] || test_keys[sc]);
+}
 
 // Through the bindings (runtime/hle/bindings.c: g_bind_key), read on every key event, so a rebind applies at once.
 static void recompute_keyboard(void) {
@@ -43,8 +47,9 @@ static void recompute_keyboard(void) {
     for (int i = 0; i < BIND_PAD_COUNT; i++)
         if (held_key(g_bind_key[i])) b |= 1ull << i;
     key_buttons = b;
-    key_lx = (held_key(g_bind_key[BIND_LS_RIGHT]) - held_key(g_bind_key[BIND_LS_LEFT])) * 32767;
-    key_ly = (held_key(g_bind_key[BIND_LS_UP]) - held_key(g_bind_key[BIND_LS_DOWN])) * 32767;
+    int tilt = held_key(g_bind_key[BIND_WALK]) ? 13107 : 32767;  // walk: 40% (BOTW walks below about half)
+    key_lx = (held_key(g_bind_key[BIND_LS_RIGHT]) - held_key(g_bind_key[BIND_LS_LEFT])) * tilt;
+    key_ly = (held_key(g_bind_key[BIND_LS_UP]) - held_key(g_bind_key[BIND_LS_DOWN])) * tilt;
     key_rx = (held_key(g_bind_key[BIND_RS_RIGHT]) - held_key(g_bind_key[BIND_RS_LEFT])) * 32767;
     key_ry = (held_key(g_bind_key[BIND_RS_UP]) - held_key(g_bind_key[BIND_RS_DOWN])) * 32767;
 }
@@ -72,10 +77,61 @@ static void recompute_pad(void) {
 // Forget held keys (the menu took focus); the gamepad is re-read on its next event.
 void input_reset(void) {
     memset(keys_down, 0, sizeof keys_down);
+    memset(mouse_down, 0, sizeof mouse_down);
     recompute_keyboard();
 }
 
+// ---- mouse camera
+// While the game has the window (focused, no overlay menu, no scripted run) the cursor is held in it (SDL relative
+// mode) and its motion becomes the right stick: speed in pixels per second, scaled so that about 1200 px/s is a full
+// tilt at sensitivity 1, plus a small offset past the game's own stick dead zone so slow motion still turns it.
+// SAVAGEWIND_MOUSE_SCALE (px/s for a full tilt) and SAVAGEWIND_MOUSE_DEADZONE (0..1) tune it.
+static _Atomic int64_t mouse_dx_milli, mouse_dy_milli;  // motion since the last stick sample, 1/1000 pixel
+static _Atomic bool mouse_held;                         // relative mode on (main thread decides, game thread reads)
+
+static void mouse_stick(int32_t *x, int32_t *y) {
+    static uint64_t last_ns;
+    static int32_t hx, hy;
+    *x = *y = 0;
+    if (!mouse_held || !g_settings.mouse_camera) { mouse_dx_milli = mouse_dy_milli = 0; hx = hy = 0; return; }
+    uint64_t now = plat_now_ns();
+    if (last_ns && now - last_ns < 4000000) { *x = hx; *y = hy; return; }  // (several polls in one frame: one sample)
+    double dt = last_ns ? (double)(now - last_ns) / 1e9 : 1 / 60.0;
+    last_ns = now;
+    if (dt > 0.1) dt = 0.1;
+    static double full = -1, dz = -1;
+    if (full < 0) full = getenv("SAVAGEWIND_MOUSE_SCALE") ? atof(getenv("SAVAGEWIND_MOUSE_SCALE")) : 1200.0;
+    if (dz < 0) dz = getenv("SAVAGEWIND_MOUSE_DEADZONE") ? atof(getenv("SAVAGEWIND_MOUSE_DEADZONE")) : 0.12;
+    double dx = (double)atomic_exchange(&mouse_dx_milli, 0) / 1000.0, dy = (double)atomic_exchange(&mouse_dy_milli, 0) / 1000.0;
+    double vx = dx / dt / (full / g_settings.mouse_sens), vy = -dy / dt / (full / g_settings.mouse_sens);
+    if (g_settings.mouse_invert_y) vy = -vy;
+    double m = sqrt(vx * vx + vy * vy);
+    if (m > 1e-3) {
+        double out = dz + m * (1 - dz);  // past the dead zone, then linear
+        if (out > 1) out = 1;
+        vx *= out / m, vy *= out / m;
+    }
+    hx = *x = (int32_t)lround(vx * 32767);
+    hy = *y = (int32_t)lround(vy * 32767);
+}
+
+// Main thread, every window loop turn (runtime/nvn/vulkan/device.c ui_run): hold or free the cursor.
+extern bool menu_input_captured(void);  // runtime/ui/menu.mm: overlay menu or name entry up (it has the keys / pad)
+static bool win_focused = true;         // (main thread: window events and input_mouse_update)
+void input_mouse_update(SDL_Window *w) {
+    static bool cur;
+    bool want = w && win_focused && g_settings.mouse_camera && !menu_input_captured() &&
+                !getenv("SAVAGEWIND_INPUT") && !getenv("SAVAGEWIND_HOST_INPUT");
+    if (want == cur) return;
+    cur = want;
+    SDL_SetWindowRelativeMouseMode(w, want);
+    mouse_held = want;
+    if (!want) { memset(mouse_down, 0, sizeof mouse_down); recompute_keyboard(); }
+    LOG("[input] mouse %s\n", want ? "held in the window (camera)" : "free");
+}
+
 volatile int g_debug_frame_request;  // F9: dump the next frame's passes (build/pass_*.png) + draw log
+volatile int g_record_frames;        // F12: (debugging) save every other game image to build/frames/ until F12 again
 
 // Events a test pushes (SAVAGEWIND_HOST_INPUT type: / sdlkey: / sdlpad:) carry this device id: they go the whole way, menu first.
 #define TEST_DEVICE 0x7E57u
@@ -147,8 +203,25 @@ void input_handle_event(const SDL_Event *e) {
     switch (e->type) {
     case SDL_EVENT_KEY_DOWN: case SDL_EVENT_KEY_UP:
         if (e->type == SDL_EVENT_KEY_DOWN && e->key.scancode == SDL_SCANCODE_F9 && !e->key.repeat) g_debug_frame_request = 1;
+        if (e->type == SDL_EVENT_KEY_DOWN && e->key.scancode == SDL_SCANCODE_F12 && !e->key.repeat)
+            g_record_frames = !g_record_frames;
         if (e->key.scancode < SDL_SCANCODE_COUNT) keys_down[e->key.scancode] = e->type == SDL_EVENT_KEY_DOWN;
         recompute_keyboard();
+        break;
+    case SDL_EVENT_MOUSE_MOTION:
+        if (mouse_held) {
+            mouse_dx_milli += (int64_t)lround(e->motion.xrel * 1000);
+            mouse_dy_milli += (int64_t)lround(e->motion.yrel * 1000);
+        }
+        break;
+    case SDL_EVENT_MOUSE_BUTTON_DOWN: case SDL_EVENT_MOUSE_BUTTON_UP:
+        if (e->button.button < sizeof mouse_down && mouse_held) {
+            mouse_down[e->button.button] = e->type == SDL_EVENT_MOUSE_BUTTON_DOWN;
+            recompute_keyboard();
+        }
+        break;
+    case SDL_EVENT_WINDOW_FOCUS_LOST: case SDL_EVENT_WINDOW_FOCUS_GAINED:
+        win_focused = e->type == SDL_EVENT_WINDOW_FOCUS_GAINED;
         break;
     case SDL_EVENT_GAMEPAD_ADDED:
         if (!pad) { pad = SDL_OpenGamepad(e->gdevice.which); LOG("[input] gamepad: %s\n", SDL_GetGamepadName(pad)); note_family(); }
@@ -356,8 +429,6 @@ void input_frame(uint64_t frame) {
     script_ry = ry;
 }
 
-extern bool menu_input_captured(void);  // runtime/ui/menu.mm: overlay menu or name entry up (it has the keys / pad)
-
 // Buttons held right now (keyboard, gamepad, test script), independent of whether the game polls (movies).
 uint64_t input_buttons_now(void) { return (menu_input_captured() ? 0 : key_buttons | pad_buttons) | script_buttons; }
 
@@ -391,7 +462,9 @@ static void fill_state(Cpu *c) {
         if (renderer_present_count() < until) b |= 1ull << BTN_PLUS;
     }
     int32_t lx = clamp_axis((menu ? 0 : key_lx + pad_lx) + script_lx), ly = clamp_axis((menu ? 0 : key_ly + pad_ly) + script_ly);
-    int32_t rx = clamp_axis((menu ? 0 : key_rx + pad_rx) + script_rx), ry = clamp_axis((menu ? 0 : key_ry + pad_ry) + script_ry);
+    int32_t mx = 0, my = 0;
+    if (!menu) mouse_stick(&mx, &my);
+    int32_t rx = clamp_axis((menu ? 0 : key_rx + pad_rx + mx) + script_rx), ry = clamp_axis((menu ? 0 : key_ry + pad_ry + my) + script_ry);
     // d-pad / arrow keys walk (setting) while the stick is at rest. "At rest" has a dead zone: a controller's stick
     // never reads exactly 0 (a DualSense rests at a few hundred), which used to turn the d-pad off altogether.
     if (!menu && g_settings.dpad_move && (int64_t)lx * lx + (int64_t)ly * ly < 8000ll * 8000) {

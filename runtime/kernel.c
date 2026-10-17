@@ -132,7 +132,7 @@ static bool core_next(Core *k, KThread *t) {
 }
 
 static void core_acquire(KThread *t) {
-    if (!t || !cores_on() || t->core_held >= 0) return;
+    if (!t || !cores_on() || t->core_held >= 0 || t->off_cores) return;
     static int one_core = -1;  // (debug) SAVAGEWIND_ONE_CORE=1: every thread on core 0, one guest thread at a time
     if (one_core < 0) one_core = getenv("SAVAGEWIND_ONE_CORE") != NULL;
     int idx = one_core ? 0 : t->core & 3;
@@ -156,6 +156,26 @@ static void core_release(KThread *t) {
     t->core_held = -1;
     pthread_cond_broadcast(&k->cv);
     pthread_mutex_unlock(&k->m);
+}
+
+// A thread that does a coprocessor's work runs beside the four cores, as on the console: the in-process audio
+// renderer (runtime/services/audio.c) is the audio DSP's. Waiting for a core token behind the game's threads, it
+// fell tens of milliseconds behind and the sound broke up.
+void kernel_thread_off_cores(void) {
+    KThread *t = t_cur;
+    if (!t) return;
+    core_release(t);
+    t->off_cores = true;
+}
+
+// Host code running on a guest thread (an HLE call) waits until t without holding the thread's core, in slices of
+// at most 50 ms so a reboot doesn't wait it out (as svcSleepThread).
+void kernel_sleep_until_ns(uint64_t t) {
+    KThread *me = t_cur;
+    core_release(me);
+    for (uint64_t now; !g_rt_unwind && (now = plat_now_ns()) < t;)
+        plat_sleep_until_ns(t - now < 50000000 ? t : now + 50000000);
+    core_acquire(me);
 }
 
 // At a syscall: give the core to a better thread waiting for it, if there is one.
@@ -285,6 +305,15 @@ static uint64_t next_thread_id = 0x50;
 volatile int g_rt_unwind;
 static KThread *g_threads;  // every thread of this boot (g_klock)
 
+int kernel_running_threads(pthread_t *host, uint32_t *handle, uint64_t *entry, int max) {
+    int n = 0;
+    pthread_mutex_lock(&g_klock);
+    for (KThread *t = g_threads; t && n < max; t = t->anext)
+        if (t->started && !t->finished) host[n] = t->host, handle[n] = t->handle, entry[n] = t->entry, n++;
+    pthread_mutex_unlock(&g_klock);
+    return n;
+}
+
 void rt_unwind_point(void) {
     if (__builtin_expect(g_rt_unwind, 0) && t_cur) longjmp(t_cur->unwind, 1);
 }
@@ -406,6 +435,7 @@ static void waitlist_remove(KThread *t) {
 static uint32_t block_current(int64_t timeout_ns) {
     KThread *t = t_cur;
     struct timespec ts;
+    WaitKind kind = t->wait_kind;
     if (timeout_ns >= 0) deadline(&ts, timeout_ns);
     waitlist_add(t);
     while (t->wait_kind != WAIT_NONE) {
@@ -421,6 +451,15 @@ static uint32_t block_current(int64_t timeout_ns) {
             break;
         }
         if (!kwait(timeout_ns, &ts)) {
+            // The timeout can fire while a waker already ran: a thread it woke (or handed a mutex) did not time
+            // out, and a condvar waiter that a signal moved to its mutex waits for that without a timeout, as on
+            // the console. Timing out anyway, a condvar waiter would go on to take the mutex it was just given
+            // (svc_wait_process_wide_key) and wait for itself.
+            if (t->wait_kind == WAIT_NONE) break;
+            if (kind == WAIT_CONDVAR && t->wait_kind == WAIT_MUTEX) {
+                timeout_ns = -1;
+                continue;
+            }
             t->wait_kind = WAIT_NONE;
             t->wait_result = R_TIMEOUT;
             break;
@@ -466,8 +505,12 @@ static uint32_t svc_wait_process_wide_key(uint64_t mutex, uint64_t key, uint32_t
     t->wait_tag = tag;
     mutex_release(mutex);
     uint32_t r = block_current(timeout);
-    if (r != R_OK) {
-        // timed out / cancelled: still must reacquire the mutex
+    // A wait that timed out returns without the mutex, as on the console: user mode takes it again (BOTW 1.8.2's
+    // InternalConditionVariableImplByHorizon::TimedWait calls Enter on 0xea01, sdk 0x71001492bc). Taken here too,
+    // the thread then waited for the mutex it held, and every thread after it (the game's audio thread, waiting
+    // for the in-process audio renderer's event).
+    if (r != R_OK && r != R_TIMEOUT) {
+        // cancelled: still must reacquire the mutex
         if (!mutex_acquire_or_mark(mutex, tag)) {
             t->wait_kind = WAIT_MUTEX;
             t->wait_addr = mutex;
@@ -634,8 +677,13 @@ static int prof_svc = -1;
 static void svc_entry(Cpu *c, uint32_t imm, uint64_t pc);
 void rt_svc(Cpu *c, uint32_t imm, uint64_t pc) {
     rt_unwind_point();
-    core_preempt_point(t_cur);
+    // ArbitrateUnlock and SignalProcessWideKey give the core up after they let go, not before: a thread that yielded
+    // first kept its waiters waiting until it got its core back (the game's audio thread held the audio renderer's
+    // mutex up to 40 ms that way).
+    bool release = imm == 0x1B || imm == 0x1D;
+    if (!release) core_preempt_point(t_cur);
     svc_entry(c, imm, pc);
+    if (release) core_preempt_point(t_cur);
     rt_unwind_point();
 }
 
@@ -995,10 +1043,14 @@ static void dump_threads(void) {
     static const char *const kinds[] = {"-", "mutex", "condvar", "arbiter"};
     pthread_mutex_lock(&g_klock);
     for (KThread *t = g_threads; t; t = t->anext) {
-        LOG("[threads] handle %x id %llx prio %d %s wait %s %llx%s lr %llx\n", t->handle, (unsigned long long)t->id,
-            t->prio, t->finished ? "finished" : t->started ? "running" : "created", kinds[t->wait_kind & 3],
-            (unsigned long long)t->wait_addr, t->in_sync_wait ? " (WaitSynchronization)" : "",
+        LOG("[threads] handle %x id %llx prio %d core %d %s wait %s %llx%s lr %llx\n", t->handle,
+            (unsigned long long)t->id, t->prio, t->core, t->finished ? "finished" : t->started ? "running" : "created",
+            kinds[t->wait_kind & 3], (unsigned long long)t->wait_addr, t->in_sync_wait ? " (WaitSynchronization)" : "",
             (unsigned long long)t->cpu.x[30]);
+        if (t->wait_kind == WAIT_MUTEX || t->wait_kind == WAIT_CONDVAR) {  // the mutex word: its owner's handle
+            uint64_t m = t->wait_kind == WAIT_MUTEX ? t->wait_addr : t->wait_mutex;
+            LOG("[threads]   mutex %llx = %x\n", (unsigned long long)m, guest_mapped(m, 4) ? *u32p(m) : 0);
+        }
         if (t->started && !t->finished && t->wait_kind == WAIT_NONE && !t->in_sync_wait) {
             // not in a kernel wait: the registers as of the last call boundary (a leaf loop keeps them in host registers)
             LOG("[threads]   regs");

@@ -29,6 +29,7 @@ extern "C" {
 void input_reset(void);
 void controls_bindings_draw(float scale);  // controls_ui.mm
 #include "../input_bind.h"
+#include "../perfmon.h"
 #include "../paths.h"
 }
 
@@ -160,6 +161,11 @@ bool menu_handle_event(const SDL_Event *e) {
         if (!e->key.repeat && (e->key.scancode == SDL_SCANCODE_F1 ||
                                (e->key.scancode == SDL_SCANCODE_ESCAPE && !g_open.load()))) {
             if (!typing) set_open(!g_open.load());  // (Esc with the menu open goes to ImGui below: it cancels a field)
+            return true;
+        }
+        if (!e->key.repeat && e->key.scancode == SDL_SCANCODE_F10 && !typing) {  // performance overlay: off, FPS, full
+            g_settings.perf_overlay = (g_settings.perf_overlay + 1) % 3;
+            settings_save();
             return true;
         }
         if (!e->key.repeat && (e->key.scancode == SDL_SCANCODE_F11 ||
@@ -433,7 +439,10 @@ static void tab_display(void) {
         g_settings.fullscreen = fs;
         g_want_fullscreen_apply.store(true);
     }
-    opt_toggle("Show FPS", &g_settings.show_fps, false, "Shows the frame rate in the top right corner.");
+    static const char *const perf_names[] = {"Off", "FPS", "Full"};
+    opt_choice("Performance overlay", &g_settings.perf_overlay, perf_names, 3, PERF_OFF,
+               "FPS: the frame rate and frame time. Full: also CPU, memory and GPU load and temperatures, and a "
+               "frame time graph. F10 switches between them while you play.");
 
     opt_section("Rendering");
     // display order -> RES_* (the ini / enum order predates the menu order)
@@ -480,6 +489,11 @@ static void tab_display(void) {
     opt_choice("Anti-aliasing", &g_settings.antialias, aa, 2, AA_OFF,
                "Smooths jagged edges of the game image before it is scaled to the window. SMAA: finds the edges and "
                "blends only along them, so textures stay sharp. Most useful at a lower internal resolution.");
+    opt_toggle("Asynchronous shaders", &g_settings.async_shaders, false,
+               "Off: the game waits for each new shader to compile, a short stutter the first time an effect "
+               "appears, and everything is drawn. On: no waiting, but what needs a shader still compiling is skipped "
+               "meanwhile: effects pop in late, and pictures the game draws only once (the save file's screenshot) "
+               "can come out as garbage.");
     opt_end();
 }
 
@@ -537,6 +551,14 @@ static void tab_about(void) {
     toggle("D-pad as left stick", &g_settings.dpad_move);
     hint("The d-pad (and the arrow keys) also move like the left stick while the stick is at rest.");
     ImGui::Spacing();
+    header("Mouse");
+    toggle("Mouse camera", &g_settings.mouse_camera);
+    hint("The mouse turns the camera. While you play, the cursor stays in the window; Esc or F1 frees it.");
+    float sens = roundf(g_settings.mouse_sens * 100);
+    if (opt_slider("Mouse sensitivity", &sens, 10, 500, 5, 100, "%g%%", "How fast the mouse turns the camera."))
+        g_settings.mouse_sens = sens / 100.0f;
+    toggle("Invert mouse Y", &g_settings.mouse_invert_y);
+    ImGui::Spacing();
     header("Controls");
     controls_bindings_draw(ImGui::GetFontSize() / 34);
     ImGui::Spacing();
@@ -554,6 +576,50 @@ RT_ON_RESET(menu_reset) {
     pthread_mutex_lock(&q_lock);
     q_events.clear();
     pthread_mutex_unlock(&q_lock);
+}
+
+// Performance overlay (F10), in the style of MangoHud: the game's frame rate and frame times, and the machine's load
+// and temperatures (runtime/perfmon.c). Numbers the platform doesn't give read "-".
+static void perf_cell(const char *fmt, float v) {
+    ImGui::TableNextColumn();
+    if (v < 0) ImGui::TextDisabled("-");
+    else ImGui::Text(fmt, v);
+}
+static void perf_overlay_draw(ImGuiIO &io, float scale) {
+    PerfStats s;
+    perfmon_snapshot(&s);
+    // top right: BOTW keeps its hearts and stamina top left, its map and gauges bottom right
+    ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x - 16 * scale, 16 * scale), 0, ImVec2(1, 0));
+    ImGui::SetNextWindowBgAlpha(0.6f);
+    ImGui::Begin("##perf", NULL, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
+                                     ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoFocusOnAppearing);
+    ImGui::SetWindowFontScale(0.72f);
+    const ImVec4 gpu_c(0.55f, 0.83f, 0.31f, 1), cpu_c(0.18f, 0.59f, 0.80f, 1), ram_c(0.80f, 0.45f, 0.70f, 1),
+                 fps_c(0.95f, 0.95f, 0.95f, 1);
+    if (g_settings.perf_overlay == PERF_FPS) {
+        ImGui::TextColored(fps_c, "%.0f FPS  %.1f ms", s.fps, s.frame_ms_avg);
+        ImGui::End();
+        return;
+    }
+    if (ImGui::BeginTable("##perft", 4, ImGuiTableFlags_SizingFixedFit)) {
+        ImGui::TableNextColumn(); ImGui::TextColored(gpu_c, "GPU");
+        perf_cell("%.0f%%", s.gpu_pct); perf_cell("%.0f C", s.gpu_temp_c); perf_cell("%.0f W", s.gpu_power_w);
+        ImGui::TableNextColumn(); ImGui::TextColored(gpu_c, "VRAM");
+        perf_cell("%.2f GB", s.vram_used_mb < 0 ? -1 : s.vram_used_mb / 1024); perf_cell("/ %.1f GB", s.vram_total_mb < 0 ? -1 : s.vram_total_mb / 1024);
+        perf_cell("%.0f MHz", s.gpu_clock_mhz);
+        ImGui::TableNextColumn(); ImGui::TextColored(cpu_c, "CPU");
+        perf_cell("%.0f%%", s.cpu_total_pct); perf_cell("%.0f C", s.cpu_temp_c); perf_cell("game %.0f%%", s.cpu_game_pct);
+        ImGui::TableNextColumn(); ImGui::TextColored(ram_c, "RAM");
+        perf_cell("%.1f GB", s.ram_used_mb / 1024); perf_cell("/ %.1f GB", s.ram_total_mb / 1024); perf_cell("game %.1f GB", s.ram_game_mb / 1024);
+        ImGui::TableNextColumn(); ImGui::TextColored(fps_c, "FPS");
+        perf_cell("%.0f", s.fps); perf_cell("%.1f ms", s.frame_ms_avg); perf_cell("max %.1f ms", s.frame_ms_max);
+        ImGui::EndTable();
+    }
+    float top = s.frame_ms_max > 50 ? s.frame_ms_max : 50;
+    ImGui::PlotLines("##ft", s.frame_ms, PERF_HISTORY, 0, NULL, 0, top, ImVec2(330 * scale, 48 * scale));
+    ImGui::TextDisabled("%s", s.gpu_name[0] ? s.gpu_name : "GPU: no NVML / sysfs data");
+    ImGui::TextDisabled("%s", s.cpu_name);
+    ImGui::End();
 }
 
 static void keyboard_draw(ImGuiIO &io, float scale) {
@@ -735,7 +801,7 @@ void menu_render(void *cmd, uint32_t target_w, uint32_t target_h) {
 #endif
     bool open = g_open.load();
     bool kbd = g_kbd.load() == 1;
-    if (!open && !kbd && !g_settings.show_fps) {
+    if (!open && !kbd && g_settings.perf_overlay == PERF_OFF) {
         if (g_inited) { pthread_mutex_lock(&q_lock); q_events.clear(); pthread_mutex_unlock(&q_lock); }
         return;
     }
@@ -780,14 +846,7 @@ void menu_render(void *cmd, uint32_t target_w, uint32_t target_h) {
 #endif
     ImGui::NewFrame();
 
-    if (g_settings.show_fps) {
-        ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x - 16 * scale, 16 * scale), 0, ImVec2(1, 0));
-        ImGui::SetNextWindowBgAlpha(0.5f);
-        ImGui::Begin("##fps", NULL, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
-                                        ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoFocusOnAppearing);
-        ImGui::Text("%.0f fps", io.Framerate);
-        ImGui::End();
-    }
+    if (g_settings.perf_overlay != PERF_OFF) perf_overlay_draw(io, scale);
 
     if (open) {
         // dim the game behind the menu

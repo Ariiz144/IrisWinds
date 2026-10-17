@@ -20,8 +20,9 @@ Settings g_settings = {
     .volume = 1.0f,
     .reverb = true,
     .movie_audio = true,
-    .show_fps = false,
     .upscaler = UPSCALE_SHARP,  // (MetalFX on macOS, AMD FSR 1 on Windows)
+    .mouse_camera = true,
+    .mouse_sens = 1.0f,
 };
 
 void settings_load(void) {
@@ -40,7 +41,8 @@ void settings_load(void) {
         else if (!strcmp(key, "volume")) g_settings.volume = (float)atof(val);
         else if (!strcmp(key, "reverb")) g_settings.reverb = atoi(val) != 0;
         else if (!strcmp(key, "movie_audio")) g_settings.movie_audio = atoi(val) != 0;
-        else if (!strcmp(key, "show_fps")) g_settings.show_fps = atoi(val) != 0;
+        else if (!strcmp(key, "show_fps")) g_settings.perf_overlay = atoi(val) ? PERF_FPS : PERF_OFF;  // (older files)
+        else if (!strcmp(key, "perf_overlay")) g_settings.perf_overlay = !strcmp(val, "full") ? PERF_FULL : !strcmp(val, "fps") ? PERF_FPS : PERF_OFF;
         else if (!strcmp(key, "resolution")) {
             int n = atoi(val);
             g_settings.res_mode = !strcmp(val, "dynamic") ? RES_DYNAMIC : (!strcmp(val, "75%") || !strcmp(val, "67%")) ? RES_Q75 :
@@ -50,6 +52,10 @@ void settings_load(void) {
         else if (!strcmp(key, "upscaler")) g_settings.upscaler = !strcmp(val, "bilinear") ? UPSCALE_BILINEAR : UPSCALE_SHARP;  // (metalfx / fsr1: this OS's)
         else if (!strcmp(key, "antialias")) g_settings.antialias = !strcmp(val, "off") ? AA_OFF : AA_SMAA;  // ("fxaa": SMAA now)
         else if (!strcmp(key, "dpad_move")) g_settings.dpad_move = atoi(val) != 0;
+        else if (!strcmp(key, "mouse_camera")) g_settings.mouse_camera = atoi(val) != 0;
+        else if (!strcmp(key, "mouse_sensitivity")) g_settings.mouse_sens = (float)atof(val);
+        else if (!strcmp(key, "mouse_invert_y")) g_settings.mouse_invert_y = atoi(val) != 0;
+        else if (!strcmp(key, "async_shaders")) g_settings.async_shaders = atoi(val) != 0;
         else if (!strcmp(key, "menu_tip_seen")) g_settings.menu_tip_seen = atoi(val) != 0, tip_key = true;
         else bind_settings_load(key, val);  // bind_pad_* / bind_key_*: runtime/hle/bindings.c
     }
@@ -57,6 +63,7 @@ void settings_load(void) {
     if (!tip_key) g_settings.menu_tip_seen = true;  // (a settings file from before the note: not a first launch)
     if (g_settings.volume < 0) g_settings.volume = 0;
     if (g_settings.volume > 2) g_settings.volume = 2;
+    if (!(g_settings.mouse_sens >= 0.1f && g_settings.mouse_sens <= 5.0f)) g_settings.mouse_sens = 1.0f;
     LOG("[settings] loaded %s\n", SETTINGS_FILE);
 }
 
@@ -68,7 +75,7 @@ void settings_save(void) {
     fprintf(f, "volume = %.2f\n", g_settings.volume);
     fprintf(f, "reverb = %d\n", g_settings.reverb);
     fprintf(f, "movie_audio = %d\n", g_settings.movie_audio);
-    fprintf(f, "show_fps = %d\n", g_settings.show_fps);
+    fprintf(f, "perf_overlay = %s\n", g_settings.perf_overlay == PERF_FULL ? "full" : g_settings.perf_overlay == PERF_FPS ? "fps" : "off");
     fprintf(f, "upscaler = %s\n", g_settings.upscaler == UPSCALE_METALFX ? "metalfx" : g_settings.upscaler == UPSCALE_FSR1 ? "fsr1" : "bilinear");
     fprintf(f, "antialias = %s\n", g_settings.antialias == AA_SMAA ? "smaa" : "off");
     if (g_settings.res_mode == RES_DYNAMIC) fprintf(f, "resolution = dynamic\n");
@@ -78,6 +85,10 @@ void settings_save(void) {
     else if (g_settings.res_mode >= 1 && g_settings.res_mode <= 8) fprintf(f, "resolution = %dx\n", g_settings.res_mode);
     else fprintf(f, "resolution = match\n");
     fprintf(f, "dpad_move = %d\n", g_settings.dpad_move);
+    fprintf(f, "mouse_camera = %d\n", g_settings.mouse_camera);
+    fprintf(f, "mouse_sensitivity = %.2f\n", g_settings.mouse_sens);
+    fprintf(f, "mouse_invert_y = %d\n", g_settings.mouse_invert_y);
+    fprintf(f, "async_shaders = %d\n", g_settings.async_shaders);
     fprintf(f, "menu_tip_seen = %d\n", g_settings.menu_tip_seen);
     bind_settings_save(f);
     fclose(f);

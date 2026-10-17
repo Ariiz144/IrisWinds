@@ -209,6 +209,26 @@ SI int simd_fe_mode(uint64_t fpcr) {
     return m[(fpcr >> 22) & 3];
 }
 
+// The host's rounding mode for the FPCR paths below. On x86-64 float and double math is SSE, so only MXCSR's
+// rounding field matters: MinGW's fegetround / fesetround also read and rewrite the x87 control word, and cost more
+// than the operation they wrapped. (BOTW 1.8.2 sets FPCR.FZ, which sends every scalar op down the slow path: its
+// main thread spent half its time there.) The paths change the mode only when FPCR asks for one other than
+// round to nearest, the host's own, and put it back.
+#if defined(__x86_64__)
+#include <xmmintrin.h>
+// (MXCSR.RC: 0 nearest, 1 down, 2 up, 3 toward zero. The FE_* values differ between C libraries: UCRT's are 0x100
+// apart, glibc's and msvcrt's 0x400.)
+SI unsigned simd_rc(int fe) { return fe == FE_DOWNWARD ? 1u : fe == FE_UPWARD ? 2u : fe == FE_TOWARDZERO ? 3u : 0u; }
+SI int simd_getround(void) {
+    static const int m[4] = {FE_TONEAREST, FE_DOWNWARD, FE_UPWARD, FE_TOWARDZERO};
+    return m[(_mm_getcsr() >> 13) & 3u];
+}
+SI void simd_setround(int fe) { _mm_setcsr((_mm_getcsr() & ~0x6000u) | simd_rc(fe) << 13); }
+#else
+SI int simd_getround(void) { return fegetround(); }
+SI void simd_setround(int fe) { fesetround(fe); }
+#endif
+
 #define F s
 #define T float
 #define U uint32_t
@@ -263,11 +283,13 @@ SI double simd_s2d(Cpu *c, float x) {
 }
 SN float simd_d2s_slow(Cpu *c, double x) {
 #pragma STDC FENV_ACCESS ON
-    int old = fegetround();
-    fesetround(simd_fe_mode(c->fpcr));
+    int mode = simd_fe_mode(c->fpcr);
+    if (mode == FE_TONEAREST) return (float)x;  // (FZ alone: flushed by the caller)
+    int old = simd_getround();
+    simd_setround(mode);
     volatile double vx = x;
     volatile float r = (float)vx;
-    fesetround(old);
+    simd_setround(old);
     return r;
 }
 SI float simd_d2s(Cpu *c, double x) {

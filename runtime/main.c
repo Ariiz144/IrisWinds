@@ -155,6 +155,7 @@ static void boot(const char *root) {
     { extern void settings_load(void); settings_load(); }
     kernel_init();
     dispatch_init();
+    { extern void jpeg_debug_init(void); jpeg_debug_init(); }
 
     uint32_t stack_size = 0x100000;
     int prio = 44;

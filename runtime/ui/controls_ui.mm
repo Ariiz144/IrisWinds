@@ -83,7 +83,7 @@ extern "C" void controls_bindings_draw(float scale) {
         static const int order[] = {BIND_A, BIND_B, BIND_X, BIND_Y, BIND_L, BIND_R, BIND_ZL, BIND_ZR, BIND_PLUS,
                                     BIND_MINUS, BIND_UP, BIND_DOWN, BIND_LEFT, BIND_RIGHT, BIND_LSTICK, BIND_RSTICK,
                                     BIND_LS_UP, BIND_LS_DOWN, BIND_LS_LEFT, BIND_LS_RIGHT, BIND_RS_UP, BIND_RS_DOWN,
-                                    BIND_RS_LEFT, BIND_RS_RIGHT};
+                                    BIND_RS_LEFT, BIND_RS_RIGHT, BIND_WALK};
         for (int slot : order) {
             ImGui::TableNextRow();
             ImGui::TableNextColumn();
@@ -91,7 +91,7 @@ extern "C" void controls_bindings_draw(float scale) {
             ImGui::TextUnformatted(bind_input_name(slot));
             ImGui::TableNextColumn();
             if (slot < BIND_PAD_COUNT) cell(BIND_DEV_PAD, slot, fam, cd, cs, ms);
-            else ImGui::TextDisabled(slot < BIND_RS_UP ? "Left stick" : "Right stick");
+            else ImGui::TextDisabled(slot == BIND_WALK ? "Tilt the stick" : slot < BIND_RS_UP ? "Left stick" : "Right stick");
             ImGui::TableNextColumn();
             cell(BIND_DEV_KEY, slot, fam, cd, cs, ms);
         }

@@ -10,31 +10,35 @@
 
 _Static_assert(PADB_LTRIGGER == SDL_GAMEPAD_BUTTON_COUNT, "trigger pseudo-buttons follow SDL's buttons");
 
-// Defaults: Nintendo layout by position (east = A, south = B, north = X, west = Y), triggers = ZL / ZR;
-// keyboard WASD left stick, arrows d-pad, K/J/L/I = A/B/X/Y, Q/E = L/R, 1/3 = ZL/ZR, Enter / Backspace = Plus /
-// Minus, F / numpad 0 = stick clicks, numpad 8/5/4/6 right stick.
+// Defaults: Nintendo layout by position (east = A, south = B, north = X, west = Y), triggers = ZL / ZR.
+// Keyboard and mouse, laid out for BOTW the way PC action games are: WASD move (C held: walk), the mouse turns the
+// camera (I / J / K / L too, runtime/hle/input.c), Space = X (jump), Left Shift = B (sprint, back), E = A
+// (interact, confirm), left click = Y (attack), right click = ZL (shield, lock on), F = ZR (bow), Q = L (rune),
+// R = R (throw), Left Ctrl = left stick press (crouch), middle click = right stick press (look), Tab = Plus
+// (inventory), M = Minus (map), arrows = d-pad. Esc and F1 stay the overlay menu's (runtime/ui/menu.mm).
 #define DEF_PAD { \
     SDL_GAMEPAD_BUTTON_EAST, SDL_GAMEPAD_BUTTON_SOUTH, SDL_GAMEPAD_BUTTON_NORTH, SDL_GAMEPAD_BUTTON_WEST, \
     SDL_GAMEPAD_BUTTON_LEFT_STICK, SDL_GAMEPAD_BUTTON_RIGHT_STICK, SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, \
     SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, PADB_LTRIGGER, PADB_RTRIGGER, SDL_GAMEPAD_BUTTON_START, SDL_GAMEPAD_BUTTON_BACK, \
     SDL_GAMEPAD_BUTTON_DPAD_LEFT, SDL_GAMEPAD_BUTTON_DPAD_UP, SDL_GAMEPAD_BUTTON_DPAD_RIGHT, SDL_GAMEPAD_BUTTON_DPAD_DOWN}
 #define DEF_KEY { \
-    SDL_SCANCODE_K, SDL_SCANCODE_J, SDL_SCANCODE_L, SDL_SCANCODE_I, SDL_SCANCODE_F, SDL_SCANCODE_KP_0, \
-    SDL_SCANCODE_Q, SDL_SCANCODE_E, SDL_SCANCODE_1, SDL_SCANCODE_3, SDL_SCANCODE_RETURN, SDL_SCANCODE_BACKSPACE, \
+    SDL_SCANCODE_E, SDL_SCANCODE_LSHIFT, SDL_SCANCODE_SPACE, BIND_MOUSE + SDL_BUTTON_LEFT, SDL_SCANCODE_LCTRL, \
+    BIND_MOUSE + SDL_BUTTON_MIDDLE, SDL_SCANCODE_Q, SDL_SCANCODE_R, BIND_MOUSE + SDL_BUTTON_RIGHT, SDL_SCANCODE_F, \
+    SDL_SCANCODE_TAB, SDL_SCANCODE_M, \
     SDL_SCANCODE_LEFT, SDL_SCANCODE_UP, SDL_SCANCODE_RIGHT, SDL_SCANCODE_DOWN, \
-    SDL_SCANCODE_W, SDL_SCANCODE_S, SDL_SCANCODE_A, SDL_SCANCODE_D, SDL_SCANCODE_KP_8, SDL_SCANCODE_KP_5, \
-    SDL_SCANCODE_KP_4, SDL_SCANCODE_KP_6}
+    SDL_SCANCODE_W, SDL_SCANCODE_S, SDL_SCANCODE_A, SDL_SCANCODE_D, SDL_SCANCODE_I, SDL_SCANCODE_K, \
+    SDL_SCANCODE_J, SDL_SCANCODE_L, SDL_SCANCODE_C}
 static const int16_t k_def_pad[BIND_PAD_COUNT] = DEF_PAD, k_def_key[BIND_KEY_COUNT] = DEF_KEY;
 int16_t g_bind_pad[BIND_PAD_COUNT] = DEF_PAD, g_bind_key[BIND_KEY_COUNT] = DEF_KEY;
 
 static const char *const k_ini[BIND_KEY_COUNT] = {
     "a", "b", "x", "y", "lstick", "rstick", "l", "r", "zl", "zr", "plus", "minus", "left", "up", "right", "down",
-    "ls_up", "ls_down", "ls_left", "ls_right", "rs_up", "rs_down", "rs_left", "rs_right",
+    "ls_up", "ls_down", "ls_left", "ls_right", "rs_up", "rs_down", "rs_left", "rs_right", "walk",
 };
 static const char *const k_names[BIND_KEY_COUNT] = {
     "A", "B", "X", "Y", "Left stick press", "Right stick press", "L", "R", "ZL", "ZR", "Plus", "Minus",
     "D-pad Left", "D-pad Up", "D-pad Right", "D-pad Down", "Left stick Up", "Left stick Down", "Left stick Left",
-    "Left stick Right", "Right stick Up", "Right stick Down", "Right stick Left", "Right stick Right",
+    "Left stick Right", "Right stick Up", "Right stick Down", "Right stick Left", "Right stick Right", "Walk (hold)",
 };
 // controller buttons by position (savagewind.ini)
 static const char *const k_pad_ini[PADB_HOST_COUNT] = {
@@ -75,7 +79,10 @@ const char *bind_pad_label(int host, int fam) {
     return fam == 1 ? xb[host] : fam == 2 ? ps[host] : nin[host];
 }
 
+static const char *const k_mouse[5] = {"Mouse Left", "Mouse Middle", "Mouse Right", "Mouse Back", "Mouse Forward"};
+
 const char *bind_key_label(int sc) {
+    if (sc > BIND_MOUSE && sc <= BIND_MOUSE_LAST) return k_mouse[sc - BIND_MOUSE - 1];
     if (sc <= 0 || sc >= SDL_SCANCODE_COUNT) return "(none)";
     const char *n = SDL_GetScancodeName((SDL_Scancode)sc);
     return n && *n ? n : "(unnamed key)";
@@ -180,6 +187,13 @@ bool bind_capture_event(const SDL_Event *e) {
         return true;
     case SDL_EVENT_KEY_UP: case SDL_EVENT_TEXT_INPUT:
         return true;
+    case SDL_EVENT_MOUSE_BUTTON_DOWN:  // a keyboard binding can be a mouse button (a controller capture ignores it)
+        if (dev != BIND_DEV_KEY || e->button.button < SDL_BUTTON_LEFT || e->button.button > SDL_BUTTON_X2) return true;
+        cap_dev = -1;
+        assign(dev, cap_slot, BIND_MOUSE + e->button.button);
+        return true;
+    case SDL_EVENT_MOUSE_BUTTON_UP:
+        return true;
     case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
         // Home / Guide opens the menu; a keyboard capture ignores the controller (it times out, or Esc)
         if (dev != BIND_DEV_PAD || e->gbutton.button == SDL_GAMEPAD_BUTTON_GUIDE || e->gbutton.button >= SDL_GAMEPAD_BUTTON_COUNT) return true;
@@ -210,7 +224,9 @@ bool bind_settings_load(const char *key, const char *val) {
             for (int h = 0; h < PADB_HOST_COUNT; h++)
                 if (!strcmp(val, k_pad_ini[h])) g_bind_pad[i] = (int16_t)h;
         } else {
-            SDL_Scancode sc = strcmp(val, "none") ? SDL_GetScancodeFromName(val) : SDL_SCANCODE_UNKNOWN;
+            int sc = strcmp(val, "none") ? (int)SDL_GetScancodeFromName(val) : SDL_SCANCODE_UNKNOWN;
+            for (int m = 0; m < 5; m++)
+                if (!strcmp(val, k_mouse[m])) sc = BIND_MOUSE + 1 + m;
             if (sc != SDL_SCANCODE_UNKNOWN || !strcmp(val, "none")) g_bind_key[i] = (int16_t)sc;
         }
     }
@@ -223,5 +239,5 @@ void bind_settings_save(FILE *f) {
             fprintf(f, "bind_pad_%s = %s\n", k_ini[i], k_pad_ini[g_bind_pad[i]]);
     for (int i = 0; i < BIND_KEY_COUNT; i++)
         if (g_bind_key[i] != k_def_key[i])
-            fprintf(f, "bind_key_%s = %s\n", k_ini[i], g_bind_key[i] ? SDL_GetScancodeName((SDL_Scancode)g_bind_key[i]) : "none");
+            fprintf(f, "bind_key_%s = %s\n", k_ini[i], g_bind_key[i] ? bind_key_label(g_bind_key[i]) : "none");
 }

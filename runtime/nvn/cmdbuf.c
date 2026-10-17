@@ -16,8 +16,12 @@
 //   command, an estimate of what NVN writes for it (kept at or under the real size: memory the game allocates from
 //   an estimate that is too small is only accounting, the records do not live there).
 // - Host side: records go to shadow storage keyed by the guest memory they are accounted to: the chunk while it is
-//   being recorded into, then the part of it that was used. When the game adds guest memory overlapping that again,
-//   what was recorded there is dead (on hardware the game overwrites it). Dead blocks are reused three frames later,
+//   being recorded into, then the part of it that was used. When the game writes commands over that memory again,
+//   what was recorded there is dead (on hardware it is overwritten): the lists the first bytes go over at once, the
+//   others as the recording reaches them. The memory the game adds is often far more than it records there (BOTW
+//   gives each deferred lighting composite's material list a 0x200-byte window, records the 0x18 bytes it measured
+//   and packs the next list right after); killing the whole window lost the lists packed there before, which the
+//   frame still calls (the composites' material ID, and with it the lighting). Dead blocks are reused three frames later,
 //   not at once: the command buffer that recorded there may still chain on from them. Memory added without a guest
 //   chunk (a null pool) gets shadow storage of its own.
 // A command handle is the host address of a list's first record.
@@ -25,7 +29,9 @@ static uint32_t cmd_cost(uint32_t op, uint32_t extra) { (void)op; return 8 + ((e
 
 typedef struct { uint8_t *mem; uint64_t size; uint64_t frame; } HBlock;
 typedef struct Shadow {
-    uint64_t lo, hi;  // the guest memory it stands for; lo == hi == 0: none
+    uint64_t lo, hi;  // the guest memory it stands for (written so far); lo == hi == 0: none
+    uint64_t win;     // end of the memory the game added there (0: none)
+    uint64_t free_to; // claims below this go over no other live shadow (shadow_claim takes no lock)
     HBlock *blocks;
     int nblocks, cap;
     int users;        // command buffers recording into it
@@ -82,25 +88,31 @@ static void shadow_unuse(Shadow *sh) {  // (lock held)
     if (!--sh->users && sh->dead) { free(sh->blocks); free(sh); }
 }
 
+static int live_index(uint64_t lo) {  // (lock held) the first live shadow not wholly before lo
+    int a = 0, b = g_nlive;
+    while (a < b) {
+        int m = (a + b) / 2;
+        if (g_live[m]->hi <= lo && g_live[m]->lo < lo) a = m + 1; else b = m;
+    }
+    return a;
+}
+
 // A command buffer moves from shadow `old` (NULL: none yet), having used `used` guest bytes there, to the shadow
 // for guest memory [lo, hi): the same one when the game adds exactly that range again, unless that is the one
-// being recorded into (`recording`: its blocks still hold the start of the list); otherwise a new one, and
-// overlapped ones die. What `old` stands for shrinks to the part used first.
+// being recorded into (`recording`: its blocks still hold the start of the list); otherwise a new one, and the
+// shadows its first bytes go over die (shadow_claim: the others once written over). What `old` stands for shrinks
+// to the part used first.
 static Shadow *shadow_switch(Shadow *old, uint64_t used, bool recording, uint64_t lo, uint64_t hi) {
     pthread_mutex_lock(&g_shadow_lock);
     if (old && !old->dead && old->lo < old->hi && old->lo + used < old->hi) old->hi = old->lo + used;
     Shadow *sh = NULL;
     if (lo < hi) {
-        int a = 0, b = g_nlive;  // first live shadow ending after lo
-        while (a < b) {
-            int m = (a + b) / 2;
-            if (g_live[m]->hi <= lo) a = m + 1; else b = m;
-        }
-        int end = a;
-        while (end < g_nlive && g_live[end]->lo < hi) end++;
-        Shadow *same = end == a + 1 && g_live[a]->lo == lo && g_live[a]->hi == hi ? g_live[a] : NULL;
+        int a = live_index(lo);
+        Shadow *same = a < g_nlive && g_live[a]->lo == lo && g_live[a]->win == hi ? g_live[a] : NULL;
         if (same && (same->users == (same == old)) && !(recording && same == old)) sh = same;
         else {
+            int end = a;
+            while (end < g_nlive && g_live[end]->lo <= lo) end++;
             for (int i = a; i < end; i++) shadow_kill(g_live[i]);
             if (g_nlive - (end - a) + 1 > g_caplive) {
                 g_caplive = g_caplive ? g_caplive * 2 : 1024;
@@ -109,9 +121,11 @@ static Shadow *shadow_switch(Shadow *old, uint64_t used, bool recording, uint64_
             memmove(g_live + a + 1, g_live + end, (g_nlive - end) * sizeof *g_live);
             g_nlive += 1 - (end - a);
             sh = calloc(1, sizeof *sh);
-            sh->lo = lo;
-            sh->hi = hi;
+            sh->lo = sh->hi = lo;
+            sh->win = hi;
+            sh->free_to = a + 1 < g_nlive && g_live[a + 1]->lo < hi ? g_live[a + 1]->lo : hi;
             g_live[a] = sh;
+            if (a > 0 && g_live[a - 1]->free_to > lo) g_live[a - 1]->free_to = lo;
         }
     } else {
         sh = calloc(1, sizeof *sh);
@@ -120,6 +134,28 @@ static Shadow *shadow_switch(Shadow *old, uint64_t used, bool recording, uint64_
     if (old) shadow_unuse(old);
     pthread_mutex_unlock(&g_shadow_lock);
     return sh;
+}
+
+// The command buffer recording into `sh` has written its guest memory up to `end`: lists recorded there before die.
+static void shadow_claim(Shadow *sh, uint64_t end) {
+    if (end > sh->win) end = sh->win;  // (recording goes on past the window when the game adds no more: accounting only)
+    if (end <= sh->hi || sh->dead) return;
+    if (end <= sh->free_to) { sh->hi = end; return; }
+    pthread_mutex_lock(&g_shadow_lock);
+    if (!sh->dead) {
+        int i = live_index(sh->lo);
+        while (i < g_nlive && g_live[i] != sh) i++;
+        if (i < g_nlive) {
+            int last = i + 1;
+            while (last < g_nlive && g_live[last]->lo < end) last++;
+            for (int k = i + 1; k < last; k++) shadow_kill(g_live[k]);
+            memmove(g_live + i + 1, g_live + last, (g_nlive - last) * sizeof *g_live);
+            g_nlive -= last - (i + 1);
+            sh->hi = end;
+            sh->free_to = i + 1 < g_nlive && g_live[i + 1]->lo < sh->win ? g_live[i + 1]->lo : sh->win;
+        }
+    }
+    pthread_mutex_unlock(&g_shadow_lock);
 }
 
 static void shadow_leave(Shadow *sh, uint64_t used) {  // (a command buffer is finalized)
@@ -254,6 +290,7 @@ static CmdRec *rec_cost(Cpu *c, NvnCmdBuf *cb, uint32_t op, uint32_t extra, uint
         memcpy(c->x, saved, sizeof saved);
     }
     cb->gused += cost;
+    shadow_claim(cb->shadow, cb->gmem + cb->gused);
     if (cb->used + size + JUMP_RESERVE > cb->size) {
         uint64_t want = size + JUMP_RESERVE;
         use_block(cb, cb->block + 1, want > cb->size * 2 ? want : cb->size * 2);
@@ -343,6 +380,8 @@ NVN(nvnCommandBufferBindStorageBuffer) {
 }
 // (cmd, stage, first, count, const handle*)
 NVN(nvnCommandBufferBindTextures) { record_copy(c, CMD_BIND_TEXTURES, 4, (uint32_t)A(3) * 8); }
+// The same arguments, but the handles are read when the commands run (BOTW binds material textures this way)
+NVN(nvnCommandBufferBindTexturesDeferred) { Snap s = snap(c); record(c, CMD_BIND_TEXTURES_DEFERRED, 0, &s); }
 NVN(nvnCommandBufferBindTexture) {
     Snap s = snap(c);
     CmdRec *r = record(c, CMD_BIND_TEXTURES, 8, &s);
@@ -390,9 +429,9 @@ typedef struct {
     NvnTextureView dview;
     uint8_t has_dview;
 } RtRec;
-// Textures in records are the guest NVNtexture objects, resolved when executed (nvn_texture_live): on hardware a
-// list holds GPU addresses, so it stays valid when the game finalizes and initializes a texture again in the same
-// object (BOTW does, between frames, for render targets its display lists keep using).
+// Textures in records are host textures, taken when recorded (nvn_texture_host): on hardware a list holds the
+// texture's address and shape as they were then. One the game finalizes later (BOTW does, between frames, for render
+// targets its display lists keep using) still names its memory: the renderer keeps one image per memory and shape.
 NVN(nvnCommandBufferSetRenderTargets) {
     Snap s = snap(c);
     int n = (int)s.x[1];
@@ -400,10 +439,10 @@ NVN(nvnCommandBufferSetRenderTargets) {
     RtRec rt = {0};
     const uint64_t *colors = (const uint64_t *)(uintptr_t)s.x[2], *views = (const uint64_t *)(uintptr_t)s.x[3];
     for (int i = 0; i < n; i++) {
-        rt.tex[i] = colors ? colors[i] : 0;
+        rt.tex[i] = colors ? (uint64_t)(uintptr_t)nvn_texture_host(colors[i]) : 0;
         if (views && views[i]) { rt.has_view[i] = 1; memcpy(&rt.views[i], (void *)(uintptr_t)views[i], sizeof(NvnTextureView)); }
     }
-    rt.depth = s.x[4];
+    rt.depth = (uint64_t)(uintptr_t)nvn_texture_host(s.x[4]);
     if (s.x[5]) { rt.has_dview = 1; memcpy(&rt.dview, (void *)(uintptr_t)s.x[5], sizeof(NvnTextureView)); }
     CmdRec *r = record(c, CMD_SET_RENDER_TARGETS, sizeof rt, &s);
     r->x[0] = (uint64_t)n;
@@ -493,7 +532,7 @@ typedef struct { uint64_t tex; NvnTextureView view; uint8_t has_view; int32_t re
 static void clear_texture(Cpu *c, int kind) {
     Snap s = snap(c);
     ClearTexRec ct = {0};
-    ct.tex = s.x[1];  // (guest NVNtexture: resolved when executed)
+    ct.tex = (uint64_t)(uintptr_t)nvn_texture_host(s.x[1]);
     if (s.x[2]) { ct.has_view = 1; memcpy(&ct.view, (void *)(uintptr_t)s.x[2], sizeof ct.view); }
     if (s.x[3]) memcpy(ct.region, (void *)(uintptr_t)s.x[3], sizeof ct.region);
     if (s.x[4]) memcpy(ct.color, (void *)(uintptr_t)s.x[4], 16);
@@ -571,7 +610,7 @@ NVN(nvnCommandBufferResumeTransformFeedback) { (void)c; }
 // ---- copies
 typedef struct { uint64_t tex; NvnTextureView view; uint8_t has_view; int32_t region[6]; } TexRef;
 static void tex_ref(TexRef *t, uint64_t tex, uint64_t view, uint64_t region) {
-    t->tex = tex;  // (guest NVNtexture: resolved when executed)
+    t->tex = (uint64_t)(uintptr_t)nvn_texture_host(tex);
     if (view) { t->has_view = 1; memcpy(&t->view, (void *)(uintptr_t)view, sizeof t->view); }
     if (region) memcpy(t->region, (void *)(uintptr_t)region, sizeof t->region);
 }

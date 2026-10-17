@@ -120,7 +120,7 @@ CXXFLAGS := -O2 -g -std=c++17 -I$(IMGUI) -I$(IMGUI)/backends -Iruntime -Iruntime
 
 all: $(EXE) $(if $(strip $(GEN_SRC)),$(GAMELIB))  # (GEN_SRC is a space when there is no generated/)
 
-$(B)/obj/%.o: $(GEN)/%.c runtime/cpu.h
+$(B)/obj/%.o: $(GEN)/%.c runtime/cpu.h runtime/simd.h runtime/simd_fp.h  # (cpu.h includes both)
 	@mkdir -p $(dir $@)
 	@$(CC) $(GENFLAGS) -c $< -o $@
 $(B)/obj/layout.o: runtime/gamelib.h

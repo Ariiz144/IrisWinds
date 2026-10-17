@@ -11,6 +11,7 @@ enum { UPSCALE_BILINEAR = 0, UPSCALE_METALFX = 1 /* macOS */, UPSCALE_FSR1 = 2 /
 #define UPSCALE_SHARP UPSCALE_FSR1
 #endif
 enum { AA_OFF = 0, AA_SMAA = 1 };
+enum { PERF_OFF = 0, PERF_FPS = 1, PERF_FULL = 2 };
 
 typedef struct {
     bool fullscreen;
@@ -20,8 +21,12 @@ typedef struct {
     float volume;        // master volume, 1 = 100%
     bool reverb;         // room reverb effect
     bool movie_audio;
-    bool show_fps;
+    int perf_overlay;    // PERF_*: the performance overlay (F10 cycles it)
     bool dpad_move;      // the d-pad (and arrow keys) also act as the left stick while it is at rest
+    bool mouse_camera;   // the mouse turns the camera (right stick); the cursor is held in the window while playing
+    float mouse_sens;    // mouse camera speed, 1 = default
+    bool mouse_invert_y; // mouse up looks down
+    bool async_shaders;  // draw on while new shaders compile (no stutter; what needs them is skipped meanwhile)
     bool menu_tip_seen;  // the start screen's one-time "how to open the menu" note was shown (first PLAY ever)
 } Settings;
 

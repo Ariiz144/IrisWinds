@@ -106,6 +106,7 @@ static void pick_device(void) {
     free(qp);
     if (g_vk.qfam == UINT32_MAX) FATAL("no graphics+present queue\n");
     LOG("[vk] using %s\n", g_vk.props.deviceName);
+    { extern void perfmon_set_gpu_hint(const char *n); perfmon_set_gpu_hint(g_vk.props.deviceName); }
 }
 
 static bool g_fault_ext;
@@ -573,6 +574,21 @@ static void present_locked(NvnTexture *t) {
             if (*next == ',') next++;
         }
     }
+    {   // F12 (runtime/hle/input.c): every other game image -> build/frames/rec_N.png until F12 again (catches flicker
+        // too short to see; the saves slow the game down meanwhile)
+        extern volatile int g_record_frames;
+        static int recording;
+        if (g_record_frames != recording) {
+            recording = g_record_frames;
+            if (recording) mkdir("build/frames", 0755);
+            LOG("[shot] recording %s at frame %llu\n", recording ? "on" : "off", (unsigned long long)total_frames);
+        }
+        if (recording && !(total_frames & 1)) {
+            char path[256];
+            snprintf(path, sizeof path, "build/frames/rec_%05llu.png", (unsigned long long)total_frames);
+            renderer_save_texture_tex(b, path);
+        }
+    }
     static long shot_from = -1;
     if (shot_from < 0) { const char *e = getenv("SAVAGEWIND_SCREENSHOT_FROM"); shot_from = e ? atol(e) : 0; }
     if (shot_every && total_frames % shot_every == 0 && (long)total_frames >= shot_from) {
@@ -684,6 +700,8 @@ int ui_run(void) {
             input_handle_event(&e);
         }
         menu_apply_window_requests(window);
+        extern void input_mouse_update(SDL_Window *w);  // runtime/hle/input.c: hold the cursor while the game has it
+        input_mouse_update(window);
     }
 }
 

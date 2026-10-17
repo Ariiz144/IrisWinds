@@ -511,6 +511,7 @@ void renderer_mark_gpu_owned(NvnTexture *t) { tex_backend(t)->gpu_owned = true; 
 bool renderer_is_gpu_owned(NvnTexture *t) { return tex_backend(t)->gpu_owned; }
 
 void backend_pool_written(uint64_t addr, uint64_t size) { (void)addr; (void)size; }
+void backend_debug_copies_at(uint64_t addr) { (void)addr; }
 
 // Host-produced texel data (decoded video): upload straight into the Metal texture.
 void renderer_upload_rgba(NvnTexture *t, const void *rgba, uint32_t w, uint32_t h, uint32_t stride) {

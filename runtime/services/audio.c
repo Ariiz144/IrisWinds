@@ -3,6 +3,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <math.h>
+#include <stdatomic.h>
 #include <time.h>
 
 #include <SDL3/SDL.h>
@@ -632,6 +633,21 @@ static void wav_header(FILE *f, uint32_t bytes) {
     fseek(f, 0, SEEK_END);
 }
 
+// Bytes of stereo float audio to keep queued ahead of the device: 4 frames of n samples, and at least 2 device
+// periods.
+static int output_target(SDL_AudioStream *st, uint32_t rate, uint32_t n) {
+    int target = 4 * (int)(n * 2 * sizeof(float));
+    SDL_AudioSpec dev;
+    int dev_frames = 0;
+    if (st && SDL_GetAudioDeviceFormat(SDL_GetAudioStreamDevice(st), &dev, &dev_frames) && dev_frames > 0) {
+        int t = (2 * dev_frames * (int)rate / (dev.freq ? dev.freq : 48000) + (int)n) * 2 * (int)sizeof(float);
+        if (t > target) target = t;
+        LOG("[audren] device %d Hz, %d frames/period; queue target %d samples\n", dev.freq, dev_frames,
+            target / (2 * (int)sizeof(float)));
+    }
+    return target;
+}
+
 static void *renderer_tick(void *arg) {
     Renderer *r = arg;
     float out[2 * 4096];
@@ -639,17 +655,7 @@ static void *renderer_tick(void *arg) {
     int frame_bytes = (int)(N * 2 * sizeof(float));
     uint64_t next = 0;
     struct timespec now;
-    int target = 4 * frame_bytes;  // queued audio to keep ahead of the device: >= 2 device periods
-    if (r->stream) {
-        SDL_AudioSpec dev;
-        int dev_frames = 0;
-        if (SDL_GetAudioDeviceFormat(SDL_GetAudioStreamDevice(r->stream), &dev, &dev_frames) && dev_frames > 0) {
-            int t = (2 * dev_frames * (int)r->sample_rate / (dev.freq ? dev.freq : 48000) + (int)N) * 2 * (int)sizeof(float);
-            if (t > target) target = t;
-            LOG("[audren] device %d Hz, %d frames/period; queue target %d samples\n", dev.freq, dev_frames,
-                target / (2 * (int)sizeof(float)));
-        }
-    }
+    int target = output_target(r->stream, r->sample_rate, N);
     while (!r->quit) {
         if (r->stream) {
             while (SDL_GetAudioStreamQueued(r->stream) >= target && !r->quit) {
@@ -943,19 +949,24 @@ static void request_update(Renderer *r, IpcReq *req, IpcResp *resp) {
     (void)resp;
 }
 
-static void renderer_open_output(Renderer *r) {
+// The renderer's output: a stereo float SDL stream (NULL without a device or with SAVAGEWIND_NO_AUDIO), and with
+// SAVAGEWIND_AUDIO_WAV=<file> a recording of it.
+static SDL_AudioStream *output_open(uint32_t rate, FILE **wav) {
     if (getenv("SAVAGEWIND_AUDIO_WAV")) {
-        r->wav = fopen(getenv("SAVAGEWIND_AUDIO_WAV"), "wb");
-        if (r->wav) wav_header(r->wav, 0);
+        *wav = fopen(getenv("SAVAGEWIND_AUDIO_WAV"), "wb");
+        if (*wav) wav_header(*wav, 0);
     }
-    if (getenv("SAVAGEWIND_NO_AUDIO") && strcmp(getenv("SAVAGEWIND_NO_AUDIO"), "0")) return;
-    if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) { LOG("[audren] SDL audio init failed: %s\n", SDL_GetError()); return; }
-    SDL_AudioSpec spec = {SDL_AUDIO_F32, 2, (int)r->sample_rate};
-    r->stream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, NULL, NULL);
-    if (!r->stream) { LOG("[audren] SDL audio open failed: %s\n", SDL_GetError()); return; }
-    if (getenv("SAVAGEWIND_AUDIO_GAIN")) SDL_SetAudioStreamGain(r->stream, (float)atof(getenv("SAVAGEWIND_AUDIO_GAIN")));
-    SDL_ResumeAudioStreamDevice(r->stream);
+    if (getenv("SAVAGEWIND_NO_AUDIO") && strcmp(getenv("SAVAGEWIND_NO_AUDIO"), "0")) return NULL;
+    if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) { LOG("[audren] SDL audio init failed: %s\n", SDL_GetError()); return NULL; }
+    SDL_AudioSpec spec = {SDL_AUDIO_F32, 2, (int)rate};
+    SDL_AudioStream *st = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, NULL, NULL);
+    if (!st) { LOG("[audren] SDL audio open failed: %s\n", SDL_GetError()); return NULL; }
+    if (getenv("SAVAGEWIND_AUDIO_GAIN")) SDL_SetAudioStreamGain(st, (float)atof(getenv("SAVAGEWIND_AUDIO_GAIN")));
+    SDL_ResumeAudioStreamDevice(st);
+    return st;
 }
+
+static void renderer_open_output(Renderer *r) { r->stream = output_open(r->sample_rate, &r->wav); }
 
 static void audio_renderer(Service *s, IpcReq *req, IpcResp *resp) {
     Renderer *r = s->state;
@@ -1037,6 +1048,292 @@ SERVICE("audren:u", audren_u) {
     case 2: case 4: ipc_return_object(resp, service_new("IAudioDevice", audio_device, NULL)); break;
     default: LOG("[audren] cmd %u (ok)\n", req->cmd);
     }
+}
+
+// ------------------------------------------------------------------ the sdk's own AudioRenderer, in process
+// BOTW's sdk module carries the whole AudioRenderer: the server (nn::audio::server: voices, mixes, effects, command
+// generation) and the DSP's command processor (nn::audio::dsp::CommandListProcessor), CPU code recompiled with the
+// rest of the game. Its client reaches that server in process, by a direct call (CreateAudioRendererManagerByDfc,
+// sdk 0x7100224d00), for the CPU rendering device: nn::audio::OpenAudioRenderer (sdk 0x7100220a70) takes that path
+// when AudioRendererParameter +0x2c (rendering device) is 1, and when +0x30 (execution mode) is 1 too it opens the
+// renderer for manual execution on the game's own work buffer; otherwise it opens audren:u (the mixer above). In
+// manual execution the application renders each frame with nn::audio::ExecuteAudioRendererRendering (sdk
+// 0x7100221380): command generation and the processor run on the calling thread, then the renderer's event is
+// signaled. So InitializeAudioRendererParameter asks for CPU + manual, and two guest threads of ours do the ADSP's
+// part, beside the game's cores: one renders a frame whenever the SDL stream runs low, the other signals the event.
+// The final mix is a DeviceSink command, which the sdk's processor skips (DispatchCommand, sdk 0x710024aa40, has no
+// case for its id 0x14; on the console the ADSP plays it): a hook after CommandListProcessor::Process takes its
+// buffers. SuperMarioWonderRecomp (MIT, by BelmanteGu) runs Wonder's renderer this way; its PROGRESS.md was the
+// lead, no code comes from it. SAVAGEWIND_AUDIO_DFC=0: the mixer above instead.
+typedef struct {
+    bool open;                   // the game's renderer is open
+    _Atomic int threads;         // our render and event threads still running
+    _Atomic bool signal;         // a frame was rendered: the event thread signals the game's event
+    uint64_t renderer, context;  // the game's AudioRendererHandle
+    uint32_t rate, samples;      // AudioRendererParameter +0x00, +0x04
+    SDL_AudioStream *stream;
+    FILE *wav;
+    uint32_t wav_bytes;
+    float out[2 * 1024];  // the last frame, stereo, from the device sink (sdk_take_sink)
+    uint32_t out_n;
+    uint64_t frames, render_ns, render_max, lock_max;  // (SAVAGEWIND_AUDIO_LOG)
+    float peak;
+} SdkRen;
+static SdkRen g_sdkren;
+static GuestFn g_sdk_process;  // the recompiled CommandListProcessor::Process, under our hook
+static _Atomic uint32_t g_sdk_short;  // device requests the stream couldn't fill: underruns (SAVAGEWIND_AUDIO_LOG)
+
+static void SDLCALL sdk_stream_get(void *u, SDL_AudioStream *st, int additional, int total) {
+    (void)u, (void)st, (void)total;
+    if (additional > 0 && g_sdkren.frames > 400) g_sdk_short++;
+}
+
+static bool sdk_renderer_on(void) {
+    const char *e = ENV("SAVAGEWIND_AUDIO_DFC");
+    return !e || strcmp(e, "0");
+}
+
+RT_ON_RESET(sdkren_reset) {
+    SdkRen *r = &g_sdkren;
+    if (r->stream) SDL_DestroyAudioStream(r->stream);
+    if (r->wav) { wav_header(r->wav, r->wav_bytes); fclose(r->wav); }
+    memset(r, 0, sizeof *r);
+}
+
+// The command list a processor ran (CommandListProcessor::Setup, sdk 0x710024a9fc): +0x04 command count, +0x14
+// samples per buffer, commands from +0x20, each with +0x04 bit 0 enabled, +0x05 id, +0x06 size. DeviceSinkCommand
+// (id 0x14, 0x148 bytes, written by sdk 0x71002333f0): +0x128 its sample buffers (int32 samples on the int16
+// scale, as CircularBufferSinkCommand reads them), +0x130 the input count, +0x134 the input buffer indices (int16),
+// FL FR FC LFE BL BR. Stereo goes to r->out.
+static void sdk_take_sink(SdkRen *r, uint64_t list) {
+    r->out_n = 0;
+    if (!in_guest(list, 0x20)) return;
+    uint32_t count = *(const uint32_t *)(uintptr_t)(list + 4), n = *(const uint32_t *)(uintptr_t)(list + 0x14);
+    if (!n || n > 1024) return;
+    uint64_t cmd = list + 0x20;
+    for (uint32_t i = 0; i < count && in_guest(cmd, 8); i++) {
+        const uint8_t *p = (const uint8_t *)(uintptr_t)cmd;
+        int16_t size = *(const int16_t *)(p + 6);
+        if (p[5] == 0x14 && (p[4] & 1) && in_guest(cmd, 0x148)) {
+            uint64_t buf = *(const uint64_t *)(p + 0x128);
+            uint32_t inputs = *(const uint32_t *)(p + 0x130);
+            if (inputs > 6) inputs = 6;
+            const int32_t *ch[6] = {0};
+            for (uint32_t k = 0; k < inputs; k++) {
+                int16_t idx = *(const int16_t *)(p + 0x134 + 2 * k);
+                uint64_t a = buf + (uint64_t)idx * n * 4;
+                if (idx >= 0 && in_guest(a, (uint64_t)n * 4)) ch[k] = (const int32_t *)(uintptr_t)a;
+            }
+            for (uint32_t s = 0; s < n; s++) {
+                float v[6] = {0};
+                for (uint32_t k = 0; k < inputs; k++) v[k] = ch[k] ? (float)ch[k][s] : 0;
+                float L = v[0], R = inputs == 1 ? v[0] : v[1];
+                if (inputs >= 6) {
+                    L += 0.707f * v[2] + 0.251f * v[3] + 0.707f * v[4];
+                    R += 0.707f * v[2] + 0.251f * v[3] + 0.707f * v[5];
+                }
+                r->out[s * 2] = clampf(L / 32768.f, -1, 1);
+                r->out[s * 2 + 1] = clampf(R / 32768.f, -1, 1);
+            }
+            r->out_n = n;
+            return;
+        }
+        if (size <= 0) break;
+        cmd += (uint64_t)size;
+    }
+}
+
+// Hook on nn::audio::dsp::CommandListProcessor::Process (x0: the processor, whose +0x00 is its command list).
+static void sdk_process(Cpu *c) {
+    uint64_t list = *(const uint64_t *)(uintptr_t)c->x[0], lr = c->x[30];
+    g_sdk_process(c);
+    c->x[30] = lr;
+    sdk_take_sink(&g_sdkren, list);
+}
+
+// svcSleepThread: the core goes to other threads meanwhile, and a reboot stops the thread there.
+static void sdk_sleep(Cpu *c, uint64_t ns) {
+    c->x[0] = ns;
+    rt_svc(c, 0x0B, 0);
+}
+
+// Our render thread (a guest thread: the sdk's code runs on it). One frame each time the stream drops below its
+// target, or in real time without a device: AudioRenderSystem::ExecuteAudioRendererRendering, what the client's
+// ExecuteAudioRendererRendering calls through the renderer object (whose vtable thunks add 0x70 for the system) before
+// it signals the event. The renderer's mutex (AudioRenderSystem +0x2d0, which Update, Start and Stop take) keeps
+// the game's RequestUpdate from changing voices while a frame is generated.
+static void sdk_render_thread(Cpu *c) {
+    SdkRen *r = &g_sdkren;
+    uint64_t exec = guest_sym("_ZN2nn5audio6server17AudioRenderSystem29ExecuteAudioRendererRenderingEv");
+    uint64_t lock = guest_sym("_ZN2nn2os12SdkMutexType4LockEv");
+    uint64_t unlock = guest_sym("_ZN2nn2os12SdkMutexType6UnlockEv");
+    uint32_t N = r->samples ? r->samples : 240;
+    int target = output_target(r->stream, r->rate, N);
+    uint64_t next = plat_now_ns(), frame_ns = (uint64_t)N * 1000000000ull / (r->rate ? r->rate : 48000);
+    kernel_thread_off_cores();       // (the DSP's work: beside the game's cores, not waiting for one)
+    plat_thread_realtime(frame_ns);  // (the host thread under it: ahead of the game's when the CPU is busy)
+    while (r->open) {
+        if (*(volatile const uint32_t *)(uintptr_t)(r->context + 0x14)) {  // not started (StartAudioRenderer clears it)
+            sdk_sleep(c, 5000000);
+            next = plat_now_ns();
+            continue;
+        }
+        if (r->stream) {
+            if (SDL_GetAudioStreamQueued(r->stream) >= target) { sdk_sleep(c, 1000000); continue; }
+        } else {
+            uint64_t now = plat_now_ns();
+            if (now < next) { sdk_sleep(c, next - now); continue; }
+            if (now - next > 100000000) next = now;  // (more than 100 ms late: don't catch up)
+            next += frame_ns;
+        }
+        uint64_t mutex = r->renderer + 0x70 + 0x2d0, t0 = plat_now_ns();
+        c->x[0] = mutex;
+        guest_call(c, lock);
+        uint64_t t1 = plat_now_ns();
+        r->out_n = 0;
+        if (r->open) {
+            c->x[0] = r->renderer + 0x70;
+            guest_call(c, exec);
+        }
+        c->x[0] = mutex;
+        guest_call(c, unlock);
+        uint64_t t2 = plat_now_ns();
+        r->signal = true;
+        uint32_t n = r->out_n ? r->out_n : N;
+        if (!r->out_n) memset(r->out, 0, sizeof(float) * 2 * n);
+        int bytes = (int)(n * 2 * sizeof(float));
+        if (r->stream) { apply_gain(r->stream); SDL_PutAudioStreamData(r->stream, r->out, bytes); }
+        // SAVAGEWIND_AUDIO_LOG: every 10 s, the time a frame took (the renderer's mutex, then rendering) and the
+        // times the device ran dry.
+        r->frames++;
+        r->render_ns += t2 - t1;
+        if (t2 - t1 > r->render_max) r->render_max = t2 - t1;
+        if (t1 - t0 > r->lock_max) r->lock_max = t1 - t0;
+        for (uint32_t i = 0; i < 2 * n; i++) r->peak = fmaxf(r->peak, fabsf(r->out[i]));
+        if (ENV("SAVAGEWIND_AUDIO_LOG") && r->frames % 2000 == 0) {
+            LOG("[audren-sdk] %llu frames: render %.0f us (max %.0f), mutex wait max %.0f us, %u underruns, peak %.3f\n",
+                (unsigned long long)r->frames, r->render_ns / 2000 / 1e3, r->render_max / 1e3, r->lock_max / 1e3,
+                atomic_exchange(&g_sdk_short, 0), r->peak);
+            r->render_ns = r->render_max = r->lock_max = 0;
+            r->peak = 0;
+        }
+        if (r->wav) {
+            fwrite(r->out, 1, bytes, r->wav);
+            r->wav_bytes += bytes;
+            if ((r->frames & 255) == 0) { wav_header(r->wav, r->wav_bytes); fflush(r->wav); }
+        }
+    }
+    r->threads--;
+}
+
+// The game's event, signaled after each frame from a thread of its own: SignalSystemEvent takes the event's mutex,
+// which the game's audio thread keeps while it waits for its core, and the next frame must not wait for that
+// (it did: frames took up to 75 ms, and the sound broke up).
+static void sdk_event_thread(Cpu *c) {
+    SdkRen *r = &g_sdkren;
+    uint64_t sig = guest_sym("_ZN2nn2os17SignalSystemEventEPNS0_15SystemEventTypeE");
+    kernel_thread_off_cores();
+    while (r->open) {
+        if (!atomic_exchange(&r->signal, false)) { sdk_sleep(c, 500000); continue; }
+        c->x[0] = *(const uint64_t *)(uintptr_t)r->context;  // the event OpenAudioRenderer made (manual execution)
+        guest_call(c, sig);
+    }
+    r->threads--;
+}
+
+// Our threads are nn::os threads: the sdk's code finds the current nn::os::ThreadType through TLS (+0x1f8), and
+// its mutexes use it.
+static void sdk_start_thread(Cpu *c, const char *name, HostFn fn) {
+    enum { STACK = 0x40000 };
+    uint64_t x[8];
+    memcpy(x, c->x, sizeof x);
+    uint64_t thread = (uint64_t)(uintptr_t)hle_alloc(0x400);  // nn::os::ThreadType (smaller than that)
+    uint64_t stack = ((uint64_t)(uintptr_t)hle_alloc(STACK + 0x1000) + 0xfff) & ~0xfffull;  // (page aligned)
+    char *gname = hle_alloc(strlen(name) + 1);
+    strcpy(gname, name);
+    c->x[0] = thread;
+    c->x[1] = hle_register(name, fn);
+    c->x[2] = 0;
+    c->x[3] = stack;
+    c->x[4] = STACK;
+    c->x[5] = 0;  // the highest application priority: the ADSP's work
+    c->x[6] = 3;  // (any core: the thread leaves core scheduling as it starts)
+    guest_call(c, guest_sym("_ZN2nn2os12CreateThreadEPNS0_10ThreadTypeEPFvPvES3_S3_mii"));
+    uint32_t res = (uint32_t)c->x[0];
+    if (!res) {
+        c->x[0] = thread;
+        c->x[1] = (uint64_t)(uintptr_t)gname;
+        guest_call(c, guest_sym("_ZN2nn2os20SetThreadNamePointerEPNS0_10ThreadTypeEPKc"));
+        g_sdkren.threads++;
+        c->x[0] = thread;
+        guest_call(c, guest_sym("_ZN2nn2os11StartThreadEPNS0_10ThreadTypeE"));
+    } else {
+        LOG("[audren-sdk] nn::os::CreateThread failed: %#x\n", res);
+    }
+    memcpy(c->x, x, sizeof x);
+}
+
+#define SDK_AUDIO_CALL(sym)          \
+    do {                             \
+        static uint64_t a_;          \
+        if (!a_) a_ = guest_sym(sym); \
+        guest_call(c, a_);           \
+    } while (0)
+
+HLE_FUNC("_ZN2nn5audio32InitializeAudioRendererParameterEPNS0_22AudioRendererParameterE", hle_audren_param_init) {
+    uint64_t p = c->x[0];
+    SDK_AUDIO_CALL("_ZN2nn5audio32InitializeAudioRendererParameterEPNS0_22AudioRendererParameterE");
+    if (!sdk_renderer_on()) return;
+    *(uint32_t *)(uintptr_t)(p + 0x2c) = 1;  // rendering device: CPU
+    *(uint32_t *)(uintptr_t)(p + 0x30) = 1;  // execution mode: manual
+}
+
+// OpenAudioRenderer(handle *, os::SystemEvent *, const AudioRendererParameter &, void *work, size_t size)
+HLE_FUNC("_ZN2nn5audio17OpenAudioRendererEPNS0_19AudioRendererHandleEPNS_2os11SystemEventERKNS0_22AudioRendererParameterEPvm",
+         hle_audren_open) {
+    uint64_t h = c->x[0], p = c->x[2], size = c->x[4];
+    SDK_AUDIO_CALL("_ZN2nn5audio17OpenAudioRendererEPNS0_19AudioRendererHandleEPNS_2os11SystemEventERKNS0_22AudioRendererParameterEPvm");
+    const uint32_t *pp = (const uint32_t *)(uintptr_t)p;
+    uint32_t res = (uint32_t)c->x[0];
+    LOG("[audren-sdk] OpenAudioRenderer %u Hz, %u samples, %u mix buffers, %u voices, %u effects, device %u, "
+        "mode %u, work %#llx -> %#x\n", pp[0], pp[1], pp[2], pp[4], pp[6], pp[11], pp[12],
+        (unsigned long long)size, res);
+    if (res || pp[11] != 1 || pp[12] != 1) return;
+    SdkRen *r = &g_sdkren;
+    if (r->open) { LOG("[audren-sdk] a second renderer: not rendered\n"); return; }
+    uint64_t proc = guest_sym("_ZN2nn5audio3dsp20CommandListProcessor7ProcessEv");
+    static uint64_t hooked;
+    if (hooked != proc) {
+        g_sdk_process = dispatch_lookup(proc);
+        if (!g_sdk_process) FATAL("[audren-sdk] CommandListProcessor::Process %llx isn't recompiled\n", proc);
+        hle_override(proc, sdk_process, "CommandListProcessor::Process");
+        hooked = proc;
+    }
+    r->renderer = *(const uint64_t *)(uintptr_t)h;
+    r->context = *(const uint64_t *)(uintptr_t)(h + 8);
+    r->rate = pp[0];
+    r->samples = pp[1];
+    if (!r->stream && !r->wav) {
+        r->stream = output_open(r->rate, &r->wav);
+        if (r->stream) SDL_SetAudioStreamGetCallback(r->stream, sdk_stream_get, NULL);
+    }
+    r->open = true;
+    if (!r->threads) {
+        sdk_start_thread(c, "SavageWind.AudioRender", sdk_render_thread);
+        sdk_start_thread(c, "SavageWind.AudioEvent", sdk_event_thread);
+    }
+}
+
+HLE_FUNC("_ZN2nn5audio18CloseAudioRendererENS0_19AudioRendererHandleE", hle_audren_close) {
+    SdkRen *r = &g_sdkren;
+    if (r->open && c->x[0] == r->renderer) {
+        uint64_t x0 = c->x[0], x1 = c->x[1];
+        r->open = false;
+        while (r->threads) sdk_sleep(c, 1000000);  // (their frame and signal done: the renderer goes away next)
+        c->x[0] = x0;
+        c->x[1] = x1;
+    }
+    SDK_AUDIO_CALL("_ZN2nn5audio18CloseAudioRendererENS0_19AudioRendererHandleE");
 }
 
 // ------------------------------------------------------------------ audout (buffers released in real time)

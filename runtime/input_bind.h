@@ -20,14 +20,19 @@ enum {
     BIND_PAD_COUNT,                                      // controller: the 16 buttons (its sticks stay the sticks)
     BIND_LS_UP = BIND_PAD_COUNT, BIND_LS_DOWN, BIND_LS_LEFT, BIND_LS_RIGHT,
     BIND_RS_UP, BIND_RS_DOWN, BIND_RS_LEFT, BIND_RS_RIGHT,
-    BIND_KEY_COUNT                                       // keyboard: buttons + both sticks
+    BIND_WALK,                                           // keyboard only: held, the left stick keys tilt it part way
+    BIND_KEY_COUNT                                       // keyboard: buttons + both sticks + walk
 };
 enum { BIND_DEV_PAD, BIND_DEV_KEY };
+// A keyboard binding can also be a mouse button: BIND_MOUSE + SDL_BUTTON_LEFT (1) .. SDL_BUTTON_X2 (5), past every
+// SDL scancode.
+#define BIND_MOUSE 0x400
+#define BIND_MOUSE_LAST (BIND_MOUSE + 5)
 // Controller binding values: an SDL_GamepadButton, or the analog triggers as buttons
 enum { PADB_LTRIGGER = 26 /* SDL_GAMEPAD_BUTTON_COUNT */, PADB_RTRIGGER, PADB_HOST_COUNT };
 
 extern int16_t g_bind_pad[BIND_PAD_COUNT];  // PADB value per Switch button
-extern int16_t g_bind_key[BIND_KEY_COUNT];  // SDL_Scancode per input (0 = none)
+extern int16_t g_bind_key[BIND_KEY_COUNT];  // SDL_Scancode or BIND_MOUSE + button per input (0 = none)
 
 const char *bind_input_name(int slot);         // "A", "D-pad Up", "Left stick Up"
 const char *bind_pad_label(int host, int fam); // controller button in the pad family's own words (fam: input_pad_family)

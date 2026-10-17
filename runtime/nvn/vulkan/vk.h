@@ -82,8 +82,13 @@ typedef struct TexBackend {
     uint32_t pending_w, pending_h, pending_stride;
     uint8_t astc_bw, astc_bh;  // ASTC without GPU support: decoded to RGBA8 on upload (runtime/nvn/astc.c)
     bool astc_srgb;
-    int reg;  // slot in textures.c's live list + 1 (a reboot destroys them all)
-    uint64_t used_frame;  // last frame a finalized texture's image was asked for (textures.c zombies)
+    // textures.c: one image per memory and shape, shared by every texture made there
+    uint64_t key_addr;           // 0: not shared
+    uint32_t key[7];             // target, format, width, height, depth, levels, samples
+    struct TexBackend *key_next;
+    int refs;                    // textures holding the image
+    int all, idle;               // slots + 1 in textures.c's lists of all images / images no texture holds
+    uint64_t idle_frame, used_frame;  // when it was let go / last asked for by a finalized texture (zombies)
 } TexBackend;
 
 TexBackend *vk_tex(NvnTexture *t, bool for_render);  // backend image (uploads CPU contents unless for_render)

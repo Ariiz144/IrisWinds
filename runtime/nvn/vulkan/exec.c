@@ -17,6 +17,9 @@
 #include "../../settings.h"
 
 static uint64_t stat_draws, stat_skipped, stat_passes, stat_dispatches, stat_wait_ns, stat_flushes, stat_feedback_copies;
+static uint64_t stat_feedback_live;  // depth attachments sampled as they are (read-only feedback, no copy)
+static bool pass_ds_written;         // a draw of the current pass wrote depth or stencil
+static uint8_t pass_color_written;   // the color targets (bits) a draw of the current pass wrote
 static uint64_t stat_upload_bytes;
 // SAVAGEWIND_VK_PROF=1: render-thread time per category in the fps log (exec = whole command lists, draw = draw(),
 // sets = descriptor sets incl. cbuf copies, vtx = index scan + vertex copies, submit = vkQueueSubmit2)
@@ -439,10 +442,15 @@ static void *worker(void *a) {
     return NULL;
 }
 
+// Shaders and pipelines compile where they are first needed, the draw waiting for them (a short stutter the first time
+// an effect appears), unless the "Asynchronous shaders" setting is on: then they compile on other threads and draws
+// that need them are skipped meanwhile. That loses what the game draws only once: the save file's screenshot (a
+// blit into a 256x144 texture, read back right after) came out as whatever the GPU memory held.
+// SAVAGEWIND_SYNC_SHADERS / SAVAGEWIND_ASYNC_SHADERS override the setting.
 static bool sync_shaders(void) {
-    static int v = -1;
-    if (v < 0) v = getenv("SAVAGEWIND_SYNC_SHADERS") != NULL;
-    return v;
+    static int env = -1;
+    if (env < 0) env = getenv("SAVAGEWIND_SYNC_SHADERS") ? 1 : getenv("SAVAGEWIND_ASYNC_SHADERS") ? 0 : 2;
+    return env == 2 ? !g_settings.async_shaders : env;
 }
 
 // Shader translation: one dedicated thread (the translator isn't re-entrant - translate.c's RSC2 string ring - and
@@ -565,11 +573,12 @@ const char *renderer_stats(void) {
         LOG("\n");
     }
     snprintf(stats_text, sizeof stats_text,
-             "%llu draws, %llu skipped, %llu passes, %llu dispatches, %llu flushes, wait %.0fms, compile %d, fbcopy %llu, upload %.1fMB",
+             "%llu draws, %llu skipped, %llu passes, %llu dispatches, %llu flushes, wait %.0fms, compile %d, fbcopy %llu (+%llu live), upload %.1fMB",
              (unsigned long long)stat_draws, (unsigned long long)stat_skipped, (unsigned long long)stat_passes,
              (unsigned long long)stat_dispatches, (unsigned long long)stat_flushes, (double)stat_wait_ns / 1e6,
-             atomic_exchange(&stat_compiles, 0), (unsigned long long)stat_feedback_copies, (double)stat_upload_bytes / 1048576.0);
-    stat_feedback_copies = stat_upload_bytes = 0;
+             atomic_exchange(&stat_compiles, 0), (unsigned long long)stat_feedback_copies, (unsigned long long)stat_feedback_live,
+             (double)stat_upload_bytes / 1048576.0);
+    stat_feedback_copies = stat_feedback_live = stat_upload_bytes = 0;
     if (prof) {
         prof_up = prof_up_ns;
         prof_up_ns = 0;
@@ -638,6 +647,11 @@ static uint32_t tex_wh[2][64][2];
 // ================================================================== render passes
 static VkFormat pass_color[8], pass_depth, pass_stencil;
 static uint32_t pass_ncolor, pass_samples = 1, pass_w, pass_h;
+// (debugging) SAVAGEWIND_TRACE_TEX (textures.c): texture write histories
+bool vk_trace_tex(NvnTexture *t);
+void vk_trace_event(NvnTexture *t, uint64_t key, NvnTexture *const *srcs, int nsrcs, const char *fmt, ...);
+void vk_trace_dump(NvnTexture *t);
+
 static int debug_pass_no;
 static NvnTexture *pass_dbg[8];  // (debug frame) the color targets of the pass in progress
 static int pass_dbg_n, pass_dbg_draws;
@@ -660,8 +674,15 @@ static void vk_end_pass_at(int line) {
         if (multi) snprintf(path, sizeof path, "build/pass_%llu_%03d.png", (unsigned long long)debug_pass_frame, debug_pass_no++);
         else snprintf(path, sizeof path, "build/pass_%03d.png", debug_pass_no++);
         LOG("[pass] %s: %d targets, %d draws\n", path, pass_dbg_n, pass_dbg_draws);
+        // a frame saves hundreds of images (minutes, the window stalls meanwhile): SAVAGEWIND_DEBUG_PASS_FROM=<n> /
+        // SAVAGEWIND_DEBUG_PASS_TO=<n> save only those passes, SAVAGEWIND_DEBUG_MAIN_ONLY only each pass's first target
+        static int from = -1, to = -1, main_only = -1;
+        if (from < 0) from = getenv("SAVAGEWIND_DEBUG_PASS_FROM") ? atoi(getenv("SAVAGEWIND_DEBUG_PASS_FROM")) : 0;
+        if (to < 0) to = getenv("SAVAGEWIND_DEBUG_PASS_TO") ? atoi(getenv("SAVAGEWIND_DEBUG_PASS_TO")) : 1 << 30;
+        if (main_only < 0) main_only = getenv("SAVAGEWIND_DEBUG_MAIN_ONLY") != NULL;
+        if (debug_pass_no - 1 < from || debug_pass_no - 1 > to) return;
         renderer_save_texture_tex(pass_dbg[0]->backend, path);
-        for (int i = 1; i < pass_dbg_n; i++) {  // the other targets of a multi-target pass: pass_NNN_c<i>.png
+        for (int i = 1; i < pass_dbg_n && !main_only; i++) {  // the other targets of a multi-target pass: pass_NNN_c<i>.png
             if (!pass_dbg[i] || !pass_dbg[i]->backend) continue;
             char p2[300];
             snprintf(p2, sizeof p2, "%.*s_c%d.png", (int)strlen(path) - 4, path, i);
@@ -675,6 +696,8 @@ static uint32_t level_extent(uint32_t v, uint32_t lv) { v >>= lv; return v ? v :
 static void begin_pass(void) {
     if (in_pass && !st.rt_dirty) return;
     vk_end_pass();
+    pass_ds_written = false;
+    pass_color_written = 0;
     if (dl_on == 2) renderer_flush();  // (SAVAGEWIND_VK_DEVLOST_TRACE=2: each pass its own submission)
     st.rt_dirty = false;
     VkCommandBuffer cb = vk_cmd();
@@ -1027,6 +1050,16 @@ static void translate_program(void *arg) {
     maxwell_gmem_base = HEAP_BASE;
     maxwell_gmem_size = HEAP_MAX;
     pthread_mutex_lock(&translate_lock);
+    {   // SAVAGEWIND_DBG_FS=<fs code addr hex>:<pc hex>:<reg>: that register after that instruction, as every output
+        // (pc ffffffff: 1.0, where the shader runs at all), as in renderer.m
+        static unsigned long long dbg_addr;
+        static unsigned dbg_pc;
+        static int dbg_reg, parsed;
+        if (!parsed) { parsed = 1; const char *e = getenv("SAVAGEWIND_DBG_FS"); if (e) sscanf(e, "%llx:%x:%d", &dbg_addr, &dbg_pc, &dbg_reg); }
+        maxwell_dbg_code = dbg_addr ? (const uint8_t *)(uintptr_t)dbg_addr : NULL;
+        maxwell_dbg_pc = dbg_pc;
+        maxwell_dbg_reg = dbg_reg;
+    }
     p->vi = maxwell_translate((const uint8_t *)(uintptr_t)p->code[0], p->cmax[0], STAGE_VERTEX, &p->vkey);
     if (p->vi->msl) {
         p->fkey.vs_out_mask = p->vi->out_mask;
@@ -1354,6 +1387,7 @@ static void build_pipeline(void *arg) {
 // ================================================================== feedback snapshots (renderer.m resolve_feedback)
 static NvnTexture *feedback_tex[4];
 static VkImageView feedback_view[4];
+static bool feedback_any_type[4];  // the view fits every lookup type (a restricted view of the image itself)
 static int nfeedback;
 static uint64_t g_cur_fs_hash;
 static NvnTexture *snap_tex[8];
@@ -1373,7 +1407,15 @@ static NvnTexture *shader_texture_object(int stage, ShaderTexture *st_) {
     uint64_t h = (slot >= 0 && slot < 32) ? st.tex[stage][slot] : 0;
     uint32_t tic = h & 0xFFFFF;
     if (!h || !st.tpool || tic >= (uint32_t)st.tpool->count) return NULL;
-    return nvn_texture_current(((NvnTexEntry *)st.tpool->entries)[tic].tex);
+    return ((NvnTexEntry *)st.tpool->entries)[tic].tex;
+}
+
+static const NvnTexEntry *shader_texture_entry(int stage, ShaderTexture *st_) {
+    int slot = ((int)st_->handle_offset - 0x20) / 8;
+    uint64_t h = (slot >= 0 && slot < 32) ? st.tex[stage][slot] : 0;
+    uint32_t tic = h & 0xFFFFF;
+    if (!h || !st.tpool || tic >= (uint32_t)st.tpool->count) return NULL;
+    return &((NvnTexEntry *)st.tpool->entries)[tic];
 }
 
 static bool is_attachment(NvnTexture *t) {
@@ -1433,6 +1475,27 @@ static void debug_save_depth(TexBackend *b, const char *path) {
     LOG("[vk] saved %s (%ux%u depth %.6f..%.6f)\n", path, b->width, b->height, lo, hi);
 }
 
+// The draw writes color target i (the fragment shader outputs it and its channel mask lets some channel through).
+static bool draw_writes_color(Prog *pr, int i) {
+    return ((pr->fi->out_mask >> (i * 4)) & 0xF) && ((st.channel_mask >> (i * 4)) & 0xF);
+}
+
+// The draw writes neither depth nor stencil: its depth attachment is only read.
+static bool depth_read_only(void) {
+    if (st.ds[0] && st.ds[1]) return false;
+    if (!st.ds[3]) return true;
+    uint32_t ops = st.ds[5] | st.ds[6] << 8 | st.ds[7] << 16;
+    for (int f = 0; f < 2; f++) {
+        uint32_t o = f ? ops >> 12 : ops;
+        if (!(st.stencil_mask[f] & 0xFF)) continue;
+        for (int k = 0; k < 3; k++) {
+            uint32_t v = (o >> (4 * k)) & 0xF;
+            if (v >= 2 && v <= 8) return false;  // (stencil_op: 2..8 write, KEEP otherwise)
+        }
+    }
+    return true;
+}
+
 static void resolve_feedback(Prog *pr) {
     nfeedback = 0;
     static int off = -1;
@@ -1456,12 +1519,81 @@ static void resolve_feedback(Prog *pr) {
             for (int k = 0; k < nsnaps; k++) if (snaps[k].key == t && snaps[k].copy.image) existing = &snaps[k];
             VkImageAspectFlags sa = src->aspect & VK_IMAGE_ASPECT_DEPTH_BIT ? VK_IMAGE_ASPECT_DEPTH_BIT : src->aspect;
             static const VkComponentMapping id = {0};
+            // A depth attachment the draw only reads is sampled as it is: Vulkan allows that read-only feedback in the
+            // GENERAL layout. (BOTW's light composites, fog and particles sample the depth they test against; a copy
+            // each time also ended the pass: ~500 copies a frame in the Shrine of Resurrection.) Depth written earlier
+            // in this pass needs a barrier first: the pass ends, without a copy.
+            static int nolive = -1;
+            if (nolive < 0) nolive = getenv("SAVAGEWIND_NO_LIVE_DEPTH") != NULL;
+            if (!nolive && t == st.rt.depth && depth_read_only()) {
+                if (pass_ds_written) { vk_end_pass(); st.rt_dirty = true; }
+                stat_feedback_live++;
+                feedback_tex[nfeedback] = t;
+                feedback_any_type[nfeedback] = false;
+                feedback_view[nfeedback++] = vk_image_view(src, VK_IMAGE_VIEW_TYPE_2D, src->format, 0, 1, 0, 1, id, sa);
+                continue;
+            }
+            // A color target sampled at other mip levels: BOTW builds mip chains by rendering level n from level n-1
+            // of the same (array) texture, sampling it without a view. The lookup gets a view of the levels below
+            // the one being written: different subresources, no feedback loop, no copy. (The copy cost a pass and a
+            // 1024x1024 copy per level, and for array lookups it gave a black texture.) The level below was written
+            // by an earlier pass, which ended with a barrier.
+            if (!nolive && t != st.rt.depth) {
+                const NvnTexEntry *e = shader_texture_entry(sg, &infos[sg]->tex[i]);
+                int ci = -1;
+                for (int k = 0; k < st.rt.ncolor; k++) if (st.rt.color[k] == t) ci = k;
+                const NvnTextureView *cv = ci >= 0 && st.rt.has_cview[ci] ? &st.rt.cview[ci] : NULL;
+                uint32_t nl = t->levels ? t->levels : 1, tl = cv && (cv->setmask & 1) ? cv->base_level : 0;
+                bool sv = e && e->has_view && (e->view.setmask & 1);
+                uint32_t sb = sv ? e->view.base_level : 0, sn = sv && e->view.num_levels ? e->view.num_levels : nl - sb;
+                // A color target this draw doesn't write (BOTW's light composites keep the G-buffer bound with its
+                // channel masks off and sample it): read as it is, like a read-only depth attachment. Written earlier
+                // in this pass: the pass ends first (a barrier), still no copy.
+                if (ci >= 0 && !draw_writes_color(pr, ci)) {
+                    if (pass_color_written & (1u << ci)) { vk_end_pass(); st.rt_dirty = true; }
+                    stat_feedback_live++;
+                    continue;
+                }
+                if (tl > sb) {  // (tl inside the sampled range: keep the levels under it; past it: all of them)
+                    NvnTextureView v;
+                    memset(&v, 0, sizeof v);
+                    if (e && e->has_view) v = e->view;
+                    v.setmask |= 1;
+                    v.base_level = (uint8_t)sb;
+                    v.num_levels = (uint8_t)(tl < sb + sn ? tl - sb : sn);
+                    VkImageView view = vk_view(t, &v, true, false, infos[sg]->tex[i].type);
+                    if (view) {
+                        stat_feedback_live++;
+                        feedback_tex[nfeedback] = t;
+                        feedback_any_type[nfeedback] = true;
+                        feedback_view[nfeedback++] = view;
+                        continue;
+                    }
+                }
+            }
             if (!nosnap && si >= 0 && (snap_ok[si] || self_write) && existing) {
                 feedback_tex[nfeedback] = t;
                 feedback_view[nfeedback++] = vk_image_view(&existing->copy, VK_IMAGE_VIEW_TYPE_2D, src->format, 0, 1, 0, 1, id, sa);
                 continue;
             }
             stat_feedback_copies++;
+            // SAVAGEWIND_LOG_FEEDBACK=<n>: 200 snapshots after the first n (what is sampled while bound)
+            static long logfb = -1, fbskip;
+            if (logfb < 0) logfb = getenv("SAVAGEWIND_LOG_FEEDBACK") ? (fbskip = atol(getenv("SAVAGEWIND_LOG_FEEDBACK")), 200) : 0;
+            if (logfb > 0 && fbskip > 0) fbskip--;
+            else if (logfb > 0) {
+                logfb--;
+                const NvnTexEntry *e = shader_texture_entry(sg, &infos[sg]->tex[i]);
+                int ci = -1;
+                for (int k = 0; k < st.rt.ncolor; k++) if (st.rt.color[k] == t) ci = k;
+                const NvnTextureView *cv = ci >= 0 && st.rt.has_cview[ci] ? &st.rt.cview[ci] : NULL;
+                LOG("[feedback] %s %ux%u fmt %#x levels %u | target view mask %#x level %u layer %u+%u | sampled view %d mask %#x "
+                    "level %u+%u layer %u+%u\n", t == st.rt.depth ? "depth" : "color", src->width, src->height, t->format,
+                    t->levels, cv ? cv->setmask : 0, cv ? cv->base_level : 0, cv ? cv->min_layer : 0, cv ? cv->num_layers : 0,
+                    e ? e->has_view : -1, e && e->has_view ? e->view.setmask : 0, e && e->has_view ? e->view.base_level : 0,
+                    e && e->has_view ? e->view.num_levels : 0, e && e->has_view ? e->view.min_layer : 0,
+                    e && e->has_view ? e->view.num_layers : 0);
+            }
             vk_end_pass();
             TexBackend *dst = snapshot_image(t, src);
             VkCommandBuffer cb = vk_cmd();
@@ -1480,6 +1612,7 @@ static void resolve_feedback(Prog *pr) {
                 cb = vk_cmd();
             }
             feedback_tex[nfeedback] = t;
+            feedback_any_type[nfeedback] = false;
             feedback_view[nfeedback++] = vk_image_view(dst, VK_IMAGE_VIEW_TYPE_2D, src->format, 0, 1, 0, 1, id, sa);
             if (si < 0) { static int rr; si = rr++ & 7; snap_tex[si] = t; }
             snap_ok[si] = true;
@@ -1642,7 +1775,7 @@ static void texture_info(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo
     wh[0] = wh[1] = 0;
     if (h && st.tpool && tic < (uint32_t)st.tpool->count) {
         NvnTexEntry *e = &((NvnTexEntry *)st.tpool->entries)[tic];
-        NvnTexture *et = nvn_texture_current(e->tex);  // (a finalized texture: what is in its memory now)
+        NvnTexture *et = e->tex;  // (a finalized one too: textures.c gives it the image of its memory and shape)
         if (et) {
             // Per-frame memo: ~2400 lookups per overworld frame recomputed the view (format / range math, cache
             // probe). The first lookup of a frame still runs vk_view (upload check); a view that may have been
@@ -1665,7 +1798,8 @@ static void texture_info(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo
             renderer_texture_scale(et, &sc[0], &sc[1]);
             wh[0] = et->width; wh[1] = et->height;
             for (int k = 0; k < nfeedback; k++)
-                if (et == feedback_tex[k] && (st_->type == TEXTYPE_2D || st_->type == TEXTYPE_2D_ARRAY)) {
+                if (et == feedback_tex[k] && feedback_any_type[k]) view = feedback_view[k];
+                else if (et == feedback_tex[k] && (st_->type == TEXTYPE_2D || st_->type == TEXTYPE_2D_ARRAY)) {
                     view = feedback_view[k];
                     if (st_->type == TEXTYPE_2D_ARRAY) view = vk_dummy_view(TEXTYPE_2D_ARRAY);  // (2D snapshot as array: rare)
                 }
@@ -1806,6 +1940,13 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
     vk_full_barrier(cb);
     gp_mark(cb, "dispatch %ux%ux%u (local %ux%ux%u)", gx, gy, gz, cp->local[0], cp->local[1], cp->local[2]);
     dl_note("dispatch %ux%ux%u cs %llx gmem %d", gx, gy, gz, (unsigned long long)st.program->stages[5].code_addr, cp->si->uses_gmem);
+    if (g_debug_frame) {
+        LOG("[dispatch] %ux%ux%u cs %llx gmem %d cb %#x sbuf:", gx, gy, gz, (unsigned long long)st.program->stages[5].code_addr,
+            cp->si->uses_gmem, cp->si->cbuf_mask);
+        for (int i = 0; i < 16; i++)
+            if (st.sbuf[5][i].addr) LOG(" %d=%llx+%llu", i, (unsigned long long)st.sbuf[5][i].addr, (unsigned long long)st.sbuf[5][i].size);
+        LOG("\n");
+    }
     nfeedback = 0;
     VkDescriptorSet ds = stage_set(&cp->p, cp->p.set_layout[0], 0, 5, cp->si, NULL, NULL, gx, gy, gz, NULL);
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, cp->pipe);
@@ -1864,7 +2005,12 @@ static void draw_(CmdRec *r, bool indexed) {
     for (int i = 0; i < st.nattrib; i++) vkey.attr_kind[i] = (uint8_t)attr_kind(st.attrib[i] & 0xFF);
     for (int i = 0; i < st.rt.ncolor; i++) if (st.rt.color[i]) fkey.rt_kind[i] = (uint8_t)rt_kind(st.rt.color[i]->format);
     Prog *pr = get_program(st.program, &vkey, &fkey);
-    if (!pr || atomic_load(&pr->state) != 1) { stat_skipped++; return; }
+    if (!pr || atomic_load(&pr->state) != 1) {
+        if (st.rt.ncolor && vk_trace_tex(st.rt.color[0]))
+            vk_trace_event(st.rt.color[0], 2, NULL, 0, "draw skipped: program %s", pr ? "not compiled yet" : "missing");
+        stat_skipped++;
+        return;
+    }
     {   // fragment-shader hash: skip lists (SAVAGEWIND_SKIP_FSHASH), debug logs, GPU profile labels
         static uint64_t last_fs, last_hash;
         uint64_t fs = st.program->stages[1].code_addr;
@@ -1886,6 +2032,41 @@ static void draw_(CmdRec *r, bool indexed) {
         g_cur_fs_hash = last_hash;
     }
     if (g_debug_frame) { debug_draw(pr, r, indexed); pass_dbg_draws++; }
+    {   // (SAVAGEWIND_TRACE_TEX) a draw into a traced texture: its fragment shader and the textures it samples
+        bool any = false;
+        for (int i = 0; i < st.rt.ncolor && i < 8 && !any; i++) any = vk_trace_tex(st.rt.color[i]);
+        if (any) {
+            NvnTexture *srcs[16];
+            int ns = 0;
+            char buf[240];
+            int o = 0;
+            for (int sg = 0; sg < 2; sg++) {
+                ShaderInfo *si = sg ? pr->fi : pr->vi;
+                for (int i = 0; i < si->ntex && ns < 16; i++) {
+                    NvnTexture *t = shader_texture_object(sg, &si->tex[i]);
+                    srcs[ns++] = t;
+                    if (t && o < (int)sizeof buf - 12) o += snprintf(buf + o, sizeof buf - o, " #%llu", (unsigned long long)t->debug_id);
+                }
+            }
+            {   // the vertex stage's first uniform buffer (c[3]): its words 0x50..0x70 (BOTW's 2D quads: uv transform)
+                Range u = st.ubuf[0][0];
+                if (u.addr && u.size >= 0x70 && o < (int)sizeof buf - 60) {
+                    const float *f = (const float *)(uintptr_t)(u.addr + 0x50);
+                    o += snprintf(buf + o, sizeof buf - o, " | vs %llx c3@%llx %g %g %g %g / %g %g %g", (unsigned long long)
+                                  st.program->stages[0].code_addr, (unsigned long long)u.addr, f[0], f[1], f[2], f[3], f[4],
+                                  f[5], f[6]);
+                }
+            }
+            buf[o] = 0;
+            for (int i = 0; i < st.rt.ncolor && i < 8; i++)
+                if (st.rt.color[i])
+                    vk_trace_event(st.rt.color[i], g_cur_fs_hash + (uint64_t)i, srcs, ns,
+                                   "draw as target %d (of %d)%s, fs %llx hash %016llx out %#x, mask %#x, samples%s", i,
+                                   st.rt.ncolor, draw_writes_color(pr, i) ? "" : " NOT WRITTEN",
+                                   (unsigned long long)st.program->stages[1].code_addr, (unsigned long long)g_cur_fs_hash,
+                                   pr->fi->out_mask, st.channel_mask, buf);
+        }
+    }
     resolve_feedback(pr);
     snap_reason = "draw-depthwrite";
     if (st.rt.depth && st.ds[0] && st.ds[1]) snapshots_invalidate(st.rt.depth);
@@ -1893,6 +2074,9 @@ static void draw_(CmdRec *r, bool indexed) {
     for (int i = 0; i < st.rt.ncolor; i++)
         if (st.rt.color[i] && ((st.channel_mask >> (i * 4)) & 0xF)) snapshots_invalidate(st.rt.color[i]);
     begin_pass();
+    if (st.rt.depth && !depth_read_only()) pass_ds_written = true;
+    for (int i = 0; i < st.rt.ncolor && i < 8; i++)
+        if (st.rt.color[i] && draw_writes_color(pr, i)) pass_color_written |= (uint8_t)(1u << i);
     VkCommandBuffer cb = vk_cmd();
 
     uint32_t mode = (uint32_t)r->x[0];
@@ -1959,7 +2143,12 @@ static void draw_(CmdRec *r, bool indexed) {
         pipe_tab[pslot].pipe = pp;
         run_job(build_pipeline, pp);
     }
-    if (atomic_load(&pp->state) != 1) { stat_skipped++; return; }
+    if (atomic_load(&pp->state) != 1) {
+        if (st.rt.ncolor && vk_trace_tex(st.rt.color[0]))
+            vk_trace_event(st.rt.color[0], 3, NULL, 0, "draw skipped: pipeline %s", pp->state ? "failed" : "compiling");
+        stat_skipped++;
+        return;
+    }
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pp->pipe);
     uint64_t prof_td_ = prof ? SDL_GetTicksNS() : 0;
     if (prof) prof_key += prof_td_ - prof_tk_;
@@ -2073,10 +2262,10 @@ static void draw_(CmdRec *r, bool indexed) {
         set_viewport(vx, vp[1] * vp_sy + vp_oy, vw, vp[3] * vp_sy, zn, zf);
         if (g_debug_frame) {
             VkRect2D sr = scissor_rect();
-            LOG("[draw]   vp %.2f %.2f %.2f %.2f (stretch %.3f, fs hash %016llx) scissor %d %d %u %u | guest sc %d %d %d %d | pass %ux%u s %.4f %.4f\n",
+            LOG("[draw]   vp %.2f %.2f %.2f %.2f (stretch %.3f, fs hash %016llx) scissor %d %d %u %u | guest sc %d %d %d %d | pass %ux%u s %.4f %.4f | depth range %.7f %.7f\n",
                 vx, vp[1] * vp_sy + vp_oy, vw, vp[3] * vp_sy, k, (unsigned long long)g_cur_fs_hash, sr.offset.x, sr.offset.y,
                 sr.extent.width, sr.extent.height, st.scissor[0][0], st.scissor[0][1], st.scissor[0][2], st.scissor[0][3], pass_w, pass_h,
-                vp_sx, vp_sy);
+                vp_sx, vp_sy, zn, zf);
         }
     }
     apply_scissor();
@@ -2199,12 +2388,20 @@ static void debug_draw(Prog *pr, CmdRec *r, bool indexed) {
         (unsigned long long)st.program->stages[0].code_addr, (unsigned long long)st.program->stages[1].code_addr,
         pr->vi->cbuf_mask, pr->fi->cbuf_mask, st.rt.ncolor);
     for (int i = 0; i < st.rt.ncolor; i++)
-        if (st.rt.color[i]) LOG(" %ux%u/f%#x/fl%#x@%llx", st.rt.color[i]->width, st.rt.color[i]->height, st.rt.color[i]->format,
-                                st.rt.color[i]->flags, (unsigned long long)st.rt.color[i]->addr);
-    if (st.rt.depth) LOG(" d%#x %p", st.rt.depth->format, (void *)st.rt.depth);
-    LOG(" | vp %.0f %.0f %.0f %.0f | attrs %#x blend %#x ds %02x%02x%02x poly %02x%02x chmask %08x\n", st.viewport[0][0], st.viewport[0][1],
+        if (st.rt.color[i]) LOG(" %ux%u/f%#x/fl%#x@%llx[%p]", st.rt.color[i]->width, st.rt.color[i]->height, st.rt.color[i]->format,
+                                st.rt.color[i]->flags, (unsigned long long)st.rt.color[i]->addr,
+                                st.rt.color[i]->backend ? (void *)((TexBackend *)st.rt.color[i]->backend)->image : NULL);
+    if (st.rt.depth) LOG(" d%#x %ux%u@%llx[%p]", st.rt.depth->format, st.rt.depth->width, st.rt.depth->height,
+                         (unsigned long long)st.rt.depth->addr,
+                         st.rt.depth->backend ? (void *)((TexBackend *)st.rt.depth->backend)->image : NULL);
+    LOG(" | vp %.0f %.0f %.0f %.0f | attrs %#x blend %#x ds %02x%02x%02x poly %02x%02x chmask %08x", st.viewport[0][0], st.viewport[0][1],
         st.viewport[0][2], st.viewport[0][3], pr->vi->attr_mask, st.color_state[0], st.ds[0], st.ds[1], st.ds[2], st.poly[0], st.poly[1],
         st.channel_mask);
+    for (int i = 0; i < st.rt.ncolor && i < 8; i++)  // blend func per enabled target: srcC dstC srcA dstA eqC eqA
+        if ((st.color_state[0] >> i) & 1)
+            LOG(" | bf%d %x %x %x %x %x %x", i, st.blend[i][1], st.blend[i][2], st.blend[i][3], st.blend[i][4], st.blend[i][5], st.blend[i][6]);
+    LOG(" | fs out %#x | poly3 %#x offset %g %g %g\n", pr->fi->out_mask, st.poly[3], st.poly_offset[0], st.poly_offset[1],
+        st.poly_offset[2]);
     if (getenv("SAVAGEWIND_DEBUG_DATA")) {  // vertex streams 0-1 and fragment cbufs: the first floats
         for (int s = 0; s < 2; s++) {
             if (!st.vbuf[s].addr) continue;
@@ -2213,11 +2410,25 @@ static void debug_draw(Prog *pr, CmdRec *r, bool indexed) {
             for (int k = 0; k < 16; k++) LOG(" %.4g", v[k]);
             LOG("\n");
         }
-        for (int c = 0; c < 18; c++) {
-            if (!((pr->fi->cbuf_mask >> c) & 1) || !st.ubuf[1][c].addr) continue;
+        if (r->x[2] <= 6 && (pr->vi->cbuf_mask & 2)) {  // vertex compiler constants (c1, after the code)
+            NvnShaderStage *ss = &st.program->stages[0];
+            const float *u = (const float *)(uintptr_t)(ss->code_addr + ss->const_offset);
+            LOG("[draw]   vcb1:");
+            for (int k = 0; k < 16 && k * 4 < (int)(ss->const_size ? ss->const_size : 16); k++) LOG(" %.9g", u[k]);
+            LOG("\n");
+        }
+        for (int c = 0; c < 18 && r->x[2] <= 6; c++) {  // vertex cbufs of full-screen draws (k - 3: binding k)
+            if (!((pr->vi->cbuf_mask >> (c + 3)) & 1) || !st.ubuf[0][c].addr) continue;
+            const float *u = (const float *)(uintptr_t)st.ubuf[0][c].addr;
+            LOG("[draw]   vcb%d %llx size %u:", c + 3, (unsigned long long)st.ubuf[0][c].addr, (unsigned)st.ubuf[0][c].size);
+            for (int k = 0; k < 128 && k * 4 < (int)st.ubuf[0][c].size; k++) LOG(" %.6g", u[k]);
+            LOG("\n");
+        }
+        for (int c = 0; c < 18; c++) {  // (binding k is ubuf k - 3)
+            if (!((pr->fi->cbuf_mask >> (c + 3)) & 1) || !st.ubuf[1][c].addr) continue;
             const float *u = (const float *)(uintptr_t)st.ubuf[1][c].addr;
-            LOG("[draw]   fcb%d %llx size %u:", c, (unsigned long long)st.ubuf[1][c].addr, (unsigned)st.ubuf[1][c].size);
-            for (int k = 0; k < 96 && k * 4 < (int)st.ubuf[1][c].size; k++) LOG(" %.6g", u[k]);
+            LOG("[draw]   fcb%d %llx size %u:", c + 3, (unsigned long long)st.ubuf[1][c].addr, (unsigned)st.ubuf[1][c].size);
+            for (int k = 0; k < 128 && k * 4 < (int)st.ubuf[1][c].size; k++) LOG(" %.6g", u[k]);
             LOG("\n");
         }
     }
@@ -2225,9 +2436,10 @@ static void debug_draw(Prog *pr, CmdRec *r, bool indexed) {
         NvnTexture *t = shader_texture_object(1, &pr->fi->tex[i]);
         const TexBackend *b = t ? (const TexBackend *)t->backend : NULL;
         if (!t) { LOG("[draw]   tex%d: none\n", i); continue; }
-        LOG("[draw]   tex%d: %p %ux%u f%#x lv %u -> %ux%u scale %.4f %.4f%s%s addr %llx\n", i, (void *)t, t->width, t->height,
+        LOG("[draw]   tex%d: %p %ux%u f%#x lv %u -> %ux%u scale %.4f %.4f%s%s addr %llx [%p]\n", i, (void *)t, t->width, t->height,
             t->format, b ? b->levels : 0, b ? b->width : 0, b ? b->height : 0, b ? b->sx : 0, b ? b->sy : 0,
-            b && b->scalable ? " scalable" : "", t->finalized ? " FINALIZED" : "", (unsigned long long)t->addr);
+            b && b->scalable ? " scalable" : "", t->finalized ? " FINALIZED" : "", (unsigned long long)t->addr,
+            b ? (void *)b->image : NULL);
     }
 }
 
@@ -2249,7 +2461,7 @@ static void copy_region_dims(NvnTexture *t, const TexRefRec *ref, const FormatIn
 
 static void copy_buffer_to_texture(uint64_t src, const TexRefRec *dst) {
     snap_reason = "buf2tex"; snapshots_invalidate(NULL);
-    NvnTexture *t = nvn_texture_live(dst->tex);
+    NvnTexture *t = (NvnTexture *)(uintptr_t)dst->tex;
     if (!t || !src) return;
     vk_end_pass();
     const FormatInfo *fi;
@@ -2260,6 +2472,7 @@ static void copy_buffer_to_texture(uint64_t src, const TexRefRec *dst) {
     if (!fi || !fi->bpb) return;
     TexBackend *b = vk_tex(t, false);  // prior CPU contents uploaded first
     renderer_mark_gpu_owned(t);
+    vk_trace_event(t, 0, NULL, 0, "copy from buffer %llx", (unsigned long long)src);
     if (b->aspect == (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) return;
     if (b->astc_bw) {  // (blocks would need the CPU decode: not seen in the game yet)
         static int nlog;
@@ -2289,8 +2502,20 @@ static void copy_buffer_to_texture(uint64_t src, const TexRefRec *dst) {
     vkCmdCopyBufferToImage(cb, s.buf, b->image, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
 }
 
+// (debugging) the last texture-to-buffer copies: backend_debug_copies_at logs those that wrote a guest address
+static struct { uint64_t dst, size, frame; NvnTexture *t; int32_t rg[6]; } t2b_log[16];
+static unsigned t2b_next;
+void backend_debug_copies_at(uint64_t a) {
+    for (int i = 0; i < 16; i++)
+        if (t2b_log[i].t && a >= t2b_log[i].dst && a < t2b_log[i].dst + t2b_log[i].size)
+            LOG("[debug]   CopyTextureToBuffer frame %llu from #%llu %ux%u format %#x region %d,%d %dx%d -> %llx+%llx\n",
+                (unsigned long long)t2b_log[i].frame, (unsigned long long)t2b_log[i].t->debug_id, t2b_log[i].t->width,
+                t2b_log[i].t->height, t2b_log[i].t->format, t2b_log[i].rg[0], t2b_log[i].rg[1], t2b_log[i].rg[3],
+                t2b_log[i].rg[4], (unsigned long long)t2b_log[i].dst, (unsigned long long)t2b_log[i].size);
+}
+
 static void copy_texture_to_buffer(const TexRefRec *src, uint64_t dst) {
-    NvnTexture *t = nvn_texture_live(src->tex);
+    NvnTexture *t = (NvnTexture *)(uintptr_t)src->tex;
     if (!t || !dst || dst < HEAP_BASE) return;
     vk_end_pass();
     const FormatInfo *fi;
@@ -2332,13 +2557,22 @@ static void copy_texture_to_buffer(const TexRefRec *src, uint64_t dst) {
     vkCmdCopyImageToBuffer(cb, srcimg, VK_IMAGE_LAYOUT_GENERAL, out.buf, 1, &c);
     renderer_flush();  // the CPU may read the result right after the fence
     kernel_watch_write("CopyTextureToBuffer", dst, total);
+    vk_trace_dump(t);
+    {
+        unsigned k = t2b_next++ & 15;
+        t2b_log[k].dst = dst;
+        t2b_log[k].size = total;
+        t2b_log[k].frame = renderer_present_count();
+        t2b_log[k].t = t;
+        memcpy(t2b_log[k].rg, rg, sizeof rg);
+    }
     memcpy((void *)(uintptr_t)dst, out.ptr, total);
     if (small_mem) vmaDestroyImage(g_vk.vma, srcimg, small_mem);
 }
 
 static void copy_texture(const TexRefRec *src, const TexRefRec *dst, uint64_t flags) {
     snap_reason = "tex2tex"; snapshots_invalidate(NULL);
-    NvnTexture *st_ = nvn_texture_live(src->tex), *dt = nvn_texture_live(dst->tex);
+    NvnTexture *st_ = (NvnTexture *)(uintptr_t)src->tex, *dt = (NvnTexture *)(uintptr_t)dst->tex;
     if (!st_ || !dt) return;
     vk_end_pass();
     if (dl_on == 2) renderer_flush();  // (SAVAGEWIND_VK_DEVLOST_TRACE=2: each copy its own submission, waited on)
@@ -2346,6 +2580,13 @@ static void copy_texture(const TexRefRec *src, const TexRefRec *dst, uint64_t fl
     dl_note("copy texture %ux%u f%#x -> %ux%u f%#x (%p -> %p)", st_->width, st_->height, st_->format, dt->width, dt->height,
             dt->format, (void *)st_, (void *)dt);
     TexBackend *s = vk_tex(st_, false), *d = vk_tex(dt, true);
+    {
+        NvnTexture *src1 = st_;
+        vk_trace_event(dt, 0, &src1, 1, "copy from #%llu %ux%u f%#x region %d,%d %dx%d -> region %d,%d %dx%d flags %llx",
+                (unsigned long long)st_->debug_id, st_->width, st_->height, st_->format, src->region[0], src->region[1],
+                src->region[3], src->region[4], dst->region[0], dst->region[1], dst->region[3], dst->region[4],
+                (unsigned long long)flags);
+    }
     renderer_mark_gpu_owned(dt);
     if (renderer_texture_presented(dt) && st_->width == dt->width && st_->height == dt->height) renderer_texture_mark_presented(st_);
     renderer_texture_first_write(dt);
@@ -2739,11 +2980,16 @@ static void exec_list(uint64_t handle, int depth) {
         CmdRec *r = (CmdRec *)(uintptr_t)p;
         void *x = r->extra;
         if (r->op < CMD_COUNT) op_counts[r->op]++;
+        if (g_debug_frame && getenv("SAVAGEWIND_LOG_OPS"))
+            LOG("[op] %u depth %d: %llx %llx %llx %llx %llx\n", r->op, depth, (unsigned long long)r->x[0], (unsigned long long)r->x[1],
+                (unsigned long long)r->x[2], (unsigned long long)r->x[3], (unsigned long long)r->x[4]);
         switch (r->op) {
         case CMD_END: return;
         case CMD_JUMP: p = r->x[0]; continue;
         case CMD_CALL: {
             const uint64_t *h = x;
+            if (g_debug_frame && getenv("SAVAGEWIND_LOG_OPS"))
+                for (uint64_t i = 0; i < r->x[0] && i < 8; i++) LOG("[call] depth %d -> %llx\n", depth, (unsigned long long)h[i]);
             for (uint64_t i = 0; i < r->x[0] && depth < 8; i++) exec_list(h[i], depth + 1);
             break;
         }
@@ -2768,6 +3014,15 @@ static void exec_list(uint64_t handle, int depth) {
         case CMD_BIND_UNIFORM_BUFFERS:
             for (uint64_t i = 0; i < r->x[2] && r->x[1] + i < 18 && r->x[0] < 6; i++)
                 memcpy(&st.ubuf[r->x[0]][r->x[1] + i], (uint8_t *)x + i * 16, 16);
+            if (g_debug_frame && getenv("SAVAGEWIND_LOG_BINDS")) {
+                LOG("[bind] ubuf stage %llu slots %llu+%llu:", (unsigned long long)r->x[0], (unsigned long long)r->x[1],
+                    (unsigned long long)r->x[2]);
+                for (uint64_t i = 0; i < r->x[2] && i < 18; i++) {
+                    const uint64_t *rg = (const uint64_t *)((uint8_t *)x + i * 16);
+                    LOG(" %llx+%llu", (unsigned long long)rg[0], (unsigned long long)rg[1]);
+                }
+                LOG("\n");
+            }
             break;
         case CMD_BIND_STORAGE_BUFFERS:
             for (uint64_t i = 0; i < r->x[2] && r->x[1] + i < 16 && r->x[0] < 6; i++)
@@ -2776,6 +3031,24 @@ static void exec_list(uint64_t handle, int depth) {
         case CMD_BIND_TEXTURES:
             for (uint64_t i = 0; i < r->x[2] && r->x[1] + i < 32 && r->x[0] < 6; i++)
                 memcpy(&st.tex[r->x[0]][r->x[1] + i], (uint8_t *)x + i * 8, 8);
+            if (g_debug_frame && getenv("SAVAGEWIND_LOG_BINDS")) {
+                LOG("[bind] stage %llu slots %llu+%llu:", (unsigned long long)r->x[0], (unsigned long long)r->x[1],
+                    (unsigned long long)r->x[2]);
+                for (uint64_t i = 0; i < r->x[2] && i < 32; i++) {
+                    uint64_t h;
+                    memcpy(&h, (uint8_t *)x + i * 8, 8);
+                    uint32_t tic = h & 0xFFFFF;
+                    NvnTexture *t = h && st.tpool && tic < (uint32_t)st.tpool->count ? ((NvnTexEntry *)st.tpool->entries)[tic].tex : NULL;
+                    if (t) LOG(" %ux%u/t%u/f%#x", t->width, t->height, t->target, t->format);
+                    else LOG(" %llx", (unsigned long long)h);
+                }
+                LOG("\n");
+            }
+            break;
+        case CMD_BIND_TEXTURES_DEFERRED:  // (stage, first, count, handles): the handles as they are now
+            if (r->x[3] >= GUEST_LO && r->x[3] + r->x[2] * 8 <= GUEST_HI)
+                for (uint64_t i = 0; i < r->x[2] && r->x[1] + i < 32 && r->x[0] < 6; i++)
+                    memcpy(&st.tex[r->x[0]][r->x[1] + i], (const uint8_t *)(uintptr_t)r->x[3] + i * 8, 8);
             break;
         case CMD_BIND_IMAGES:
             for (uint64_t i = 0; i < r->x[2] && r->x[1] + i < 8 && r->x[0] < 6; i++)
@@ -2790,11 +3063,11 @@ static void exec_list(uint64_t handle, int depth) {
             memset(&st.rt, 0, sizeof st.rt);
             st.rt.ncolor = (int)r->x[0] > 8 ? 8 : (int)r->x[0];
             for (int i = 0; i < st.rt.ncolor; i++) {
-                st.rt.color[i] = nvn_texture_live(rt->tex[i]);
+                st.rt.color[i] = (NvnTexture *)(uintptr_t)rt->tex[i];
                 st.rt.cview[i] = rt->views[i];
                 st.rt.has_cview[i] = rt->has_view[i];
             }
-            st.rt.depth = nvn_texture_live(rt->depth);
+            st.rt.depth = (NvnTexture *)(uintptr_t)rt->depth;
             st.rt.dview = rt->dview;
             st.rt.has_dview = rt->has_dview;
             static int always = -1;
@@ -2837,7 +3110,7 @@ static void exec_list(uint64_t handle, int depth) {
         case CMD_CLEAR_TEXTURE: {
             // ClearTexture(cmd, texture, view, region, color, mask): a render-target clear of the texture alone (renderer.m)
             const struct { uint64_t tex; NvnTextureView view; uint8_t has_view; int32_t region[6]; float color[4]; } *ct = x;
-            NvnTexture *t = nvn_texture_live(ct->tex);
+            NvnTexture *t = (NvnTexture *)(uintptr_t)ct->tex;
             if (!t) break;
             snap_reason = "clear-texture"; snapshots_invalidate(NULL);
             RtState saved = st.rt;
@@ -2870,6 +3143,9 @@ static void exec_list(uint64_t handle, int depth) {
         case CMD_DRAW_ARRAYS: draw(r, false); break;
         case CMD_DRAW_ELEMENTS: draw(r, true); break;
         case CMD_UPDATE_UNIFORM_BUFFER:
+            if (g_debug_frame && getenv("SAVAGEWIND_LOG_BINDS"))
+                LOG("[bind] update ubuf %llx (size %llu) +%llu: %llu bytes\n", (unsigned long long)r->x[0], (unsigned long long)r->x[1],
+                    (unsigned long long)r->x[2], (unsigned long long)r->x[3]);
             kernel_watch_write("UpdateUniformBuffer", r->x[0] + r->x[2], r->x[3]);
             memcpy((void *)(uintptr_t)(r->x[0] + r->x[2]), x, r->x[3]);
             guest_copy_flush();  // (cbuf copies shared within the submission are stale now)
@@ -2916,6 +3192,7 @@ static void exec_list(uint64_t handle, int depth) {
 
 void backend_execute(uint64_t handle) {
     gpu_lock();
+    if (g_debug_frame && getenv("SAVAGEWIND_LOG_OPS")) LOG("[submit] %llx\n", (unsigned long long)handle);
     PROF_T0();
     exec_list(handle, 0);
     PROF_ADD(prof_exec);

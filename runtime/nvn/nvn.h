@@ -30,12 +30,12 @@ typedef struct NvnTexture {
     NvnPool *pool;
     uint64_t pool_offset;
     void *backend;  // renderer-side texture
+    int backend_slot;  // (Vulkan backend) slot in textures.c's list of textures holding an image, + 1
     uint64_t debug_id;
     bool finalized;  // nvnTextureFinalize ran (the object stays: pool entries and copies may still name it)
     char label[64];
 } NvnTexture;
-NvnTexture *nvn_texture_live(uint64_t guest);  // (objects.c) the live host texture of a guest NVNtexture, or NULL
-NvnTexture *nvn_texture_current(NvnTexture *t);  // a finalized one: the texture made in its memory since (same shape)
+NvnTexture *nvn_texture_host(uint64_t guest);  // (objects.c) the host texture a guest NVNtexture holds now, or NULL
 
 typedef struct {
     uint32_t min_filter, mag_filter, wrap[3], compare_mode, compare_func, reduction;
@@ -129,7 +129,7 @@ enum {
     CMD_COPY_BUFFER_TO_BUFFER, CMD_COPY_BUFFER_TO_TEXTURE, CMD_COPY_TEXTURE_TO_BUFFER,
     CMD_COPY_TEXTURE_TO_TEXTURE, CMD_DOWNSAMPLE, CMD_UPDATE_UNIFORM_BUFFER, CMD_FENCE_SYNC, CMD_WAIT_SYNC,
     CMD_BARRIER, CMD_SIGNAL_EVENT, CMD_WAIT_EVENT, CMD_REPORT_COUNTER, CMD_DISCARD_COLOR,
-    CMD_DISCARD_DEPTH_STENCIL, CMD_SET_COPY_STRIDES, CMD_DRAW_TEXTURE, CMD_RESOLVE_DEPTH,
+    CMD_DISCARD_DEPTH_STENCIL, CMD_SET_COPY_STRIDES, CMD_DRAW_TEXTURE, CMD_RESOLVE_DEPTH, CMD_BIND_TEXTURES_DEFERRED,
     CMD_COUNT
 };
 
@@ -141,3 +141,5 @@ void backend_execute(uint64_t handle);            // run a recorded command list
 void backend_present(NvnTexture *tex);            // show a texture in the window
 void backend_texture_destroyed(NvnTexture *tex);
 void backend_pool_written(uint64_t addr, uint64_t size);
+void backend_debug_copies_at(uint64_t addr);  // (debugging) log the recent texture-to-buffer copies that wrote addr
+void nvn_debug_textures_at(uint64_t addr);    // (objects.c, debugging) log the textures whose storage holds addr

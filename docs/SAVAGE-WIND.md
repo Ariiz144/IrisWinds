@@ -18,7 +18,7 @@ Notas de desarrollo. El README explica qué hace falta y las reglas de copyright
 
 ## Publicación
 
-GitHub: `Revivedx/SavageWindRecomp` (remote `origin`, privado al crearlo el 2026-10-16). No se sube el historial
+GitHub: `Revivedx/SavageWindRecomp` (remote `origin`, público desde el 2026-10-16). No se sube el historial
 local: la importación de LASRecomp trae capturas de *Link's Awakening* y su randomizer. El `main` remoto es la
 rama local `public`, un commit por publicación con el árbol de `main` y el email noreply de GitHub:
 
@@ -209,17 +209,85 @@ Pendiente:
        video en 2 minutos).
      - Escala de render targets (la "resolución interna" de LA): apagada salvo `SAVAGEWIND_SCALE_TARGETS=1`; con
        ella el pipeline diferido de BOTW mostraba solo lo emisivo.
-   - Ahora: el menú principal se ve bien (ilustraciones, texto, "Ver. 1.8.2"). Con `Continue`
-     (`SAVAGEWIND_INPUT="900:A:8,1400:A:8,1900:A:8"`) entra al Santuario de la Resurrección: HUD y textos bien,
-     la escena 3D casi negra con partes rosas y verdes (unos 50.000 draws cada 2 s, 7-12 fps). Lo conocido:
-     - La iluminación diferida no sale: el G-buffer (6-8 targets de 1600x900) tiene geometría y texturas
-       correctas, lo que viene después no.
-     - Texturas de forma distinta en la misma memoria (la cadena de exposición 12x12 → 6x6 → 3x3 muestrea
-       texturas que nunca se dibujaron en el backend): falta propagar entre imágenes que comparten memoria.
-     - Faltan `nvnCommandBufferBind*Deferred`.
-     - Algunas voces de audio llegan con formato 0 y un buffer sin sentido.
+   - Resuelto (2026-10-16, tercera tanda): la iluminación diferida del santuario. En orden de impacto:
+     - Listas pregrabadas que se perdían. El juego da a la lista de material de cada composición de luz una
+       ventana de 0x200 bytes de memoria de comandos, graba los ~0x18 bytes que midió antes y empaqueta la
+       siguiente justo detrás. El HLE daba por muerta toda lista que se solapara con la ventana nueva aunque nada
+       se escribiera encima, y el frame la seguía llamando: ejecutaba otros records. Así se perdía el uniform
+       buffer con el ID de material (`c4` del VS, 432 bytes, el ID en +0x1a8), que las composiciones comparan
+       con test EQUAL contra la D16 que escribe el G-buffer: no se componía ninguna luz. Ahora una lista muere
+       cuando la grabación escribe de verdad sobre su memoria (`cmdbuf.c`, `shadow_claim`).
+     - `nvnCommandBufferBindTexturesDeferred` (el stub no ataba nada): el juego ata así las texturas de la
+       composición (normales, albedo, profundidad lineal, probe, buffers de luz). Lee los handles al ejecutar.
+     - Las texturas de los comandos se resuelven al grabar (`nvn_texture_host`), como en el hardware. La cadena
+       de exposición (192x192 → … → 3x3) reinicializa el mismo `NVNtexture` en cada paso dentro de un command
+       buffer: resueltas al ejecutar, todos los pasos dibujaban en el último.
+     - Una imagen Vulkan por memoria y forma (`textures.c`): los objetos `NVNtexture` sobre la misma memoria con
+       la misma forma comparten imagen (entradas del pool con objetos finalizados, copias de objetos, targets
+       recreados). Reemplaza el estacionamiento de imágenes y `nvn_texture_current`.
+     - Cubemaps muestreados como cube array (probes de 64x64 R11G11B10): salían negros.
+   - Resuelto (2026-10-16, audio):
+     - El juego mezcla con el AudioRenderer de su propio `sdk` (servidor y DSP recompilados) en vez del HLE de
+       `audren:u`, que con el SDK de 1.8.2 recibía voces con formato 0 y buffers sin sentido y quedaba mudo
+       (sección "Audio").
+     - Kernel: un `svcWaitProcessWideKeyAtomic` que vencía volvía con el mutex tomado, y el SDK lo vuelve a tomar
+       él mismo (`InternalConditionVariableImplByHorizon::TimedWait`, `sdk` 0x71001492bc, como en la consola): el
+       hilo esperaba su propio mutex y colgaba a los demás (el hilo de audio del juego, a los 30 s). Ahora vuelve
+       sin el mutex. Tampoco cuenta como vencido un timeout que llega cuando otro hilo ya lo despertó o le dio el
+       mutex.
+     - Kernel: `svcArbitrateUnlock` y `svcSignalProcessWideKey` ceden el núcleo después de soltar, no antes: el
+       hilo que cedía primero dejaba esperando a los demás hasta recuperar su núcleo.
+   - Ahora: el menú principal se ve bien. Con `Continue` (`SAVAGEWIND_INPUT="900:A:8,1400:A:8,1900:A:8"`) el
+     Santuario de la Resurrección se ve iluminado: Link, el pedestal, la puerta, los pilares y el título del
+     lugar. Lo conocido:
+     - Niebla azul muy fuerte; en algunas corridas, un rectángulo arriba a la izquierda (~1/4,5 de la
+       pantalla) con otro tono y una franja de bruma blanca. Vienen de los efectos a media resolución que se
+       componen sobre el HDR (pases de niebla/volumen después de la luz).
+     - 6-8 fps en el santuario (~3.400 draws por frame). Con `SAVAGEWIND_VK_PROF=1` el frame es ~20 ms de
+       backend, ~25 de presentación y ~75 del lado del juego; no cambia con el arreglo de listas.
+     - En algunos frames, una textura 3D de 32x32x32 (BC4) se muestrea como 2D y devuelve negro
+       (`[tex] type mismatch`).
+     - El resto de los `nvnCommandBufferBind*Deferred` (imágenes, uniform y storage buffers, texturas y
+       samplers separados) sigue sin implementar: el juego los busca pero no los llamó en estas corridas.
+       `renderer.m` (Metal) no ejecuta `CMD_BIND_TEXTURES_DEFERRED`.
+     - Sonido: suenan el jingle de `Continue` (`Sys_GameStart.bfstm`) y el ambiente del Santuario. En el título y
+       el menú el juego no pide ninguna voz (ni un `AcquireVoiceSlot` en 50 s, y no lee nada de
+       `Sound/Resource`), así que ahí no suena nada.
+   - Teclado y ratón (2026-10-16): defaults pensados para BOTW (tabla en el README), cualquier tecla o botón del
+     ratón remapeable (`BIND_MOUSE` + botón en `g_bind_key`), acción "Walk (hold)" (C: el stick izquierdo a 40%) y
+     el ratón como cámara: con la ventana enfocada, sin menú y sin script, el cursor queda retenido (modo relativo de
+     SDL) y su velocidad se vuelve el stick derecho (≈1200 px/s a fondo con sensibilidad 1, más un 12% para pasar la
+     zona muerta del juego; `SAVAGEWIND_MOUSE_SCALE`, `SAVAGEWIND_MOUSE_DEADZONE`). Esc y F1 siguen abriendo el
+     menú, que suelta el cursor. Ajustes: `mouse_camera`, `mouse_sensitivity`, `mouse_invert_y`.
+   - Ritmo de frames (2026-10-16): `nvnQueuePresentTexture` espera el turno de cada frame según el intervalo de la
+     ventana (vsyncs por frame) y nunca presenta más rápido que el tope (`SAVAGEWIND_FPS_CAP`, 60 por defecto; 0 sin
+     tope). BOTW pide intervalo 2 (30 FPS, como en la consola; 3 en algunas cargas): el menú, que iba a 130 FPS con
+     sus animaciones aceleradas, va a 30. Subir de 30 necesita parchear el paso de tiempo del juego.
+   - Overlay de rendimiento (F10: off, FPS, full; ajuste `perf_overlay`): FPS y ms del juego con gráfico, CPU (total
+     y del juego), RAM, GPU (uso, temperatura, potencia, reloj, VRAM) por NVML, que trae el driver de NVIDIA
+     (cargado en tiempo de ejecución), y en Linux amdgpu por sysfs. Temperatura de CPU: hwmon en Linux; en Windows
+     solo la zona térmica ACPI (este equipo no la tiene): la del encapsulado necesita un driver de kernel, que Savage
+     Wind no instala. `runtime/perfmon.c`.
+   - setjmp / longjmp (2026-10-16): libjpeg y libpng de `nn::image` salen de sus errores con `longjmp`, que vuelve
+     a la mitad de la función que llamó a `setjmp`; el código recompilado no puede retomar ahí ("no function at
+     70023f1b14", al codificar la miniatura del guardado). `tools/gen.py` envuelve cada `bl` a `setjmp` (el
+     símbolo o su stub PLT) en un `setjmp` del host dentro de la función C que llama (`setjmp_call`), con un
+     `jmp_buf` del host por cada `jmp_buf` del juego y por hilo (`rt_setjmp_slot`). El `setjmp` de musl sigue
+     corriendo y llena el del juego; `longjmp` es HLE (`hle_longjmp`, `runtime/hle/setjmp.c`): restaura x19-x30,
+     sp y d8-d15 de ese `jmp_buf` y salta al del host. Solo el `sdk` los usa (10 llamadas).
+   - Compilación de shaders síncrona por defecto (2026-10-16): un draw cuyo programa o pipeline todavía compilaba
+     en otro hilo se descartaba. Lo que el juego dibuja una sola vez se perdía: la miniatura del guardado (dos
+     blits, 1920x1080 a 854x480 a 256x144, leídos enseguida con `CopyTextureToBuffer`) salía con lo que hubiera en
+     esa memoria de la GPU. Ahora el draw espera la compilación (un tirón la primera vez que aparece un efecto; el
+     caché de SPIR-V y de pipelines lo evita en las siguientes sesiones). Ajuste "Asynchronous shaders"
+     (`async_shaders`) para volver a no esperar; `SAVAGEWIND_SYNC_SHADERS` / `SAVAGEWIND_ASYNC_SHADERS` mandan
+     sobre el ajuste.
    - Herramientas de diagnóstico:
-     - `SAVAGEWIND_THREAD_DUMP_AT=<s>,<s>`: estado y cadena de llamadas de cada hilo.
+     - `SAVAGEWIND_THREAD_DUMP_AT=<s>,<s>`: estado, núcleo y cadena de llamadas de cada hilo; para los que
+       esperan un mutex, también su palabra (el handle del dueño).
+     - Audio: `SAVAGEWIND_AUDIO_LOG=1` (cada 10 s: tiempo de render, espera del mutex del renderer, cortes del
+       dispositivo, pico), `SAVAGEWIND_AUDIO_WAV=<archivo>` (graba la salida), `SAVAGEWIND_AUDIO_DFC=0` (vuelve
+       al HLE de `audren:u`).
      - `SAVAGEWIND_WATCH=<dir>:<largo>` (con `_DEREF`, `_TRAP`, `_STEP`, `_FOLLOW`, `_WRITES`): trampa de
        escritura por página con paso a paso (Windows), y quién escribió (`módulo+offset`).
      - `SAVAGEWIND_FNPROF=0:999999` con `SAVAGEWIND_FNPROF_ARGS=<dir>,...`: x0-x5 y el llamador en cada
@@ -230,6 +298,26 @@ Pendiente:
        (cada pase en `build/pass_NNN.png`, `_c<i>` para los demás targets; un frame del juego guarda cientos de
        imágenes y tarda minutos). `SAVAGEWIND_HIDDEN=1` corre sin ventana visible.
      - `SAVAGEWIND_SHADER_DUMP=1`: el código Maxwell de los shaders que no traducen, en `build/shaders/`.
+     - `SAVAGEWIND_DEBUG_PASS_FROM=<n>`, `SAVAGEWIND_DEBUG_PASS_TO=<n>` y `SAVAGEWIND_DEBUG_MAIN_ONLY=1` (con el
+       frame de depuración, F9): guarda solo esos pases y solo el primer target de cada uno. Con
+       `SAVAGEWIND_DEBUG_FRAMES=<n>`, n frames seguidos (`build/pass_<frame>_NNN.png`).
+     - F12: guarda una imagen del juego de cada dos en `build/frames/rec_N.png` hasta el siguiente F12, para ver
+       parpadeos de un frame (el juego va más lento mientras graba).
+     - `SAVAGEWIND_TRACE_TEX=<an>x<al>[,...]` o `all`: cada textura (por su memoria) guarda sus últimas escrituras
+       (draws con el shader, el uniform buffer del VS y las texturas que muestrean; copias; subidas desde la memoria
+       del juego). Al copiarse una a un buffer (la CPU la lee: una captura) se loguea su historia y la de sus
+       fuentes, y se guardan como `build/trace_<n>_<id>.png`. `all` baja el juego a ~20 FPS.
+     - `SAVAGEWIND_LOG_JPEG=1` (o `dump`, que guarda la primera imagen en `build/jpeg_in.raw`): cada
+       `JpegEncoder::Encode` con su tamaño, calidad, espacio y resultado, y de dónde vienen los píxeles. BOTW baja
+       la calidad de 5 en 5 hasta que la miniatura entra en 10 KB. `SAVAGEWIND_LOG_LONGJMP=1`: cada `longjmp`.
+     - En el frame de depuración: `[draw]` muestra la `VkImage` de cada target y textura, los factores de blend,
+       el depth range y el polygon offset; `SAVAGEWIND_DEBUG_DATA=1` vuelca también los cbufs del VS (y sus
+       constantes `c1`) de los draws de pantalla completa; `SAVAGEWIND_LOG_BINDS=1`, los binds de texturas y
+       uniform buffers y las actualizaciones inline; `SAVAGEWIND_LOG_OPS=1`, cada record ejecutado, los `CALL`
+       y los envíos.
+     - `SAVAGEWIND_DBG_FS=<fs hex>:<pc hex>:<reg>`: ese registro tras esa instrucción como salida del fragment
+       shader (`pc` ffffffff: 1.0 donde el shader corre), ahora también en Vulkan. `SAVAGEWIND_SAVE_MSL=1`
+       guarda el GLSL de cada shader en `build/glsl/`.
      - En Git Bash, `VAR=1 timeout 60 ./build/savagewind.exe` no le pasa la variable al programa: usar
        `timeout 60 env VAR=1 ./build/savagewind.exe`.
      - `tools/ghidra/gq.py data <dirección> [n]` (palabras de 64 bits y a qué apuntan). Con gdb de MSYS2
@@ -264,8 +352,8 @@ Ambos límites están en `runtime/rt.h` y en `tools/layout.py`.
   en `main` agregan 2.
 - `tools/nso.py` y `runtime/loader.c` cuentan los símbolos también con `DT_GNU_HASH`: el `sdk` y el
   `subsdk0` de 1.8.2 no traen `DT_HASH`, y sin esto se veían con 0 símbolos: los imports de `main` no
-  se resolvían y `gen.py --hle` no podía encontrar funciones del `sdk` (aunque hoy no reemplaza nada:
-  `runtime/hle/hle_symbols.txt` está vacío desde LASRecomp).
+  se resolvían y `gen.py --hle` no podía encontrar funciones del `sdk` (hoy reemplaza `longjmp`, ver
+  "setjmp / longjmp").
 - `tools/test_layout.py` lo prueba con NSOs sintéticos sin código del juego (un `main` de 77 MB, dos
   `subsdk`, un `sdk` de tamaño impar, `subsdk0` y `sdk` solo con `DT_GNU_HASH` y `DT_RELR`):
   `tools/venv/Scripts/python tools/test_layout.py`.
@@ -273,6 +361,38 @@ Ambos límites están en `runtime/rt.h` y en `tools/layout.py`.
 Con el exefs de 1.8.2: `main` en 0x70_0000_0000 (29.2 MiB), `subsdk0` (multimedia) en 0x70_01d3_7000
 (6.4 MiB), `sdk` en 0x70_023a_3000 (12.3 MiB). El loader carga los tres ahí, con 488, 10110 y 23039
 símbolos; ningún import queda sin resolver salvo los `glslc*` débiles de `main`.
+
+## Audio
+
+El `sdk` de BOTW trae el AudioRenderer entero: el servidor (`nn::audio::server`: voces, mezclas, efectos,
+generación de comandos) y el procesador de comandos del DSP (`nn::audio::dsp::CommandListProcessor`), código de
+CPU que se recompila con el resto. Savage Wind lo usa en vez de reimplementarlo (`runtime/services/audio.c`):
+
+- El cliente llega al servidor dentro del proceso (`CreateAudioRendererManagerByDfc`, `sdk` 0x7100224d00) cuando
+  los parámetros piden el dispositivo de render CPU: `nn::audio::OpenAudioRenderer` (`sdk` 0x7100220a70) toma ese
+  camino si `AudioRendererParameter` +0x2c es 1, y con +0x30 (modo de ejecución) en 1 lo abre en ejecución manual,
+  sobre el work buffer del juego, sin transfer memory. Si no, abre `audren:u`.
+- El HLE de `InitializeAudioRendererParameter` pide CPU + manual, así que el juego calcula su work buffer y abre el
+  renderer con esos valores. El de `OpenAudioRenderer` guarda el handle y arranca dos hilos `nn::os` (el código
+  del `sdk` busca su `ThreadType` en TLS +0x1f8): uno renderiza un frame de 5 ms
+  (`AudioRenderSystem::ExecuteAudioRendererRendering`, en el objeto del renderer +0x70) cada vez que el stream de
+  SDL baja de su objetivo, con el mutex del renderer (+0x2d0, el que toma `Update`) tomado; el otro señala el
+  evento del juego, para que el render no espere el mutex del evento.
+- Esos dos hilos hacen el trabajo del ADSP y corren fuera de los tokens de núcleo (`kernel_thread_off_cores`):
+  el juego también usa el núcleo 3, porque el kernel informa la máscara 0xF.
+- La mezcla final es un comando DeviceSink (id 0x14), que el procesador del `sdk` salta (en la consola lo toca el
+  ADSP): un hook después de `CommandListProcessor::Process` lee sus buffers (int32 en la escala de int16, 6
+  canales FL FR FC LFE BL BR), los baja a estéreo y los manda al stream SDL.
+- Medido en el Santuario (Ryzen 5 5600X): unos 190 µs por frame (máximo 0,7 ms), espera del mutex casi siempre
+  por debajo de 2 ms, 4 cortes del dispositivo en 150 s con 25 ms en cola, todos mientras carga la escena (el
+  `Update` del juego retuvo el mutex hasta 30 ms). Con los hilos dentro de los tokens de
+  núcleo y el evento señalado desde el mismo hilo eran 1-2 ms por frame, picos de 50-170 ms y decenas de cortes
+  por segundo.
+- La idea viene de SuperMarioWonderRecomp (MIT, BelmanteGu), que corre así el renderer del SDK 16 de Wonder; se
+  usó su PROGRESS.md como referencia, sin copiar código.
+- `SAVAGEWIND_AUDIO_DFC=0` vuelve al mezclador HLE de `audren:u` (heredado de LASRecomp), que sigue en el archivo.
+  Sin probar: el reinicio en el lugar (vuelta a la pantalla de inicio) con el renderer abierto, y
+  `CloseAudioRenderer`, que el juego no llamó en las pruebas.
 
 ## Sondeo del exefs
 
@@ -327,8 +447,7 @@ su propio archivo).
 
 `DT_RELR` trae 222.402 relocaciones relativas en `main` (198.097 apuntan a código), pero casi todas a
 funciones que `gen.py` ya encontraba por `.eh_frame`, `bl` o `adrp` + `add`: suma 2 inicios de función
-en `main`, 17 en `subsdk0` y 8 en `sdk`. `runtime/hle/hle_symbols.txt` está vacío, así que `--hle` no
-reemplaza nada en ningún módulo.
+en `main`, 17 en `subsdk0` y 8 en `sdk`. `runtime/hle/hle_symbols.txt` solo lista `longjmp` (del `sdk`).
 
 Compilación (`make -j12`, con `build/savagewind.exe` ya hecho, que tarda unos 10 s):
 
