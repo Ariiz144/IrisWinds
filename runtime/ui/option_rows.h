@@ -13,6 +13,10 @@ void opt_section(const char *title);
 bool opt_toggle(const char *label, bool *v, bool def, const char *desc);
 // wrap: past the last value back to the first (and the other way); false: stops at the ends
 bool opt_choice(const char *label, int *v, const char *const *names, int n, int def, const char *desc, bool wrap = true);
+// a choice where some values can't be picked yet (avail[i] false: shown greyed when stepped onto, never stored): *v
+// keeps the last available value, *shown is the one on screen (-1: *v). True when *v changed.
+bool opt_choice_avail(const char *label, int *v, int *shown, const char *const *names, const bool *avail, int n, int def,
+                      const char *desc);
 // steps of `step` between lo and hi; fmt formats the value (e.g. "%gx")
 bool opt_slider(const char *label, float *v, float lo, float hi, float step, float def, const char *fmt, const char *desc);
 // whole numbers lo..hi in steps of `step` (holding left / right speeds up); fmt formats it (e.g. "%d rupees"), lo_name

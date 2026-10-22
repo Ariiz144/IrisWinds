@@ -9,6 +9,7 @@
 #include <math.h>
 #include <pthread.h>
 #include <atomic>
+#include <string>
 #include <vector>
 
 #include "i18n.h"
@@ -26,6 +27,7 @@ extern "C" bool vk_imgui_backend_init(void);  // runtime/nvn/vulkan/imgui_glue.c
 extern "C" {
 #include "../hle.h"
 #include "../settings.h"
+#include "../window_size.h"
 extern "C" {
 #include "../language.h"
 }
@@ -40,7 +42,10 @@ void controls_bindings_draw(float scale);  // controls_ui.mm
 // ------------------------------------------------------------------ state shared with the main thread
 static std::atomic<bool> g_open{false};
 static std::atomic<bool> g_text_busy{false};  // a text field / the on-screen keyboard has the keys (render thread: ui_text_busy)
-static std::atomic<bool> g_want_fullscreen_apply{false};
+static std::atomic<bool> g_want_window_apply{false};  // fullscreen or the window size changed
+// (also from the game's Options screen, game_options.mm)
+extern "C" void menu_request_window_apply(void) { g_want_window_apply.store(true); }
+extern "C" bool game_options_input_hold(void);  // game_options.mm: a binding capture from the game's Options screen
 
 struct QEvent {
     enum { KEY, ANALOG, MOUSE_POS, MOUSE_BUTTON, WHEEL, TEXT } kind;
@@ -142,12 +147,24 @@ static std::atomic<bool> g_last_pad{false};
 static char g_kbd_text[96];
 static int g_kbd_max = 8;
 static bool capturing() { return g_open.load() || g_kbd.load() == 1; }
-// The game gets no input while this is true (runtime/hle/input.c): menu or name entry up.
-extern "C" bool menu_input_captured(void) { return capturing(); }
+// The game gets no input while this is true (runtime/hle/input.c): menu or name entry up, or a binding capture begun
+// from the game's Options screen.
+extern "C" bool menu_input_captured(void) { return capturing() || game_options_input_hold(); }
+
+// In game the settings are the game's own Options screen (game_options.mm): F1, Esc and the controller's home button no
+// longer open this menu (SAVAGEWIND_OVERLAY=1 brings it back). Esc frees the mouse cursor instead, a click in the
+// window holds it again (runtime/hle/input.c).
+static bool overlay_enabled(void) {
+    static const bool on = getenv("SAVAGEWIND_OVERLAY") && *getenv("SAVAGEWIND_OVERLAY") != '0';
+    return on;
+}
+static std::atomic<bool> g_cursor_free{false};
+extern "C" bool menu_cursor_free(void) { return g_cursor_free.load(); }
 
 bool menu_handle_event(const SDL_Event *e) {
     static bool back_down, start_down;
-    if (g_open.load() && bind_capture_event(e)) return true;  // Controls tab waiting for a new binding: it takes the press
+    // a binding capture (Controls tab, or the game's Options screen) takes the press
+    if (bind_capture_event(e)) return true;
     if (e->type == SDL_EVENT_KEY_DOWN) g_last_pad = false;
     if (e->type == SDL_EVENT_GAMEPAD_BUTTON_DOWN) g_last_pad = true;
     if (g_kbd.load() == 1 && e->type == SDL_EVENT_KEY_DOWN && !e->key.repeat) {  // Enter confirms, Esc cancels
@@ -160,10 +177,18 @@ bool menu_handle_event(const SDL_Event *e) {
     }
     // typing (a text field, the on-screen keyboard, the name entry): keys are text, not menu shortcuts
     bool typing = g_kbd.load() == 1 || (g_open.load() && g_text_busy.load());
+    if (e->type == SDL_EVENT_MOUSE_BUTTON_DOWN && g_cursor_free.load() && !capturing()) {
+        g_cursor_free = false;  // (the click only takes the cursor back)
+        return true;
+    }
     switch (e->type) {
     case SDL_EVENT_KEY_DOWN:
         if (!e->key.repeat && (e->key.scancode == SDL_SCANCODE_F1 ||
                                (e->key.scancode == SDL_SCANCODE_ESCAPE && !g_open.load()))) {
+            if (!overlay_enabled()) {
+                if (e->key.scancode == SDL_SCANCODE_ESCAPE && !typing) g_cursor_free = !g_cursor_free.load();
+                return true;
+            }
             if (!typing) set_open(!g_open.load());  // (Esc with the menu open goes to ImGui below: it cancels a field)
             return true;
         }
@@ -176,7 +201,7 @@ bool menu_handle_event(const SDL_Event *e) {
                                (e->key.scancode == SDL_SCANCODE_RETURN && (e->key.mod & (SDL_KMOD_ALT | SDL_KMOD_GUI))) ||
                                (e->key.scancode == SDL_SCANCODE_F && (e->key.mod & SDL_KMOD_GUI) && (e->key.mod & SDL_KMOD_CTRL)))) {
             g_settings.fullscreen = !g_settings.fullscreen;
-            g_want_fullscreen_apply.store(true);
+            g_want_window_apply.store(true);
             settings_save();
             return true;
         }
@@ -202,7 +227,8 @@ bool menu_handle_event(const SDL_Event *e) {
         bool down = e->type == SDL_EVENT_GAMEPAD_BUTTON_DOWN;
         if (e->gbutton.button == SDL_GAMEPAD_BUTTON_BACK) back_down = down;
         if (e->gbutton.button == SDL_GAMEPAD_BUTTON_START) start_down = down;
-        if (down && !typing && ((back_down && start_down) || e->gbutton.button == SDL_GAMEPAD_BUTTON_GUIDE)) {
+        if (down && !typing && overlay_enabled() &&
+            ((back_down && start_down) || e->gbutton.button == SDL_GAMEPAD_BUTTON_GUIDE)) {
             set_open(!g_open.load());
             return true;
         }
@@ -264,18 +290,16 @@ void menu_apply_window_requests(void *win) {
         else SDL_StopTextInput(w);
         text_input = want_text;
     }
-    static bool first = true;
-    if (first || g_want_fullscreen_apply.exchange(false)) {
-        first = false;
-        SDL_SetWindowFullscreen(w, g_settings.fullscreen);
-    }
+    // (the window was made at its size and fullscreen mode: ui_window_init)
+    if (g_want_window_apply.exchange(false)) winsize_apply(w);
+    else winsize_refresh(w);  // (moved to another display, or its desktop size changed: other sizes are offered)
 }
 
 // ------------------------------------------------------------------ render thread
 static bool g_inited;
 static ImGuiContext *g_ctx;  // ours: the start screen (back to it after a reboot) has its own context
 static ImFont *g_font, *g_font_big;
-static ImFont *g_menu_font, *g_menu_font_big;  // the menu window (Baloo 2); everything else keeps g_font
+static ImFont *g_menu_font, *g_menu_font_big;  // the menu window (Fira Sans); everything else keeps g_font
 static int g_tab, g_tab_request = -2;  // (-2: no request; -1 is the Prelaunch tab)
 static int g_focus_tab = -99;  // put the nav cursor on this tab next frame (-100: the selected one; -99: none)
 static int g_focus_frames;
@@ -344,13 +368,15 @@ static void load_fonts(void) {
         if (!g_font) g_font = add(p, 34, cfg);
         if (g_font && !g_font_big) { ImFontConfig b = cfg; b.FontNo = 0; g_font_big = add(p, 56, b); }
     }
-    // the menu window itself: Baloo 2 SemiBold, as on the start screen (shipped, OFL), at its Settings window's sizes; the
-    // FPS counter, overlays and on-screen keyboard keep the fonts above
-    char baloo[1024];
-    if (const char *f = getenv("SAVAGEWIND_MENU_FONT")) strlcpy(baloo, f, sizeof baloo);  // (test) another weight / face
-    if (getenv("SAVAGEWIND_MENU_FONT") || rt_resource("Baloo2-SemiBold.ttf", "third_party/fonts/Baloo2/Baloo2-SemiBold.ttf", baloo, sizeof baloo)) {
-        g_menu_font = add(baloo, 39, cfg);
-        g_menu_font_big = add(baloo, 72, cfg);
+    // the menu window itself: Fira Sans, as on the start screen (shipped, OFL) - Medium for the rows, SemiBold for the
+    // titles - at its Settings window's sizes; the FPS counter, overlays and on-screen keyboard keep the fonts above
+    char med[1024], semi[1024];
+    const char *test = getenv("SAVAGEWIND_MENU_FONT");  // (test) another weight / face
+    if (test) strlcpy(med, test, sizeof med), strlcpy(semi, test, sizeof semi);
+    if (test || (rt_resource("FiraSans-Medium.ttf", "third_party/fonts/FiraSans/FiraSans-Medium.ttf", med, sizeof med) &&
+                 rt_resource("FiraSans-SemiBold.ttf", "third_party/fonts/FiraSans/FiraSans-SemiBold.ttf", semi, sizeof semi))) {
+        g_menu_font = add(med, 29, cfg);
+        g_menu_font_big = add(semi, 53.5f, cfg);
     }
     if (!g_font) g_font = io.Fonts->AddFontDefault();
     if (!g_font_big) g_font_big = g_font;
@@ -461,8 +487,11 @@ static bool toggle(const char *label, bool *v) {
     return ch;
 }
 
-extern "C" void renderer_get_scale(float *sx, float *sy);
-extern "C" double output_scale_dynamic_factor(void);
+extern "C" void renderer_get_scene_scale(float *sx, float *sy);
+extern "C" bool renderer_gpu_rtx(void);  // (vulkan/device.c, metal.m)
+extern "C" {
+#include "../nvn/output_scale.h"
+}
 
 static void tab_display(void) {
     float scale = ImGui::GetFontSize() / 34;
@@ -471,7 +500,54 @@ static void tab_display(void) {
     bool fs = g_settings.fullscreen;
     if (opt_toggle("Fullscreen", &fs, false, "Fills the screen. Also: F11, Alt+Enter or Cmd+Ctrl+F.")) {
         g_settings.fullscreen = fs;
-        g_want_fullscreen_apply.store(true);
+        g_want_window_apply.store(true);
+    }
+    {   // Window size (runtime/window_size.c): the sizes the display can show, grouped by shape
+        WinSize list[WINSIZE_MAX];
+        static char names_buf[WINSIZE_MAX][32];
+        const char *names[WINSIZE_MAX];
+        int n = winsize_list(list, g_settings.fullscreen), cur = 0, def = 0;
+        WinSize e = winsize_effective(g_settings.fullscreen), d = winsize_default(g_settings.fullscreen);
+        WinSize desk = winsize_desktop();
+        for (int i = 0; i < n; i++) {
+            winsize_name(list[i], names_buf[i], sizeof names_buf[i]);
+            names[i] = names_buf[i];
+            if (list[i].w == e.w && list[i].h == e.h) cur = i;
+            if (list[i].w == d.w && list[i].h == d.h) def = i;
+        }
+        char desc[600];
+        snprintf(desc, sizeof desc, tr("The size of the game's window, or of the screen in fullscreen. Only the sizes your "
+                                       "display can show, grouped by shape (the game itself stays 16:9, with bars on "
+                                       "wider screens).\n\nYour display: %d x %d."), desk.w, desk.h);
+        if (opt_choice("Window size", &cur, names, n, def, desc, false)) {
+            g_settings.window_w = list[cur].w, g_settings.window_h = list[cur].h;
+            g_want_window_apply.store(true);
+        }
+    }
+    {   // Frame rate (runtime/hle/framepace.c)
+        static const int fps[] = FPS_CHOICES;
+        enum { NF = sizeof fps / sizeof fps[0] };
+        static char names_buf[NF][32];
+        const char *names[NF];
+        int cur = 0, def = 0;
+        for (int i = 0; i < NF; i++) {
+            if (fps[i]) snprintf(names_buf[i], sizeof names_buf[i], tr("%d FPS"), fps[i]);
+            names[i] = fps[i] ? names_buf[i] : "Off";
+            if (fps[i] == g_settings.fps_limit) cur = i;
+            if (fps[i] == FPS_DEFAULT) def = i;
+        }
+        std::string desc = tr("How many pictures a second the game draws. The game itself runs at the same speed at "
+                              "every rate (the console runs it at 30). Higher rates need a faster computer. Menus, "
+                              "cutscenes and conversations run at 30, as on the console. Off: as many as the computer "
+                              "can draw.");
+        int hz = (int)lroundf(winsize_refresh_rate());
+        if (hz > 0) {
+            char line[200];
+            snprintf(line, sizeof line, tr("Your display refreshes %d times a second: a rate above that shows no more "
+                                           "pictures, and one that divides it evenly is the smoothest."), hz);
+            desc += std::string("\n\n") + line;
+        }
+        if (opt_choice("Frame rate", &cur, names, NF, def, desc.c_str(), false)) g_settings.fps_limit = fps[cur];
     }
     static const char *const perf_names[] = {"Off", "FPS", "Full"};
     opt_choice("Performance overlay", &g_settings.perf_overlay, perf_names, 3, PERF_OFF,
@@ -479,50 +555,67 @@ static void tab_display(void) {
                "frame time graph. F10 switches between them while you play.");
 
     opt_section("Rendering");
-    // display order -> RES_* (the ini / enum order predates the menu order)
-    // (up to 4x: 7680 x 4320, 8K - more only ran out of GPU memory, and sat next to 75% in the list)
-    // (Match display in the middle: left from it 75% / 50% / 25%, right Dynamic then 1x-4x; user 2026-10-11)
-    static const char *res[] = {"25%", "50%", "75%", "Match display", "Dynamic", "1x", "2x", "3x", "4x"};
-    static const int res_mode[] = {RES_Q25, RES_Q50, RES_Q75, RES_MATCH, RES_DYNAMIC, 1, 2, 3, 4};
-    enum { RES_MATCH_AT = 3 };
-    enum { NRES = sizeof res_mode / sizeof res_mode[0] };
-    {
-        int ri = RES_MATCH_AT;
-        for (int i = 0; i < NRES; i++) if (res_mode[i] == g_settings.res_mode) ri = i;
-        float sx, sy;
-        renderer_get_scale(&sx, &sy);
-        char d[400];
-        int n = snprintf(d, sizeof d, tr("How sharp the 3D image is. Match display: your screen's own resolution. Dynamic: "
-                                         "as sharp as your GPU keeps at full speed. 1x-4x: the Switch's 1080p times that. "
-                                         "75%% / 50%% / 25%%: a share of the display, for slower machines.\n\nRendering at "
-                                         "%.0f x %.0f."), 1920.0 * sx, 1080.0 * sy);
-        if (g_settings.res_mode == RES_DYNAMIC && n > 0 && n < (int)sizeof d)
-            snprintf(d + n, sizeof d - n, tr(" Dynamic: %.0f%% of the display right now."), output_scale_dynamic_factor() * 100);
-        if (opt_choice("Internal resolution", &ri, res, NRES, RES_MATCH_AT, d, false)) g_settings.res_mode = res_mode[ri];
-    }
-    {   // each OS's own upscaler next to bilinear (UPSCALE_SHARP: MetalFX on macOS, AMD FSR 1 on Windows)
+    {   // Upscaler: Off, this OS's spatial upscaler (its modes on the row below), and the temporal ones still to come.
+        // Values that can't be picked yet are shown greyed ("coming soon"); stepping onto them keeps the one in use.
+        // The modes wait for render-target scaling (upscale_modes_available): until then the upscaler brings the
+        // game's own 1920 x 1080 image to a bigger window.
+        std::string fsr3 = std::string(tr("FSR 3")) + " " + tr("(coming soon)");
+        std::string dlss = std::string(tr("DLSS")) + " " + tr(renderer_gpu_rtx() ? "(coming soon)" : "(NVIDIA RTX only)");
 #ifdef __APPLE__
-        static const char *ups[] = {"Bilinear", "MetalFX"};
-        const char *ud = "How the image is scaled up to the window when it renders at a lower resolution. MetalFX: Apple's "
-                         "upscaler, sharper. Bilinear: plain and soft.";
+        const char *ups[] = {"Off", "MetalFX"};
+        static const int ups_value[] = {UPSCALE_OFF, UPSCALE_METALFX};
+        const char *ud = "How the game's image (1920 x 1080) is scaled up to a bigger window. Off: plain (bilinear) "
+                         "scaling. MetalFX: Apple's upscaler, sharper.\n\nRendering below the window's size (the modes "
+                         "below) is coming in a later version.";
 #else
-        static const char *ups[] = {"Bilinear", "AMD FSR 1"};
-        const char *ud = "How the image is scaled up to the window when it renders at a lower resolution. AMD FSR 1: "
-                         "edge-aware upscaling and sharpening, sharper. Bilinear: plain and soft.";
+        const char *ups[] = {"Off", "AMD FSR 1", fsr3.c_str(), dlss.c_str()};
+        static const int ups_value[] = {UPSCALE_OFF, UPSCALE_FSR1, UPSCALE_FSR3, UPSCALE_DLSS};
+        const char *ud = "Off: the 3D image renders at the window's resolution. AMD FSR 1: it renders smaller (the mode "
+                         "below), then FSR 1's edge-aware upscaling and sharpening bring it to the window. The HUD and "
+                         "menus always render at the window's resolution.\n\nAMD FSR 3 and NVIDIA DLSS (NVIDIA RTX "
+                         "graphics cards) are coming in a later version.";
 #endif
-        int ui = g_settings.upscaler == UPSCALE_BILINEAR ? 0 : 1;
-        char udm[512];
-        if (g_settings.res_mode == RES_MATCH) {  // (renders at the window's size: nothing to scale up)
-            snprintf(udm, sizeof udm, tr("%s\n\nNot used at Match display: the game already renders at your display's resolution."), tr(ud));
-            ud = udm;
-            opt_disable_next();
+        enum { NU = sizeof ups_value / sizeof ups_value[0] };
+        bool avail[NU];
+        int ui = 0;
+        for (int i = 0; i < NU; i++) {
+            avail[i] = upscaler_available(ups_value[i]);
+            if (ups_value[i] == g_settings.upscaler) ui = i;
         }
-        if (opt_choice("Upscaler", &ui, ups, 2, 1, ud)) g_settings.upscaler = ui ? UPSCALE_SHARP : UPSCALE_BILINEAR;
+        static int shown = -1;
+        int udef = 0;  // (the reset value: UPSCALE_DEFAULT)
+        for (int i = 0; i < NU; i++) if (ups_value[i] == UPSCALE_DEFAULT) udef = i;
+        if (opt_choice_avail("Upscaler", &ui, &shown, ups, avail, NU, udef, ud)) g_settings.upscaler = ups_value[ui];
+        // its mode (AMD's scale factors), one step in; greyed when the upscaler is off
+        static const char *const modes[] = {"Ultra Quality", "Quality", "Balanced", "Performance"};
+        bool modes_ok = upscale_modes_available();
+        std::string mode_names[UPQ_COUNT];
+        const char *mn[UPQ_COUNT];
+        bool mavail[UPQ_COUNT];
+        for (int i = 0; i < UPQ_COUNT; i++) {
+            mode_names[i] = modes_ok ? tr(modes[i]) : std::string(tr(modes[i])) + " " + tr("(coming soon)");
+            mn[i] = mode_names[i].c_str();
+            mavail[i] = modes_ok;
+        }
+        float sx, sy;  // the 3D scene's size (BOTW docked: 1600 x 900 times its scale)
+        renderer_get_scene_scale(&sx, &sy);
+        char rendering[100];
+        snprintf(rendering, sizeof rendering, tr("Rendering at %.0f x %.0f."), 1600.0 * sx, 900.0 * sy);
+        std::string md = std::string(tr("How much smaller the game renders before the upscaler brings it to the window, "
+                                        "on each side: Ultra Quality 1.3x, Quality 1.5x, Balanced 1.7x, Performance "
+                                        "2x. Smaller is faster and softer.")) +
+                         "\n\n" + (modes_ok ? rendering : tr("Coming in a later version."));
+        opt_indent(1);
+        if (g_settings.upscaler == UPSCALE_OFF) opt_disable_next();
+        static int mshown = -1;
+        opt_choice_avail("Upscaler mode", &g_settings.upscale_quality, &mshown, mn, mavail, UPQ_COUNT, UPQ_QUALITY,
+                         md.c_str());
+        opt_indent(-1);
     }
     static const char *aa[] = {"Off", "SMAA"};
     opt_choice("Anti-aliasing", &g_settings.antialias, aa, 2, AA_OFF,
                "Smooths jagged edges of the game image before it is scaled to the window. SMAA: finds the edges and "
-               "blends only along them, so textures stay sharp. Most useful at a lower internal resolution.");
+               "blends only along them, so textures stay sharp. Most useful with an upscaler.");
     opt_toggle("Asynchronous shaders", &g_settings.async_shaders, false,
                "Off: the game waits for each new shader to compile, a short stutter the first time an effect "
                "appears, and everything is drawn. On: no waiting, but what needs a shader still compiling is skipped "
@@ -617,7 +710,7 @@ static void tab_about(void) {
     toggle("Mouse camera", &g_settings.mouse_camera);
     hint("The mouse turns the camera. While you play, the cursor stays in the window; Esc or F1 frees it.");
     float sens = roundf(g_settings.mouse_sens * 100);
-    if (opt_slider("Mouse sensitivity", &sens, 10, 500, 5, 100, "%g%%", "How fast the mouse turns the camera."))
+    if (opt_slider("Mouse sensitivity", &sens, 10, 1000, 5, MOUSE_SENS_DEFAULT * 100, "%g%%", "How fast the mouse turns the camera."))
         g_settings.mouse_sens = sens / 100.0f;
     toggle("Invert mouse Y", &g_settings.mouse_invert_y);
     ImGui::Spacing();

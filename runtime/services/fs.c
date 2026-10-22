@@ -336,6 +336,29 @@ static void rom_index(int fd) {
         ov_n++;
         ov_end = (ov_end + size + 0xF) & ~0xFull;
     }
+    // The title screen's version line shows System/Version.txt ("1.8.2") through "Ver.%s": it reads "Savage Wind
+    // <major>.<minor>" instead (the "Ver." goes in fs_title_version_patch), unless the overlay folder replaces the
+    // file. The line's text box holds 15 characters, so the full version is only in Savage Wind Configuration.
+    for (int i = 0; i < rom_nfiles; i++) {
+        if (strcmp(rom_files[i].path, "System/Version.txt")) continue;
+        char host[1200];
+        struct stat sb;
+        if (overlay_file(rom_files[i].path, host, sizeof host) && !stat(host, &sb)) break;
+        extern const char *rt_version(void);  // (runtime/ui/launcher.mm)
+        static char text[64];
+        const char *v = rt_version(), *dot = strchr(v, '.');
+        int n = dot ? (int)strcspn(dot + 1, ".-") + (int)(dot - v) + 1 : (int)strlen(v);  // (up to the second '.')
+        snprintf(text, sizeof text, "Savage Wind %.*s", n, v);
+        if (strlen(text) > 15) snprintf(text, sizeof text, "Savage Wind");
+        meta_copy(fd, fmeta, foff, fsz);
+        uint64_t rel = ov_end - rom_data_off, size = strlen(text);
+        memcpy(ov_meta + rom_files[i].meta + 8, &rel, 8);
+        memcpy(ov_meta + rom_files[i].meta + 0x10, &size, 8);
+        if (ov_n == ov_cap) { ov_cap = ov_cap ? ov_cap * 2 : 256; ov = realloc(ov, sizeof *ov * ov_cap); }
+        ov[ov_n++] = (Overlay){ov_end, size, NULL, -1, (const uint8_t *)text};
+        ov_end = (ov_end + size + 0xF) & ~0xFull;
+        break;
+    }
     if (ov_n) LOG("[fs] overlay: %d romfs files replaced\n", ov_n);
     if (ov_meta) { patches[npatches++] = (Patch){ov_meta_off, ov_meta_size, ov_meta}; }
     add_new_files(fd, h, dmeta, dsz, fsz);
@@ -343,6 +366,15 @@ static void rom_index(int fd) {
     free(dmeta);
     free(fmeta);
     LOG("[fs] romfs index: %d files\n", rom_nfiles);
+}
+
+// The title screen's version line: main 1.8.2 formats System/Version.txt with "Ver.%s" (0x71014b854e in the Ghidra
+// project, read by FUN_7100d4b57c and FUN_7100d4bca0); "%s" leaves just "Savage Wind <version>". Called once main is
+// loaded; anything else at that address is left alone.
+void fs_title_version_patch(void) {
+    char *fmt = (char *)(uintptr_t)0x70014b854eull;
+    if (memcmp(fmt, "Ver.%s", 7)) { LOG("[fs] title version: \"Ver.%%s\" not found, left as is\n"); return; }
+    memcpy(fmt, "%s", 3);
 }
 
 // Virtual RomFS image read: original bytes, with the patched file table and appended replacement files.

@@ -69,7 +69,15 @@ KEvent *kernel_create_event_pair(uint32_t *writable, uint32_t *readable);
 KThread *kernel_current_thread(void);
 void kernel_thread_off_cores(void);  // the current thread stops taking part in core scheduling (runtime/kernel.c)
 void kernel_sleep_until_ns(uint64_t t);  // host code on a guest thread waits until t (plat_now_ns), its core let go
+// host work on a guest thread that runs no guest code (the GPU backend: translating command lists, presenting, waiting
+// for the GPU), between these two: its core is let go meanwhile, as the console's GPU works beside the CPU cores
+void kernel_host_work_begin(void);
+void kernel_host_work_end(void);
 // (profiling, runtime/sampler.c) the host threads of the guest threads running now: up to max, with their handles
 // and entry points; returns how many
 int kernel_running_threads(pthread_t *host, uint32_t *handle, uint64_t *entry, int max);
+void kernel_sample_host_thread(void);  // (profiling) the calling host thread is sampled too (handle 0xf000 + n)
+// A better thread waits for t's core: t lets it have it (dispatch.c, at indirect calls; g_core_best_wait: per core)
+extern volatile int g_core_best_wait[4];
+void kernel_preempt(KThread *t);
 uint64_t kernel_heap_size(void);  // bytes from HEAP_BASE set by SetHeapSize

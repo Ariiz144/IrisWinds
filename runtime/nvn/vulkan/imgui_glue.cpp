@@ -1,5 +1,7 @@
 // Dear ImGui's Vulkan backend on our device (start screen and in-game menu; both draw inside the window image's
 // dynamic rendering begun by vk_frame_begin).
+#include <vector>
+
 #include "imgui.h"
 #include "imgui_impl_vulkan.h"
 
@@ -43,11 +45,16 @@ extern "C" void vk_imgui_fonts_changed(void) {
 
 extern "C" void vk_imgui_backend_shutdown(void) {
     if (!ImGui::GetIO().BackendRendererUserData) return;
+    vk_present_idle();
     vkDeviceWaitIdle(g_vk.dev);
     ImGui_ImplVulkan_Shutdown();
 }
 
-// A static RGBA8 image for ImGui (start screen background). Returns the ImTextureID.
+// A static RGBA8 image for ImGui (the start screen's picture, runtime/ui/splash.mm). Returns the ImTextureID; 0 when it
+// couldn't be made. vk_imgui_texture_free gives it back (before the backend shuts down: its descriptor is the backend's).
+struct ImGuiTex { uint64_t id; VkImage img; VkImageView view; VmaAllocation mem; };
+static std::vector<ImGuiTex> g_textures;
+
 extern "C" uint64_t vk_imgui_texture_rgba(const void *rgba, int w, int h) {
     VkImageCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     ci.imageType = VK_IMAGE_TYPE_2D;
@@ -78,5 +85,20 @@ extern "C" uint64_t vk_imgui_texture_rgba(const void *rgba, int w, int h) {
     vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
     VkImageView view;
     if (vkCreateImageView(g_vk.dev, &vi, NULL, &view) != VK_SUCCESS) return 0;
-    return (uint64_t)ImGui_ImplVulkan_AddTexture(vk_default_sampler(true), view, VK_IMAGE_LAYOUT_GENERAL);
+    uint64_t id = (uint64_t)ImGui_ImplVulkan_AddTexture(vk_default_sampler(true), view, VK_IMAGE_LAYOUT_GENERAL);
+    if (!id) { vkDestroyImageView(g_vk.dev, view, NULL); return 0; }  // (no descriptor left: rare, the image is left)
+    g_textures.push_back({id, img, view, mem});
+    return id;
+}
+
+extern "C" void vk_imgui_texture_free(uint64_t id) {
+    for (size_t i = 0; i < g_textures.size(); i++) {
+        if (g_textures[i].id != id) continue;
+        vkDeviceWaitIdle(g_vk.dev);  // (a frame in flight may still draw it)
+        ImGui_ImplVulkan_RemoveTexture((VkDescriptorSet)id);
+        vkDestroyImageView(g_vk.dev, g_textures[i].view, NULL);
+        vmaDestroyImage(g_vk.vma, g_textures[i].img, g_textures[i].mem);
+        g_textures.erase(g_textures.begin() + i);
+        return;
+    }
 }

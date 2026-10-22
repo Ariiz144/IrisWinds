@@ -955,6 +955,8 @@ static SDL_AudioStream *output_open(uint32_t rate, FILE **wav) {
     if (getenv("SAVAGEWIND_AUDIO_WAV")) {
         *wav = fopen(getenv("SAVAGEWIND_AUDIO_WAV"), "wb");
         if (*wav) wav_header(*wav, 0);
+        // (when the recording starts on plat_now_ns's clock, to line it up with other logs: the [clock] probe)
+        LOG("[audren] recording %s from %.3f s\n", getenv("SAVAGEWIND_AUDIO_WAV"), plat_now_ns() / 1e9);
     }
     if (getenv("SAVAGEWIND_NO_AUDIO") && strcmp(getenv("SAVAGEWIND_NO_AUDIO"), "0")) return NULL;
     if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) { LOG("[audren] SDL audio init failed: %s\n", SDL_GetError()); return NULL; }

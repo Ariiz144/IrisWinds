@@ -117,10 +117,11 @@ static void mouse_stick(int32_t *x, int32_t *y) {
 
 // Main thread, every window loop turn (runtime/nvn/vulkan/device.c ui_run): hold or free the cursor.
 extern bool menu_input_captured(void);  // runtime/ui/menu.mm: overlay menu or name entry up (it has the keys / pad)
+extern bool menu_cursor_free(void);     // runtime/ui/menu.mm: Esc freed the cursor (a click in the window holds it)
 static bool win_focused = true;         // (main thread: window events and input_mouse_update)
 void input_mouse_update(SDL_Window *w) {
     static bool cur;
-    bool want = w && win_focused && g_settings.mouse_camera && !menu_input_captured() &&
+    bool want = w && win_focused && g_settings.mouse_camera && !menu_input_captured() && !menu_cursor_free() &&
                 !getenv("SAVAGEWIND_INPUT") && !getenv("SAVAGEWIND_HOST_INPUT");
     if (want == cur) return;
     cur = want;

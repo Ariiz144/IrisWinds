@@ -1,4 +1,5 @@
 // A small Horizon kernel: handles, threads, synchronization, memory, and the SVC dispatcher.
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -116,6 +117,17 @@ static Core g_cores[4] = {
     {PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, NULL, {0}, 0, 0},
 };
 static int g_cores_on = -1;
+// The best (lowest) priority among the threads waiting for each core, INT_MAX with none: what dispatch.c checks at every
+// indirect call (kernel_preempt). SAVAGEWIND_NO_PREEMPT=1: kept at INT_MAX (preemption at syscalls only, as before).
+volatile int g_core_best_wait[4] = {INT_MAX, INT_MAX, INT_MAX, INT_MAX};
+static void core_best_update(Core *k) {  // (k->m held)
+    static int off = -1;
+    if (off < 0) off = getenv("SAVAGEWIND_NO_PREEMPT") != NULL;
+    int best = INT_MAX;
+    for (int i = 0; i < k->nwaiting && !off; i++)
+        if (k->waiting[i]->prio < best) best = k->waiting[i]->prio;
+    __atomic_store_n(&g_core_best_wait[k - g_cores], best, __ATOMIC_RELAXED);
+}
 
 static bool cores_on(void) {
     if (g_cores_on < 0) g_cores_on = !(getenv("SAVAGEWIND_CORES") && !strcmp(getenv("SAVAGEWIND_CORES"), "0"));
@@ -140,9 +152,11 @@ static void core_acquire(KThread *t) {
     pthread_mutex_lock(&k->m);
     t->core_ticket = k->next_ticket++;
     if (k->nwaiting < 64) k->waiting[k->nwaiting++] = t;
+    core_best_update(k);
     while ((k->owner || !core_next(k, t)) && !g_rt_unwind) pthread_cond_wait(&k->cv, &k->m);
     for (int i = 0; i < k->nwaiting; i++)
         if (k->waiting[i] == t) { k->waiting[i] = k->waiting[--k->nwaiting]; break; }
+    core_best_update(k);
     if (!k->owner) k->owner = t;  // (during a reboot the core may stay with another thread: run anyway)
     t->core_held = k->owner == t ? idx : -1;
     pthread_mutex_unlock(&k->m);
@@ -178,6 +192,18 @@ void kernel_sleep_until_ns(uint64_t t) {
     core_acquire(me);
 }
 
+// The GPU backend's work on a guest thread (runtime/nvn/objects.c: submits, presents, GPU waits). On the console that
+// work is the GPU's: the thread that submits returns at once, and one that waits for the GPU gives its core up. Here
+// it is host code on the submitting thread, ~10 ms a frame in the open world plus shader compiles: holding the core,
+// it kept the game's other threads of that core waiting. It reads guest memory the GPU would read anyway.
+static __thread int host_work_depth;
+void kernel_host_work_begin(void) {
+    if (host_work_depth++ == 0) core_release(t_cur);
+}
+void kernel_host_work_end(void) {
+    if (--host_work_depth == 0) core_acquire(t_cur);
+}
+
 // At a syscall: give the core to a better thread waiting for it, if there is one.
 static void core_preempt_point(KThread *t) {
     if (!t || t->core_held < 0) return;
@@ -189,6 +215,17 @@ static void core_preempt_point(KThread *t) {
         if (k->waiting[i]->prio < t->prio) better = true;
     pthread_mutex_unlock(&k->m);
     if (better) { core_release(t); core_acquire(t); }
+}
+
+// Horizon runs a better (lower priority number) thread the moment it can run, taking the core from a worse one.
+// Generated code has no preemption points of its own, so the core went over only at the holder's next syscall: in
+// BOTW's open world a prio-48 job thread ran ~5 ms of guest code without one once a second, while a prio-44 worker of
+// the same core, which the main thread was waiting for, waited for the core (a ~10 ms longer frame every second).
+// dispatch.c calls this at every indirect call (a safe point: the guest state is all in Cpu).
+void kernel_preempt(KThread *t) {
+    if (t->core_held < 0 || __atomic_load_n(&g_core_best_wait[t->core_held], __ATOMIC_RELAXED) >= t->prio) return;
+    core_release(t);
+    core_acquire(t);
 }
 
 // svcSleepThread(0) and friends: let the threads of the same priority waiting for this core go first.
@@ -305,11 +342,19 @@ static uint64_t next_thread_id = 0x50;
 volatile int g_rt_unwind;
 static KThread *g_threads;  // every thread of this boot (g_klock)
 
+static pthread_t g_host_threads[4];  // (profiling) host threads the sampler takes too: handles 0xf000 + i
+static int g_nhost_threads;
+void kernel_sample_host_thread(void) {
+    pthread_mutex_lock(&g_klock);
+    if (g_nhost_threads < 4) g_host_threads[g_nhost_threads++] = pthread_self();
+    pthread_mutex_unlock(&g_klock);
+}
 int kernel_running_threads(pthread_t *host, uint32_t *handle, uint64_t *entry, int max) {
     int n = 0;
     pthread_mutex_lock(&g_klock);
     for (KThread *t = g_threads; t && n < max; t = t->anext)
         if (t->started && !t->finished) host[n] = t->host, handle[n] = t->handle, entry[n] = t->entry, n++;
+    for (int i = 0; i < g_nhost_threads && n < max; i++) host[n] = g_host_threads[i], handle[n] = 0xf000 + i, entry[n] = 0, n++;
     pthread_mutex_unlock(&g_klock);
     return n;
 }
@@ -436,6 +481,8 @@ static uint32_t block_current(int64_t timeout_ns) {
     KThread *t = t_cur;
     struct timespec ts;
     WaitKind kind = t->wait_kind;
+    extern bool nvn_timeline(void);
+    uint64_t tl_t0 = nvn_timeline() ? plat_now_ns() : 0, tl_addr = t->wait_addr;
     if (timeout_ns >= 0) deadline(&ts, timeout_ns);
     waitlist_add(t);
     while (t->wait_kind != WAIT_NONE) {
@@ -466,6 +513,9 @@ static uint32_t block_current(int64_t timeout_ns) {
         }
     }
     waitlist_remove(t);
+    if (tl_t0 && plat_now_ns() - tl_t0 > 200000)
+        LOG("[tl] %.3f %x block %.3f ms (kind %d addr %llx lr %llx)\n", plat_now_ns() / 1e6, t->handle,
+            (plat_now_ns() - tl_t0) / 1e6, kind, (unsigned long long)tl_addr, (unsigned long long)t->cpu.x[30]);
     return t->wait_result;
 }
 
@@ -649,7 +699,12 @@ static uint32_t svc_wait_synchronization(uint64_t handles_ptr, int32_t count, in
         t->in_sync_wait = true;
         t->snext = g_syncwaiters;
         g_syncwaiters = t;
+        extern bool nvn_timeline(void);
+        uint64_t tl_t0 = nvn_timeline() ? plat_now_ns() : 0;
         bool ok = kwait(timeout < 0 ? -1 : timeout, &ts);
+        if (tl_t0 && plat_now_ns() - tl_t0 > 200000)
+            LOG("[tl] %.3f %x waitsync %.3f ms (handle %x lr %llx)\n", plat_now_ns() / 1e6, t->handle,
+                (plat_now_ns() - tl_t0) / 1e6, hs[0], (unsigned long long)t->cpu.x[30]);
         for (KThread **p = &g_syncwaiters; *p; p = &(*p)->snext)
             if (*p == t) { *p = t->snext; break; }
         t->in_sync_wait = false;
@@ -764,7 +819,8 @@ static void svc_impl(Cpu *c, uint32_t imm, uint64_t pc) {
     case 0x08: {  // CreateThread(_, entry, arg, stack_top, prio, core)
         KThread *t = thread_new(x[1], x[2], x[3], (int)x[4], (int)(int32_t)x[5]);
         t->handle = kernel_new_handle(&t->obj);
-        LOG("[kernel] CreateThread entry=%llx stack=%llx prio=%d -> %x\n", x[1], x[3], (int)x[4], t->handle);
+        LOG("[kernel] CreateThread entry=%llx stack=%llx prio=%d core %d -> %x\n", x[1], x[3], (int)x[4], (int)(int32_t)x[5],
+            t->handle);
         x[0] = R_OK;
         x[1] = t->handle;
         break;
@@ -814,6 +870,9 @@ static void svc_impl(Cpu *c, uint32_t imm, uint64_t pc) {
         int32_t ideal = (int32_t)x[1];
         uint64_t mask = x[2] & 0xF;
         int core = ideal >= 0 ? ideal : -1;
+        if (ENV("SAVAGEWIND_LOG_CORES"))
+            LOG("[kernel] SetThreadCoreMask %x: ideal %d mask %llx (prio %d)\n", ((KThread *)o)->handle, ideal,
+                (unsigned long long)mask, ((KThread *)o)->prio);
         if (core < 0 && mask && !(mask & (mask - 1))) core = __builtin_ctzll(mask);  // pinned to one core
         if (core >= 0) core_move((KThread *)o, core);
         x[0] = R_OK;

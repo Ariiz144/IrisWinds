@@ -127,6 +127,8 @@ static void reboot_idle(void) {  // (main thread, while guest threads stop) keep
 static void teardown(void) {
     uint64_t t0 = plat_now_ns();
     kernel_stop_threads(reboot_idle);
+    extern void nvn_queue_idle(void);
+    nvn_queue_idle();  // (runtime/nvn/objects.c: what the game submitted has run)
     backend_clear_window();
     backend_reset();
     const ResetFn *start = __start_resets, *stop = __stop_resets;
@@ -152,6 +154,7 @@ static void boot(const char *root) {
     char why[512];
     if (!gamelib_load(root, why, sizeof why)) FATAL("%s\n", why);
     loader_load(exefs);
+    { extern void fs_title_version_patch(void); fs_title_version_patch(); }  // (runtime/services/fs.c)
     { extern void settings_load(void); settings_load(); }
     { extern void language_booted(void); language_booted(); }  // (runtime/language.c)
     kernel_init();
@@ -202,6 +205,14 @@ static int build_romfs_image(const char *root) {
     return ok ? 0 : 1;
 }
 
+// The start screen (runtime/ui/launcher.mm), in one of two modes: SETUP sets the game files up and nothing else (a
+// plain start before they're ready; the game starts once they are), CONFIG is the whole configuration screen - Play,
+// Settings, the game files, Quit ("Savage Wind Configuration", --config; Quit to Start Screen comes back to it).
+enum { LAUNCHER_SETUP, LAUNCHER_CONFIG, LAUNCHER_NONE };
+void launcher_run(const char *root, int mode);
+bool launcher_game_ready(const char *root);
+bool launcher_config_key_held(void);  // (macOS: Option held while the app opens)
+
 int main(int argc, char **argv) {
     plat_init();
 #ifdef _WIN32
@@ -211,24 +222,35 @@ int main(int argc, char **argv) {
 #endif
     const char *root = "extracted";  // (in the data root)
     bool skip_launcher = getenv("SAVAGEWIND_NO_LAUNCHER") || getenv("SAVAGEWIND_INPUT");  // tests boot straight in
+    bool config = false;
     static char arg_root[1024];
     bool build_romfs = false;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--play")) skip_launcher = true;
+        else if (!strcmp(argv[i], "--config")) config = true;
         else if (!strcmp(argv[i], "--build-romfs")) build_romfs = true;
         else if (argv[i][0] != '-' && !realpath(argv[i], arg_root)) root = argv[i];  // (relative to where we started)
         else if (argv[i][0] != '-') root = arg_root;
     }
+#ifdef __APPLE__
+    if (launcher_config_key_held()) config = true;  // (the Mac's "Savage Wind Configuration": Option held)
+#endif
     rt_paths_init();  // the data root becomes the working directory (runtime/paths.h)
     if (build_romfs) return build_romfs_image(root);
-    for (bool title = !skip_launcher;;) {
-        if (title) {  // start screen (runtime/ui/launcher.mm): game files setup, settings
-            extern void launcher_run(const char *root);
-            launcher_run(root);
-        }
+    // A plain start goes straight into the game once the game files are set up and the game code built from them
+    // matches this build; the start screen only when there is something to set up, or when asked for.
+    int mode = config ? LAUNCHER_CONFIG : skip_launcher || launcher_game_ready(root) ? LAUNCHER_NONE : LAUNCHER_SETUP;
+    // (tests of the start screen - screenshots, setup and delete runs - show it: the configuration screen, or
+    // SAVAGEWIND_LAUNCHER_MODE=setup / config)
+    const char *test_mode = getenv("SAVAGEWIND_LAUNCHER_MODE");
+    if (test_mode || getenv("SAVAGEWIND_LAUNCHER_SHOT") || getenv("SAVAGEWIND_LAUNCHER_EXTRACT") ||
+        getenv("SAVAGEWIND_LAUNCHER_SETUP") || getenv("SAVAGEWIND_LAUNCHER_DELETE"))
+        mode = test_mode && !strcmp(test_mode, "setup") ? LAUNCHER_SETUP : LAUNCHER_CONFIG;
+    for (;;) {
+        if (mode != LAUNCHER_NONE) launcher_run(root, mode);
         boot(root);
         int kind = ui_run();  // window and input on the main thread; returns when a reboot is requested
         teardown();
-        title = kind == RT_REBOOT_TITLE;
+        mode = kind == RT_REBOOT_TITLE ? LAUNCHER_CONFIG : LAUNCHER_NONE;
     }
 }

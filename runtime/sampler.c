@@ -3,6 +3,7 @@
 // call stack (x64 unwind data: the game library and the runtime both have it). The samples go to
 // build/samples.txt; tools/profile_samples.py turns them into self / inclusive time per function, recompiled game
 // functions as f_<guest address>. A thread waiting in the kernel shows its wait; filter with the tool.
+// Each round of samples starts with "R <ns> <presented frame>", so a stretch of frames can be looked at alone.
 #include <stdlib.h>
 #include <string.h>
 
@@ -30,6 +31,13 @@ static void *sampler_main(void *arg) {
     LOG("[sample] sampling every %.0f us for %.0f s\n", us, secs);
     for (uint64_t next = plat_now_ns(); plat_now_ns() < end; next += (uint64_t)(us * 1000)) {
         int n = kernel_running_threads(host, handle, entry, MAX_THREADS);
+        if (used + 4 < cap) {  // a round marker: "R <ns> <presented frame>" in the file
+            extern uint64_t renderer_present_count(void);
+            buf[used++] = ~0ull;
+            buf[used++] = 2;
+            buf[used++] = plat_now_ns();
+            buf[used++] = renderer_present_count();
+        }
         for (int i = 0; i < n && used + MAX_DEPTH + 4 < cap; i++) {
             HANDLE h = (HANDLE)pthread_gethandle(host[i]);
             if (!h || SuspendThread(h) == (DWORD)-1) continue;
@@ -72,6 +80,11 @@ static void *sampler_main(void *arg) {
         for (int i = 0; i < n; i++) fprintf(f, "T %u %llx\n", handle[i], (unsigned long long)entry[i]);
         for (size_t p = 0; p < used;) {
             uint64_t th = buf[p], d = buf[p + 1];
+            if (th == ~0ull) {
+                fprintf(f, "R %llu %llu\n", (unsigned long long)buf[p + 2], (unsigned long long)buf[p + 3]);
+                p += 2 + d;
+                continue;
+            }
             fprintf(f, "S %llu", (unsigned long long)th);
             for (uint64_t k = 0; k < d; k++) fprintf(f, " %llx", (unsigned long long)buf[p + 2 + k]);
             fputc('\n', f);

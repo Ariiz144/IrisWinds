@@ -1,0 +1,59 @@
+name: Bug report
+description: Something in the game looks, sounds or behaves wrong, stutters, or crashes.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for testing Savage Wind! Every report shows how far the game really works.
+        **Never attach or link game files, keys, firmware, generated game code or save files**, and no links to
+        copies of the game: issues with any of them are removed.
+  - type: input
+    id: version
+    attributes:
+      label: Savage Wind version
+      description: Shown on the game's title screen and in Savage Wind Configuration.
+      placeholder: 0.2.0-alpha.2
+    validations:
+      required: true
+  - type: input
+    id: system
+    attributes:
+      label: Your PC
+      description: Windows version, GPU and its driver version, CPU.
+      placeholder: Windows 11 24H2, RTX 3060 (driver 581.29), Ryzen 5 5600X
+    validations:
+      required: true
+  - type: input
+    id: where
+    attributes:
+      label: Where in the game
+      description: The place, menu, cutscene or quest where it happened.
+      placeholder: Great Plateau, Eastern Abbey, at night
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and how to make it happen again
+      description: What you expected, what you saw instead, and the steps that lead to it.
+    validations:
+      required: true
+  - type: input
+    id: settings
+    attributes:
+      label: Settings
+      description: Frame rate, window size and fullscreen mode, and upscaler (Options > Settings > Video).
+      placeholder: 60 fps, 2560x1440 borderless, upscaler Off
+  - type: textarea
+    id: log
+    attributes:
+      label: savagewind.log
+      description: Attach savagewind.log from the Savage Wind folder (drag the file here). Screenshots or a short video help too.
+  - type: checkboxes
+    id: legal
+    attributes:
+      label: Before sending
+      options:
+        - label: This report contains no game files, keys, firmware, generated game code, save files or links to copies of the game.
+          required: true

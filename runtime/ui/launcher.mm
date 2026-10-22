@@ -1,11 +1,16 @@
-// Start screen, shown before the game boots: PLAY, SETTINGS, QUIT, game-files status at the lower left. Nothing of
-// the game ships with Savage Wind: on first launch the user picks the folder with their own extracted game files
-// (exefs/ and romfs/), we check the main module is an NSO, copy the files, build the game's data image and recompile
-// the game code; PLAY stays disabled until that worked.
-//
-// Skipped with --play, SAVAGEWIND_NO_LAUNCHER=1, or any scripted test run (SAVAGEWIND_INPUT): tests boot straight in.
-// The in-game menu's "Title screen" comes back here without leaving the process (runtime/main.c reboots the game).
+// Start screen, shown before the game boots, in two modes (runtime/main.c picks):
+// - setup: a plain start whose game files aren't set up yet (or whose game code was built for another version of
+//   Savage Wind). Only the game files page: nothing of the game ships with Savage Wind, so the user picks the folder
+//   with their own extracted game files (exefs/ and romfs/), we check the main module is an NSO of version 1.8.2,
+//   copy the files, build the game's data image and recompile the game code - then the game starts.
+// - configuration ("Savage Wind Configuration", --config): PLAY, SETTINGS, GAME FILES (set up, set up again,
+//   delete), QUIT, the game-files status at the lower left.
+// Once the game files are ready a plain start goes straight into the game. Skipped with --play,
+// SAVAGEWIND_NO_LAUNCHER=1, or any scripted test run (SAVAGEWIND_INPUT): tests boot straight in. Quit to Start Screen
+// in game comes back here, to the configuration screen, without leaving the process (runtime/main.c reboots the game).
+// The background: runtime/ui/splash.mm.
 #ifdef __APPLE__
+#import <AppKit/NSEvent.h>
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
 #endif
@@ -25,6 +30,7 @@
 #include "imgui_internal.h"  // (SetKeyOwner)
 #include "option_rows.h"
 #include "osk.h"
+#include "splash.h"
 #ifdef __APPLE__
 #include "imgui_impl_metal.h"
 #else
@@ -84,7 +90,8 @@ static void save_png(id<MTLTexture> tex, const char *path) {
 #endif
 
 // The version this build is (also names the release files; Makefile / tools/bundle_macos.sh / make_dmg.sh read it).
-#define SAVAGEWIND_VERSION "0.1.0-alpha.1"
+#define SAVAGEWIND_VERSION "0.2.0-alpha.2"
+extern "C" const char *rt_version(void) { return SAVAGEWIND_VERSION; }  // (the title screen's version line: fs.c)
 
 // ------------------------------------------------------------------ game files
 static std::string g_root;  // extracted game: <root>/exefs, <root>/romfs
@@ -137,9 +144,20 @@ static std::string check_copied_files(const std::string &root) {
 // "" = ready to play, else what is wrong
 static std::string check_game_files(const std::string &root) {
     std::string why = check_copied_files(root);
-    if (why.empty() && !gamelib_present(root.c_str())) return "Game code not built yet";
+    if (why.empty() && !gamelib_present(root.c_str()))  // (a library with another id: an update of Savage Wind)
+        return file_exists(root + "/" GAMELIB_NAME) ? "Game code built for another version" : "Game code not built yet";
     return why;
 }
+
+// (runtime/main.c) a plain start goes straight into the game when this is true
+extern "C" bool launcher_game_ready(const char *root) { return check_game_files(root).empty(); }
+
+#ifdef __APPLE__
+// (runtime/main.c) macOS: Option held while the app opens asks for the configuration screen - what "Savage Wind
+// Configuration.exe" is on Windows and the desktop entry's action on Linux. The Mac way (as Photos or Steam ask for
+// their library with it), and no second app to install.
+extern "C" bool launcher_config_key_held(void) { return (NSEvent.modifierFlags & NSEventModifierFlagOption) != 0; }
+#endif
 
 // ------------------------------------------------------------------ setup (background thread)
 // The player brings their own game files: a folder holding exefs/ and romfs/. They're copied into the data root (APFS
@@ -177,6 +195,21 @@ static void set_failure(int k) {
         "Savage Wind needs the game updated to version 1.8.2: the 1.8.2 ExeFS and the RomFS with the update merged "
         "in. Update the game on your console, extract it again and choose that folder."};
     if (k >= 1 && k <= 7) set_job(head[k], true, hint[k]);
+}
+
+// What keeps the game from starting, said on the game files page as a setup failure is (nothing when there are simply
+// no game files yet: the page is the welcome then)
+static void explain_status(const std::string &st) {
+    if (st.empty() || st == "No game files") return;
+    if (st == "Game code built for another version")
+        set_job("The game code was built for another version of Savage Wind", true,
+                "Savage Wind was updated: choose Set up game files to build the game code again from your copy of the "
+                "game. This takes a few minutes.");
+    else if (st == "Game code not built yet")
+        set_job("The game code isn't built yet", true,
+                "Choose Set up game files to build it from your copy of the game. This takes a few minutes.");
+    else set_failure(st.find("NSO") != std::string::npos ? FAIL_VERSION
+                     : st.find("1.8.2") != std::string::npos ? FAIL_NOT_182 : FAIL_MISSING);
 }
 
 // exefs: the folder with main and main.npdm; romfs: a folder named romfs (the game's data root). Found in the picked
@@ -383,8 +416,8 @@ extern int g_tab_request_ext;
 extern "C" void menu_apply_window_requests(void *sdl_window);
 static float g_menu_gap = 0.35f;  // space under each item, in line heights
 
-// The first PLAY ever (settings.menu_tip_seen): a note on opening the Savage Wind menu in game (it isn't obvious),
-// OK starts the game. Returns true once OK is pressed.
+// The first PLAY ever (settings.menu_tip_seen): a note on where the settings are in game (the game's own Options
+// screen, runtime/ui/game_options.mm), OK starts the game. Returns true once OK is pressed.
 static bool g_tip_test;  // (SAVAGEWIND_LAUNCHER_SHOT=<frame>:tip)
 static bool menu_tip(float s) {
     bool go = false;
@@ -400,15 +433,11 @@ static bool menu_tip(float s) {
     ImGui::PopStyleVar(2);
     if (open) {
         ImGui::SetWindowFontScale(1.25f);
-        // the controller's home button first (what players reach for: the PS button on a DualSense), the combo second
-        static const char *const home[] = {"Home button", "Xbox button", "PlayStation button"};  // (bind_label_family)
-        static const char *const pad[] = {"Minus + Plus", "View + Menu", "Create + Options"};
         ImGui::PushTextWrapPos(0);
-        ImGui::TextUnformatted(tr("Savage Wind has its own menu for video, audio and controls settings."));
+        ImGui::TextUnformatted(tr("Savage Wind's video, audio and controls settings are in the game's own Options."));
         ImGui::Spacing();
-        int fam = bind_label_family() % 3;
-        ImGui::Text(tr("Open it in game with F1 or Esc, or on a controller with the %s (or %s together)."), tr(home[fam]),
-                    tr(pad[fam]));
+        ImGui::TextUnformatted(tr("Open them from the title screen, or pause the game and choose System > Options. "
+                                  "Esc frees the mouse cursor."));
         ImGui::PopTextWrapPos();
         ImGui::Dummy(ImVec2(0, 14 * s));
         ImGui::SetCursorPosX((ImGui::GetWindowWidth() - 180 * s) * 0.5f);
@@ -674,24 +703,33 @@ static void launcher_fonts(void) {
     io.Fonts->Clear();
     g_fonts_lang = ui_lang_generation();
     g_font_small = g_font_menu = g_font_title = NULL;
-    // Baloo 2 SemiBold (OFL, shipped: third_party/fonts/Baloo2) - rounded, game-like; it runs small, hence the sizes
-    char baloo[1024];
-    std::string own = rt_resource("Baloo2-SemiBold.ttf", "third_party/fonts/Baloo2/Baloo2-SemiBold.ttf", baloo, sizeof baloo) ? baloo : "";
-    const char *fonts[] = {getenv("SAVAGEWIND_LAUNCHER_FONT") ? getenv("SAVAGEWIND_LAUNCHER_FONT") : "",  // (test)
-                           own.c_str(), "fonts/nintendo_udsgr_std_003.ttf", "/System/Library/Fonts/Avenir Next.ttc",
-                           "/System/Library/Fonts/Helvetica.ttc", "C:/Windows/Fonts/segoeui.ttf"};
-    static const ImWchar ranges[] = {0x20, 0xFF, 0x2039, 0x203A, 0x2192, 0x2192, 0x2713, 0x2713, 0x25B8, 0x25B8, 0};  // + ‹ › → ✓ ▸
-    auto add = [&](const char *p, float size) {
-        ImFont *f = io.Fonts->AddFontFromFileTTF(p, size, NULL, ranges);
+    // Fira Sans (OFL, shipped: third_party/fonts/FiraSans) - a clean humanist sans, like the game's own menu text:
+    // SemiBold for the title and the menu, Medium for the rest. It has Cyrillic too (Russian menus).
+    char semi[1024], med[1024];
+    std::string own = rt_resource("FiraSans-SemiBold.ttf", "third_party/fonts/FiraSans/FiraSans-SemiBold.ttf", semi,
+                                  sizeof semi) ? semi : "";
+    std::string own_small = rt_resource("FiraSans-Medium.ttf", "third_party/fonts/FiraSans/FiraSans-Medium.ttf", med,
+                                        sizeof med) ? med : own;
+    const char *test = getenv("SAVAGEWIND_LAUNCHER_FONT");  // (test) another typeface, for both
+    const char *fonts[] = {test ? test : "", own.c_str(), "fonts/nintendo_udsgr_std_003.ttf",
+                           "/System/Library/Fonts/Avenir Next.ttc", "/System/Library/Fonts/Helvetica.ttc",
+                           "C:/Windows/Fonts/segoeui.ttf"};
+    static const ImWchar latin[] = {0x20, 0xFF, 0x2039, 0x203A, 0x2192, 0x2192, 0x2713, 0x2713, 0x25B8, 0x25B8, 0};  // + ‹ › → ✓ ▸
+    static const ImWchar cyrillic[] = {0x20, 0xFF, 0x400, 0x4FF, 0x2039, 0x203A, 0x2192, 0x2192, 0x2713, 0x2713, 0x25B8,
+                                       0x25B8, 0};
+    const ImWchar *ranges = !strcmp(ui_lang(), "ru") ? cyrillic : latin;
+    auto add = [&](const char *p, float size, const ImWchar *r) {
+        ImFont *f = io.Fonts->AddFontFromFileTTF(p, size, NULL, r);
         if (f) ui_merge_fallback_font(io.Fonts, size, NULL);
         return f;
     };
     for (const char *p : fonts) {
         if (g_font_menu || !*p || !file_exists(p)) continue;
-        bool b2 = p == own.c_str() || getenv("SAVAGEWIND_LAUNCHER_FONT");
-        g_font_small = add(p, 30 * (b2 ? 1.75f : 1));
-        g_font_menu = add(p, 52 * (b2 ? 1.85f : 1));
-        g_font_title = add(p, 92 * (b2 ? 2.3f : 1));
+        // (Fira's capitals are taller for its size than the system fonts': its sizes match theirs on screen)
+        bool fira = p == own.c_str() && !test;
+        g_font_small = add(fira ? own_small.c_str() : p, 30 * (fira ? 1.3f : 1), ranges);
+        g_font_menu = add(p, 52 * (fira ? 1.3f : 1), ranges);
+        g_font_title = add(p, 92 * (fira ? 1.6f : 1), latin);
     }
     if (!g_font_menu) g_font_small = g_font_menu = g_font_title = io.Fonts->AddFontDefault();
 }
@@ -707,12 +745,16 @@ static void launcher_fonts_follow_language(void) {
 #endif
 }
 
-// Returns when PLAY is chosen; QUIT exits.
-extern "C" void launcher_run(const char *root) {
+// mode (runtime/main.c): 0 setup - the game files page alone, the game starts once they're ready; 1 configuration.
+// Returns when the game is to start; QUIT (and closing the setup page) exits.
+static bool g_setup_only;
+extern "C" void launcher_run(const char *root, int mode) {
     g_root = root;
+    g_setup_only = mode == 0;
     ui_window_init();
     SDL_Window *win = ui_window();
     g_launcher_win = win;
+    SDL_SetWindowTitle(win, g_setup_only ? "Savage Wind" : "Savage Wind Configuration");
 #ifdef __APPLE__
     CAMetalLayer *layer = (__bridge CAMetalLayer *)ui_metal_layer();
     id<MTLDevice> dev = (__bridge id<MTLDevice>)ui_metal_device();
@@ -745,10 +787,14 @@ extern "C" void launcher_run(const char *root) {
     ImGui_ImplSDL3_SetGamepadMode(ImGui_ImplSDL3_GamepadMode_Manual, NULL, 0);  // (controllers: launcher_pad_event)
     launcher_pad_open_all();
     io.BackendFlags |= ImGuiBackendFlags_HasGamepad;
+    splash_load();
 
     std::string status = check_game_files(g_root);
-    Page page = status.empty() ? MAIN : SETUP;
+    Page page = status.empty() && !g_setup_only ? MAIN : SETUP;
+    set_job("");  // (an earlier visit's result)
+    explain_status(status);
     bool play = false;
+    bool tip_then_play = false;  // (setup mode: the game files just got ready; the first-start note, then the game)
     // SAVAGEWIND_LAUNCHER_SHOT=<frame>[:<page>] (test): save build/launcher.png at that frame and exit; page: settings[:<tab>] / askdelete / setup
     long shot_at = getenv("SAVAGEWIND_LAUNCHER_SHOT") ? atol(getenv("SAVAGEWIND_LAUNCHER_SHOT")) : 0, frame = 0;
     if (shot_at) {
@@ -810,7 +856,10 @@ extern "C" void launcher_run(const char *root) {
         static bool was_busy;
         if (was_busy && !busy) {
             status = check_game_files(g_root);
-            if (status.empty()) page = MAIN;
+            if (status.empty() && g_setup_only) {  // set up: on into the game (after the first-start note)
+                if (g_settings.menu_tip_seen) play = true;
+                else tip_then_play = true;
+            } else if (status.empty()) page = MAIN;
         }
         was_busy = busy;
 
@@ -848,8 +897,7 @@ extern "C" void launcher_run(const char *root) {
             float s = ds.y / 720.0f;  // layout scale (fonts are built for ~2x)
             ImGui::GetIO().FontGlobalScale = s * 0.5f;
             ImDrawList *bg = ImGui::GetBackgroundDrawList();
-            bg->AddRectFilledMultiColor(ImVec2(0, 0), ds, IM_COL32(18, 34, 40, 255), IM_COL32(40, 70, 64, 255),
-                                        IM_COL32(12, 20, 24, 255), IM_COL32(8, 12, 16, 255));
+            splash_draw(bg, ds, (float)ImGui::GetTime());  // (the player's picture, or Savage Wind's own art)
             {  // a shadow banner fading in from the left behind the menu, and one from the right behind the version
                 const float stops[][2] = {{0.0f, 225}, {0.3f, 215}, {0.44f, 165}, {0.55f, 95}, {0.64f, 35}, {0.74f, 0}};
                 for (int i = 0; i + 1 < (int)(sizeof stops / sizeof stops[0]); i++) {
@@ -878,7 +926,15 @@ extern "C" void launcher_run(const char *root) {
                 ImVec2 p = ImGui::GetCursorScreenPos();
                 text_fx(ImGui::GetWindowDrawList(), ImGui::GetFont(), ImGui::GetFontSize(), p, IM_COL32(255, 232, 120, 255),
                         IM_COL32(255, 138, 48, 255), t, 3 * s);
-                ImGui::Dummy(ImGui::CalcTextSize(t));
+                ImVec2 ts = ImGui::CalcTextSize(t);
+                ImGui::Dummy(ts);
+                // and what this screen is, under it in the ice blue of the art
+                std::string sub = tr_upper(tr("Configuration"));
+                ImGui::PushFont(g_font_small);
+                ImVec2 sp(p.x + 6 * s, p.y + ts.y * 0.98f);
+                text_fx(ImGui::GetWindowDrawList(), ImGui::GetFont(), ImGui::GetFontSize() * 1.15f, sp,
+                        IM_COL32(205, 232, 250, 255), IM_COL32(150, 200, 235, 255), sub.c_str(), 1.5f * s);
+                ImGui::PopFont();
             }
             ImGui::PopFont();
             ImGui::SetCursorPos(ImVec2(x0, 285 * s));
@@ -917,8 +973,6 @@ extern "C" void launcher_run(const char *root) {
                     if (!g_settings.menu_tip_seen) ImGui::OpenPopup("##menutip");
                     else play = true;
                 }
-                if (g_tip_test) ImGui::OpenPopup("##menutip"), g_tip_test = false;
-                if (menu_tip(s)) play = true;
                 ImGui::SetCursorPosX(x0);
                 if (g_refocus == SETTINGS) ImGui::SetKeyboardFocusHere(), g_refocus = MAIN;  // (back from Settings: it
                 if (menu_item("SETTINGS", true)) {                                             //  stays selected)
@@ -927,11 +981,9 @@ extern "C" void launcher_run(const char *root) {
                     opened = true;
                     page = SETTINGS;
                 }
-                if (!status.empty() || busy) {  // (once set up, the game files are kept up in Settings > Prelaunch)
-                    ImGui::SetCursorPosX(x0);
-                    if (g_refocus == SETUP) ImGui::SetKeyboardFocusHere(), g_refocus = MAIN;
-                    if (menu_item("SET UP GAME FILES", !busy)) page = SETUP;
-                }
+                ImGui::SetCursorPosX(x0);  // (set up, set up again, delete: the game files page)
+                if (g_refocus == SETUP) ImGui::SetKeyboardFocusHere(), g_refocus = MAIN;
+                if (menu_item(status.empty() ? "GAME FILES" : "SET UP GAME FILES", !busy)) page = SETUP;
                 ImGui::SetCursorPosX(x0);
                 if (menu_item("QUIT", true)) exit(0);
                 g_menu_gap = 0.35f;
@@ -985,24 +1037,26 @@ extern "C" void launcher_run(const char *root) {
                 }
             } else {
                 // SETUP: the game files, in a window like Settings (option rows: runtime/ui/option_rows.h) - choose the
-                // folder with the game files, set up; once set up, delete. Each row's explanation on the right.
-                float sc = ds.y / 1080.0f, w = fminf(ds.x * 0.9f, 1500 * sc), h = ds.y - 2 * 18 * sc;
+                // folder with the game files, set up; once set up, delete or set up again. Each row's explanation on
+                // the right. A card on the left: the background shows beside it. The first start's is the welcome.
+                float sc = ds.y / 1080.0f, w = fminf(ds.x * 0.66f, 1320 * sc), h = fminf(ds.y - 2 * 18 * sc, 640 * sc);
                 ImGui::GetWindowDrawList()->AddRectFilled(ImGui::GetWindowPos(), ImVec2(ImGui::GetWindowPos().x + ds.x,
-                                                          ImGui::GetWindowPos().y + ds.y), IM_COL32(0, 0, 0, 110));
+                                                          ImGui::GetWindowPos().y + ds.y), IM_COL32(0, 0, 0, 50));
                 ImVec2 wp = ImGui::GetWindowPos();
-                ImGui::SetCursorScreenPos(ImVec2(wp.x + (ds.x - w) * 0.5f, wp.y + (ds.y - h) * 0.5f));
-                ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.06f, 0.09f, 0.08f, 0.96f));
+                ImGui::SetCursorScreenPos(ImVec2(wp.x + fmaxf(18 * sc, fminf(ds.x * 0.05f, x0)), wp.y + (ds.y - h) * 0.5f));
+                ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.05f, 0.08f, 0.10f, 0.93f));
                 ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 14 * sc);
                 ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(28 * sc, 24 * sc));
                 ImGui::BeginChild("##setup", ImVec2(w, h), ImGuiChildFlags_AlwaysUseWindowPadding, ImGuiWindowFlags_NavFlattened);
                 ImGui::PopStyleVar(2);
                 ImGui::PopStyleColor();
+                bool welcome = g_setup_only && status == "No game files";
                 ImGui::PushFont(g_font_small);
                 ImGui::PushFont(g_font_menu);
-                ImGui::TextColored(ImVec4(0.93f, 0.76f, 0.33f, 1), "%s", tr("Game Files"));
+                ImGui::TextColored(ImVec4(0.93f, 0.76f, 0.33f, 1), "%s", tr(welcome ? "Welcome to Savage Wind" : "Game Files"));
                 ImGui::PopFont();
                 bool back = false;
-                if (!busy) {  // close: the drawn X in the corner, as Settings (B / Esc too)
+                if (!busy) {  // close: the drawn X in the corner, as Settings (B / Esc too; setup mode: the X quits)
                     float bx = 44 * sc;
                     ImGui::SameLine(ImGui::GetWindowWidth() - ImGui::GetStyle().WindowPadding.x - bx);
                     ImVec2 p = ImGui::GetCursorScreenPos();
@@ -1018,12 +1072,20 @@ extern "C" void launcher_run(const char *root) {
                     dl->AddLine(ImVec2(p.x + bx - m, p.y + m), ImVec2(p.x + m, p.y + bx - m), col, t);
                 }
                 ImGui::Spacing();
+                if (welcome && !busy) {  // what this is about, the first time
+                    ImGui::PushTextWrapPos(0);
+                    ImGui::TextColored(ImVec4(0.86f, 0.85f, 0.80f, 1), "%s",
+                                       tr("Savage Wind needs your own copy of the game, version 1.8.2. Choose the folder "
+                                          "with its extracted files and set them up: the game starts when it's done."));
+                    ImGui::PopTextWrapPos();
+                    ImGui::Dummy(ImVec2(0, 10 * sc));
+                }
 
                 pthread_mutex_lock(&g_lock);
                 std::string src = g_src, job = g_job, job_hint = g_job_hint;
                 bool failed = g_job_failed;
                 pthread_mutex_unlock(&g_lock);
-                bool ready = status.empty() && !busy;  // (set up: the window offers to delete them)
+                bool ready = status.empty() && !busy;  // (set up: the window offers to delete them, or set them up again)
                 static double files_gb = -1;
                 // chosen: "Selected" with a green check (long paths ran over the label); the path is in the
                 // explanation, and choosing again opens the picker again
@@ -1047,6 +1109,9 @@ extern "C" void launcher_run(const char *root) {
                                       "needs to be done once and may take a while. Your own files aren't changed.");
                 if (!job.empty())
                     ex_d += std::string("\n\n") + tr(job.c_str()) + (job_hint.empty() ? "" : std::string(".\n") + tr(job_hint.c_str()));
+                std::string again_d = tr("Sets the game files up again from the folder chosen above, in place of Savage Wind's "
+                                         "copy. With no folder chosen, builds the game code again from Savage Wind's copy. "
+                                         "Saves and settings are kept.");
 
                 // the controller's cursor starts on the first row (not the X), a few frames while the window lays out
                 static int seen_frame = -10, focus_first;  // (not drawn last frame: the window has just opened)
@@ -1056,25 +1121,7 @@ extern "C" void launcher_run(const char *root) {
                     if (focus_first > 0 && focus_first--) ImGui::SetFocusID(ImGui::GetItemID(), ImGui::GetCurrentWindow());
                 };
                 opt_begin("##files", sc);
-                if (!ready) {
-                    opt_section("Your copy of the game");
-                    if (busy) opt_disable_next();
-                    if (opt_action("Game files folder", src_v.c_str(), src_d.c_str(), true))
-                        SDL_ShowOpenFolderDialog(picked, NULL, win, NULL, false);
-                    check_left_of_value(src_v);
-                    first_row();
-                    opt_section("Set up");
-                    if (busy || (src.empty() && !check_copied_files(g_root).empty())) opt_disable_next();
-                    if (opt_action("Set up game files", busy ? tr("Working...") : "", ex_d.c_str(), true)) {
-                        pthread_mutex_lock(&g_lock);
-                        g_busy = true;
-                        pthread_mutex_unlock(&g_lock);
-                        pthread_t t;
-                        pthread_create(&t, NULL, extract_thread, NULL);
-                        pthread_detach(t);
-                    }
-                    files_gb = -1;  // (re-measured after a setup)
-                } else {
+                if (ready && !g_setup_only) {
                     // DELETE: frees Savage Wind's copy (runtime/paths.c removes only what the setup made, only inside
                     // the data root). Saves, settings and the user's own files stay.
                     if (files_gb < 0) files_gb = rt_game_files_size(g_root.c_str()) / 1e9;
@@ -1099,6 +1146,28 @@ extern "C" void launcher_run(const char *root) {
                         if (opt_action("Cancel", "", "Keeps the game files.", true)) g_confirm_delete = false;
                     }
                 }
+                if (!ready || !g_confirm_delete) {  // choose the folder, set up (again: from it, or the game code alone)
+                    opt_section(!ready ? "Your copy of the game" : "Set up again");
+                    if (busy) opt_disable_next();
+                    if (opt_action("Game files folder", src_v.c_str(), src_d.c_str(), true))
+                        SDL_ShowOpenFolderDialog(picked, NULL, win, NULL, false);
+                    check_left_of_value(src_v);
+                    if (!ready) {
+                        first_row();
+                        opt_section("Set up");
+                    }
+                    if (busy || (src.empty() && !check_copied_files(g_root).empty())) opt_disable_next();
+                    if (opt_action("Set up game files", busy ? tr("Working...") : "", ready ? again_d.c_str() : ex_d.c_str(),
+                                   true)) {
+                        pthread_mutex_lock(&g_lock);
+                        g_busy = true;
+                        pthread_mutex_unlock(&g_lock);
+                        pthread_t t;
+                        pthread_create(&t, NULL, extract_thread, NULL);
+                        pthread_detach(t);
+                    }
+                    if (!ready) files_gb = -1;  // (re-measured after a setup)
+                }
                 if (!job_line.empty()) {  // the current step / result
                     ImGui::Dummy(ImVec2(0, 14 * sc));
                     ImGui::PushTextWrapPos(0);
@@ -1108,17 +1177,30 @@ extern "C" void launcher_run(const char *root) {
                         ImGui::TextColored(ImVec4(0.86f, 0.85f, 0.80f, 1), "%s", tr(job_hint.c_str()));
                     ImGui::PopTextWrapPos();
                 }
+                if (g_setup_only && !busy) {  // where the rest is, later
+                    ImGui::Dummy(ImVec2(0, 14 * sc));
+                    ImGui::PushTextWrapPos(0);
+#ifdef _WIN32
+                    ImGui::TextDisabled("%s", tr("To change settings or the game files later, open Savage Wind Configuration."));
+#elif defined(__APPLE__)
+                    ImGui::TextDisabled("%s", tr("To change settings or the game files later, hold Option while you open Savage Wind."));
+#else
+                    ImGui::TextDisabled("%s", tr("To change settings or the game files later, start Savage Wind with --config."));
+#endif
+                    ImGui::PopTextWrapPos();
+                }
                 opt_end();
                 if (g_confirm_delete && (ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false) ||
                                          ImGui::IsKeyPressed(ImGuiKey_Escape, false)))
                     g_confirm_delete = false;  // (B / Esc: back out of the question first)
-                else if (!busy && !typing && (ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false) ||
-                                              ImGui::IsKeyPressed(ImGuiKey_Escape, false)))
-                    back = true;
+                else if (!busy && !typing && !g_setup_only && (ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false) ||
+                                                               ImGui::IsKeyPressed(ImGuiKey_Escape, false)))
+                    back = true;  // (setup mode has nothing to go back to: only its X closes it)
                 ImGui::PopFont();
                 ImGui::EndChild();
                 if (back && !busy) {
                     settings_save();
+                    if (g_setup_only) exit(0);
                     g_confirm_delete = false;
                     page = MAIN, g_refocus = SETUP;
                 }
@@ -1161,9 +1243,16 @@ extern "C" void launcher_run(const char *root) {
                 }
             }
 
-            // status (lower left) and version (lower right) - not under the Settings / Game Files windows
-            if (page == MAIN) {
+            // the first start's note on where the settings are: after PLAY, or in setup mode once the game files are
+            // ready; OK starts the game
+            if (g_tip_test) ImGui::OpenPopup("##menutip"), g_tip_test = false;
+            if (tip_then_play) ImGui::OpenPopup("##menutip"), tip_then_play = false;
+            if (menu_tip(s)) play = true;
+
+            // status (lower left, main page) and version (lower right) - not under the Settings window
+            if (page != SETTINGS) {
             ImGui::PushFont(g_font_small);
+            if (page == MAIN) {
             ImGui::SetCursorPos(ImVec2(x0, ds.y - 118 * s));
             static std::string main_id;  // (read again after the game files change)
             if (!status.empty()) main_id.clear();
@@ -1189,6 +1278,7 @@ extern "C" void launcher_run(const char *root) {
                 const char *b = strrchr(f, '/');
                 ImGui::GetWindowDrawList()->AddText(ImVec2(ImGui::GetWindowPos().x + 20 * s, ImGui::GetWindowPos().y + 16 * s),
                                                     IM_COL32(255, 255, 255, 255), b ? b + 1 : f);
+            }
             }
             {  // version (lower right), under a shadow banner from the right
                 ImDrawList *dl = ImGui::GetWindowDrawList();
@@ -1240,6 +1330,8 @@ extern "C" void launcher_run(const char *root) {
     }
     // play: hand the window to the game
     settings_save();
+    SDL_SetWindowTitle(win, "Savage Wind");
+    splash_unload();
 #ifdef __APPLE__
     ImGui_ImplMetal_Shutdown();
 #else

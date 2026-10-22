@@ -33,9 +33,15 @@ typedef struct NvnTexture {
     int backend_slot;  // (Vulkan backend) slot in textures.c's list of textures holding an image, + 1
     uint64_t debug_id;
     bool finalized;  // nvnTextureFinalize ran (the object stays: pool entries and copies may still name it)
+    uint32_t cpu_levels;  // levels nvnTextureWriteTexels filled since the renderer last uploaded them (bit per level)
     char label[64];
 } NvnTexture;
 NvnTexture *nvn_texture_host(uint64_t guest);  // (objects.c) the host texture a guest NVNtexture holds now, or NULL
+
+// Pitch (row-major, the builder's stride) storage instead of block-linear: NVN_TEXTURE_FLAGS_LINEAR (0x10) and
+// NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET (0x40). BOTW's terrain height tiles are 256x256 R16 linear render targets
+// the CPU fills row by row.
+static inline bool nvn_texture_flags_pitch(uint32_t flags) { return (flags & (0x10 | 0x40)) != 0; }
 
 typedef struct {
     uint32_t min_filter, mag_filter, wrap[3], compare_mode, compare_func, reduction;
@@ -90,6 +96,8 @@ typedef struct NvnWindow {
 typedef struct NvnSync {
     volatile int signaled;
     volatile uint64_t seq;  // GPU submission this fence belongs to (renderer_fence_seq), 0 = none
+    uint64_t ticket;        // (objects.c submission queue) the queued nvnQueueFenceSync that sets seq, 0 = none
+    volatile int in_list;   // a command list fences it (nvnCommandBufferFenceSync, set when it is recorded)
 } NvnSync;
 
 // ---- command recording (runtime/nvn/cmdbuf.c: records in host memory, accounted to guest command memory)
@@ -130,6 +138,7 @@ enum {
     CMD_COPY_TEXTURE_TO_TEXTURE, CMD_DOWNSAMPLE, CMD_UPDATE_UNIFORM_BUFFER, CMD_FENCE_SYNC, CMD_WAIT_SYNC,
     CMD_BARRIER, CMD_SIGNAL_EVENT, CMD_WAIT_EVENT, CMD_REPORT_COUNTER, CMD_DISCARD_COLOR,
     CMD_DISCARD_DEPTH_STENCIL, CMD_SET_COPY_STRIDES, CMD_DRAW_TEXTURE, CMD_RESOLVE_DEPTH, CMD_BIND_TEXTURES_DEFERRED,
+    CMD_SET_DEPTH_CLAMP,
     CMD_COUNT
 };
 

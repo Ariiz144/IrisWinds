@@ -421,6 +421,7 @@ typedef struct {
     bool eos_pending;
     int64_t eos_time;
     bool stopped;  // Stop / destroyed: no more events (see dec_stop)
+    bool playing;  // a started video decoder, counted in g_movie_playing
     pthread_mutex_t lock;
 } Decoder;
 
@@ -511,10 +512,15 @@ static void dec_output_format(Decoder *d, MediaData *m) {
 static void dec_get_output_format(Cpu *c) { dec_output_format(self_state(c), md(c->x[1])); c->x[0] = 0; }
 static void dec_get_output_buffer_format(Cpu *c) { dec_output_format(self_state(c), md(c->x[2])); c->x[0] = 0; }
 
+// Video decoders started and not stopped: a movie is playing. The game shows one of its pictures per frame, so the
+// frame rate is held at 30 meanwhile (runtime/hle/framepace.c).
+volatile int g_movie_playing;
+
 static void dec_start(Cpu *c) {
     Decoder *d = self_state(c);
     pthread_mutex_lock(&d->lock);
     d->stopped = false;
+    if (d->video && !d->playing) d->playing = true, __atomic_add_fetch(&g_movie_playing, 1, __ATOMIC_RELAXED);
     pthread_mutex_unlock(&d->lock);
     dec_signal(c, d, 0);  // all input buffers are free
     c->x[0] = 0;
@@ -530,6 +536,7 @@ static void dec_stop(Cpu *c) {
     static uint64_t clear_event;
     if (!clear_event) clear_event = guest_sym("_ZN2nn2os10ClearEventEPNS0_9EventTypeE");
     pthread_mutex_lock(&d->lock);
+    if (d->playing) d->playing = false, __atomic_sub_fetch(&g_movie_playing, 1, __ATOMIC_RELAXED);
     if (!d->stopped) {
         d->stopped = true;
         LOG("[movie] decoder %s stopped\n", d->video ? "video" : "audio");
@@ -770,6 +777,7 @@ RT_ON_RESET(movie_reset) {
     }
     g_ex_vt = g_dec_vt = 0;
     g_nbuf_pool = 0;  // (the HLE heap starts over)
+    g_movie_playing = 0;
     g_skip_held = false, g_skip_pressed_at = 0;
 }
 

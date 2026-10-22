@@ -66,6 +66,7 @@ typedef struct {
     uint32_t out_mask;      // vertex: output varyings; fragment: render targets written
     bool writes_depth, uses_discard, writes_point_size;
     bool uses_gmem;         // global memory access: bind the guest heap at GMEM_BUFFER_INDEX
+    bool writes_gmem;       // ... and stores to it (STG)
     bool uses_tint;         // fragment: reads the per-draw tint (buffer 19, float4[2]) applied to color target 0
     bool uses_rscale;       // reads the resolution-scale table (fragment/compute buffer 18): float4 [0] = render
                             // target scale, [1 + i] = allocation scale of texture i
@@ -89,5 +90,10 @@ extern const uint8_t *maxwell_dbg_vs;
 // code: shader binary (with the 0x50-byte SPH header for graphics stages)
 ShaderInfo *maxwell_translate(const uint8_t *code, size_t max_size, int stage, const ShaderKey *key);
 void maxwell_free(ShaderInfo *s);
+// For caching translations: the bytes of code the translation reads (header and code up to its end), an id of this
+// translator's build, and whether debugging switches make the output depend on more than binary and key.
+size_t maxwell_binary_size(const uint8_t *code, size_t max_size, int stage);
+const char *maxwell_translator_id(void);
+bool maxwell_translation_uncacheable(void);
 // Disassemble for debugging (writes text to f).
 void maxwell_disassemble(const uint8_t *code, size_t max_size, int stage, void *file);

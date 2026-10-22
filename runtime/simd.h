@@ -50,7 +50,13 @@ typedef u128 __attribute__((aligned(1), may_alias)) u128u;
 #define FPCR_DN (1u << 25)
 #define FPCR_FZ (1u << 24)
 #define FPCR_RM (3u << 22)
+// FPCR settings the fast paths below can't follow: they go through the slow ones. On x86-64 FZ isn't one of them: the
+// thread's MXCSR follows it (rt_fpcr_write, below).
+#if defined(__x86_64__)
+#define FPCR_SLOW FPCR_RM
+#else
 #define FPCR_SLOW (FPCR_FZ | FPCR_RM)
+#endif
 
 enum { FOP_ADD, FOP_SUB, FOP_MUL, FOP_MULX, FOP_NMUL, FOP_DIV, FOP_ABD, FOP_SQRT, FOP_MADD, FOP_RECPS, FOP_RSQRTS,
        FOP_MAX, FOP_MIN, FOP_MAXNM, FOP_MINNM };
@@ -224,9 +230,21 @@ SI int simd_getround(void) {
     return m[(_mm_getcsr() >> 13) & 3u];
 }
 SI void simd_setround(int fe) { _mm_setcsr((_mm_getcsr() & ~0x6000u) | simd_rc(fe) << 13); }
+// MSR FPCR. FZ (flush denormal inputs and results to signed zero) is MXCSR's DAZ (inputs) and FTZ (results) on x86-64,
+// so the FP ops keep their fast paths: BOTW 1.8.2 sets FZ at the start of its threads (main 0x7000b4de30, the thread
+// entry 0x70000c4e3c), and the software flush sent every FP op down the slow path (~40% of the main thread's time in
+// the open world). Each guest thread is a host thread of its own whose FP code is the guest's, and lifted FPCR writes
+// are the only ones (new threads start with FPCR 0 and the host's default MXCSR). The one difference: a result that
+// rounds up to the smallest normal may be kept, where ARM (tininess before rounding) flushes it.
+SI void rt_fpcr_write(Cpu *c, uint64_t v) {
+    c->fpcr = v & 0x7c00000ull;
+    unsigned m = _mm_getcsr() & ~0x8040u;  // (FTZ bit 15, DAZ bit 6)
+    _mm_setcsr(c->fpcr & FPCR_FZ ? m | 0x8040u : m);
+}
 #else
 SI int simd_getround(void) { return fegetround(); }
 SI void simd_setround(int fe) { fesetround(fe); }
+SI void rt_fpcr_write(Cpu *c, uint64_t v) { c->fpcr = v & 0x7c00000ull; }
 #endif
 
 #define F s

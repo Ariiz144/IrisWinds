@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "../framepace.h"
 #include "../kernel.h"
 #include "../perfmon.h"
 #include "nvn.h"
@@ -128,28 +129,214 @@ NVN(nvnQueueGetTotalCommandMemoryUsed) { RET(0); }
 NVN(nvnQueueGetTotalControlMemoryUsed) { RET(0); }
 NVN(nvnQueueGetTotalComputeMemoryUsed) { RET(0); }
 NVN(nvnQueueResetMemoryUsageCounts) { (void)c; }
+// The backend's work (submits, presents, GPU waits) lets the thread's core go (kernel_host_work_begin).
+// SAVAGEWIND_HOST_WORK_CORE=1: keep holding it (as before).
+static bool host_work(void) {
+    static int on = -1;
+    if (on < 0) on = !getenv("SAVAGEWIND_HOST_WORK_CORE");
+    return on;
+}
+// SAVAGEWIND_TIMELINE=<first frame>:<frames>: "[tl]" lines (ms, guest thread, event) for submits, fences, GPU
+// waits and presents of those presented frames: who waits for whom within a frame.
+uint64_t renderer_present_count(void);
+uint64_t vk_completed_seq(void);
+uint64_t renderer_fence_seq(void);
+bool nvn_timeline(void) {
+    static int64_t from = -2, count;
+    if (from == -2) {
+        const char *e = getenv("SAVAGEWIND_TIMELINE");
+        from = -1;
+        if (e) { from = atoll(e); const char *c = strchr(e, ':'); count = c ? atoll(c + 1) : 60; }
+    }
+    if (from < 0) return false;
+    uint64_t f = renderer_present_count();
+    return f >= (uint64_t)from && f < (uint64_t)(from + count);
+}
+#define TL(fmt, ...) do { if (nvn_timeline()) LOG("[tl] %.3f %x " fmt "\n", plat_now_ns() / 1e6, kernel_current_thread_handle(), ##__VA_ARGS__); } while (0)
+
+// ---- the submission queue
+// On the console a submit hands the GPU its commands and returns; the GPU runs them while the CPU goes on with the next
+// frame. Here the commands are translated to Vulkan on the CPU first (~10 ms a frame in the open world), and BOTW 1.8.2
+// submits the frame's command list on its render thread (main 0x7000d81158), presents, and only then lets the main
+// thread record the next frame: the translation sat on every frame's critical path. So submits, queue fences, presents
+// and texture / sync finalizes go, in their order, to one host thread that runs them, and the guest goes on at once. It
+// waits where it would wait for the GPU on the console (nvnSyncWait, nvnQueueFinish): for the queue to get past the
+// fence, then for the GPU. The commands read guest memory when they run, as the GPU reads it when it gets to them: the
+// game fences its CPU writes to memory in use (as it must on the console).
+// At most QUEUE_AHEAD presents wait in the queue (SAVAGEWIND_QUEUE_AHEAD, default 1): a guest further ahead waits.
+// SAVAGEWIND_ASYNC_EXEC=0: everything runs on the calling thread (as before).
+enum { QOP_EXEC, QOP_FENCE, QOP_PRESENT, QOP_TEXTURE_FINALIZE, QOP_SYNC_FREE };
+typedef struct { int op; uint64_t a; void *p; } QOp;
+#define QCAP 4096
+static QOp g_q[QCAP];
+static uint64_t g_q_done, g_q_put;  // operations run / queued (operation k, from 1, is done once g_q_done >= k)
+static int g_q_presents, g_q_ahead = 1;
+static pthread_mutex_t g_q_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_q_work = PTHREAD_COND_INITIALIZER, g_q_progress = PTHREAD_COND_INITIALIZER;
+
+static bool async_exec(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("SAVAGEWIND_ASYNC_EXEC");
+        on = !e || atoi(e) != 0;
+        if (getenv("SAVAGEWIND_QUEUE_AHEAD")) g_q_ahead = atoi(getenv("SAVAGEWIND_QUEUE_AHEAD")) > 0 ? atoi(getenv("SAVAGEWIND_QUEUE_AHEAD")) : 1;
+        LOG("[nvn] command lists run %s\n", on ? "on the submission thread" : "on the submitting thread");
+    }
+    return on;
+}
+
+// SAVAGEWIND_FRAME_LOG=2: an "[fsplit]" line per present with when each step of the frame happened, in ms before the
+// present ends: the main thread's VFR update and its GPU wait (nvnSyncWait), the submit, the list's translation, the
+// present's turn (cheap enough to leave the timing alone, unlike SAVAGEWIND_TIMELINE)
+uint64_t g_fs_vfr, g_fs_sync0, g_fs_sync1, g_fs_submit, g_fs_x0, g_fs_x1, g_fs_pace;
+static int frame_split(void) {
+    static int on = -1;
+    if (on < 0) on = getenv("SAVAGEWIND_FRAME_LOG") && atoi(getenv("SAVAGEWIND_FRAME_LOG")) == 2;
+    return on;
+}
+static void frame_split_log(void) {
+    uint64_t now = plat_now_ns();
+    #define FS(t) ((t) ? ((double)now - (double)(t)) / 1e6 : -1.0)
+    LOG("[fsplit] %.3f vfr %.1f sync %.1f-%.1f submit %.1f exec %.1f-%.1f pace %.1f\n", now / 1e6, FS(g_fs_vfr),
+        FS(g_fs_sync0), FS(g_fs_sync1), FS(g_fs_submit), FS(g_fs_x0), FS(g_fs_x1), FS(g_fs_pace));
+    #undef FS
+}
+
+static void qop_run(const QOp *o) {
+    switch (o->op) {
+    case QOP_EXEC:
+        if (frame_split()) g_fs_x0 = plat_now_ns();
+        backend_execute(o->a);
+        if (frame_split()) g_fs_x1 = plat_now_ns();
+        break;
+    case QOP_FENCE: { NvnSync *s = o->p; s->seq = renderer_fence_seq(); s->signaled = 1; break; }
+    case QOP_PRESENT:
+        backend_present(o->p);
+        if (frame_split()) frame_split_log();
+        break;
+    case QOP_TEXTURE_FINALIZE: backend_texture_destroyed(o->p); ((NvnTexture *)o->p)->finalized = true; break;
+    case QOP_SYNC_FREE: free(o->p); break;
+    }
+}
+
+static void *queue_thread(void *arg) {
+    (void)arg;
+    kernel_sample_host_thread();
+    pthread_mutex_lock(&g_q_lock);
+    for (;;) {
+        while (g_q_done == g_q_put) pthread_cond_wait(&g_q_work, &g_q_lock);
+        QOp o = g_q[g_q_done % QCAP];
+        pthread_mutex_unlock(&g_q_lock);
+        if (o.op == QOP_EXEC) TL("queue: exec %llx", (unsigned long long)o.a);
+        qop_run(&o);
+        if (o.op == QOP_EXEC || o.op == QOP_PRESENT) TL("queue: %s done", o.op == QOP_EXEC ? "exec" : "present");
+        pthread_mutex_lock(&g_q_lock);
+        g_q_done++;
+        if (o.op == QOP_PRESENT) g_q_presents--;
+        pthread_cond_broadcast(&g_q_progress);
+    }
+    return NULL;
+}
+
+// (g_q_lock held; returns with it held) until done(): the guest thread's core let go meanwhile
+static void queue_block(bool (*done)(uint64_t), uint64_t arg) {
+    while (!done(arg)) {
+        pthread_mutex_unlock(&g_q_lock);
+        kernel_host_work_begin();
+        pthread_mutex_lock(&g_q_lock);
+        while (!done(arg)) pthread_cond_wait(&g_q_progress, &g_q_lock);
+        pthread_mutex_unlock(&g_q_lock);
+        kernel_host_work_end();  // (taking the core back without the queue's lock: its holder may be queueing)
+        pthread_mutex_lock(&g_q_lock);
+    }
+}
+static bool q_reached(uint64_t k) { return g_q_done >= k; }
+static bool q_room(uint64_t present) { return g_q_put - g_q_done < QCAP && (!present || g_q_presents < g_q_ahead); }
+
+static void queue_start(void) {
+    pthread_t t;
+    pthread_create(&t, NULL, queue_thread, NULL);
+}
+static uint64_t queue_put(int op, uint64_t a, void *p) {
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    pthread_once(&once, queue_start);
+    pthread_mutex_lock(&g_q_lock);
+    queue_block(q_room, op == QOP_PRESENT);
+    g_q[g_q_put % QCAP] = (QOp){op, a, p};
+    uint64_t k = ++g_q_put;
+    if (op == QOP_PRESENT) g_q_presents++;
+    pthread_cond_signal(&g_q_work);
+    pthread_mutex_unlock(&g_q_lock);
+    return k;
+}
+
+// until the queue has run operation k (0: nothing to wait for; ~0: everything queued so far)
+static void queue_wait(uint64_t k) {
+    if (!k) return;
+    pthread_mutex_lock(&g_q_lock);
+    if (k == ~0ull) k = g_q_put;
+    queue_block(q_reached, k);
+    pthread_mutex_unlock(&g_q_lock);
+}
+void nvn_queue_idle(void) { if (async_exec()) queue_wait(~0ull); }  // (runtime/main.c reboot: guest threads stopped)
+
 NVN(nvnQueueSubmitCommands) {
     int n = (int)A(1);
     const uint64_t *handles = AP(2);
+    TL("submit %d lists (lr %llx)", n, (unsigned long long)c->x[30]);
+    if (frame_split()) g_fs_submit = plat_now_ns();
+    if (async_exec()) {
+        for (int i = 0; i < n; i++) queue_put(QOP_EXEC, handles[i], NULL);
+        return;
+    }
+    if (host_work()) kernel_host_work_begin();
     for (int i = 0; i < n; i++) backend_execute(handles[i]);
+    if (host_work()) kernel_host_work_end();
+    TL("submitted (seq %llu)", (unsigned long long)renderer_fence_seq());
 }
 NVN(nvnQueueFlush) { (void)c; }
-NVN(nvnQueueFinish) { (void)c; renderer_sync(); }
+NVN(nvnQueueFinish) {
+    (void)c;
+    if (async_exec()) queue_wait(~0ull);
+    if (host_work()) kernel_host_work_begin();
+    renderer_sync();
+    if (host_work()) kernel_host_work_end();
+}
 
-static NvnSync *sync_of(uint64_t guest) {
+static pthread_mutex_t g_sync_lock = PTHREAD_MUTEX_INITIALIZER;
+static NvnSync *sync_of(uint64_t guest) {  // (the submission thread creates one too: a list fencing a sync never initialized)
     NvnSync *s = HOST(NvnSync, guest);
+    if (s) return s;
+    pthread_mutex_lock(&g_sync_lock);
+    s = HOST(NvnSync, guest);
     if (!s) { s = calloc(1, sizeof *s); SET_HOST(guest, s); }
+    pthread_mutex_unlock(&g_sync_lock);
     return s;
 }
 uint64_t renderer_fence_seq(void);
 void renderer_wait_seq(uint64_t seq);
-NVN(nvnQueueFenceSync) { NvnSync *s = sync_of(A(1)); s->signaled = 1; s->seq = renderer_fence_seq(); }
+NVN(nvnQueueFenceSync) {
+    NvnSync *s = sync_of(A(1));
+    if (async_exec()) {
+        s->ticket = queue_put(QOP_FENCE, 0, s);
+        TL("fence %llx queued as %llu (lr %llx)", (unsigned long long)A(1), (unsigned long long)s->ticket, (unsigned long long)c->x[30]);
+        return;
+    }
+    s->signaled = 1; s->seq = renderer_fence_seq();
+    TL("fence %llx = seq %llu (lr %llx)", (unsigned long long)A(1), (unsigned long long)s->seq, (unsigned long long)c->x[30]);
+}
 void nvn_sync_set_seq(uint64_t guest, uint64_t seq) { NvnSync *s = sync_of(guest); s->signaled = 1; s->seq = seq; }
+void nvn_sync_in_list(uint64_t guest) { if (guest) sync_of(guest)->in_list = 1; }  // (cmdbuf.c: recording a list fence)
 NVN(nvnQueueWaitSync) { RET(1); }
 
 // ================================================================== sync / event
 NVN(nvnSyncInitialize) { SET_HOST(A(0), calloc(1, sizeof(NvnSync))); RET(1); }
-NVN(nvnSyncFinalize) { free(HOST(NvnSync, A(0))); SET_HOST(A(0), 0); }
+NVN(nvnSyncFinalize) {
+    NvnSync *s = HOST(NvnSync, A(0));
+    SET_HOST(A(0), 0);
+    if (s && async_exec()) queue_put(QOP_SYNC_FREE, 0, s);  // (a queued fence may still set it)
+    else free(s);
+}
 NVN(nvnSyncSetDebugLabel) { (void)c; }
 void renderer_flush(void);
 NVN(nvnSyncWait) {  // NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED
@@ -159,9 +346,20 @@ NVN(nvnSyncWait) {  // NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED
     if (getenv("SAVAGEWIND_LOG_SYNC") && n++ % 60 == 0) LOG("[nvn] SyncWait #%llu (lr %llx)\n", (unsigned long long)n, c->x[30]);
     static int whole = -1;  // SAVAGEWIND_SYNC_ALL=1: old behaviour, wait for all submitted work
     if (whole < 0) whole = getenv("SAVAGEWIND_SYNC_ALL") ? 1 : 0;
+    NvnSync *s = sync_of(A(0));
+    TL("syncwait %llx seq %llu ticket %llu (fence seq now %llu, done %llu, lr %llx)", (unsigned long long)A(0),
+       (unsigned long long)s->seq, (unsigned long long)s->ticket, (unsigned long long)renderer_fence_seq(),
+       (unsigned long long)vk_completed_seq(), (unsigned long long)c->x[30]);
+    // the queue first: up to the fence that sets it (a fence inside a command list: everything submitted so far)
+    if (frame_split() && s->ticket) g_fs_sync0 = plat_now_ns();
+    if (async_exec()) queue_wait(flush || whole || s->in_list ? ~0ull : s->ticket);
+    if (host_work()) kernel_host_work_begin();
     if (flush) renderer_flush();
     else if (whole) renderer_sync();
-    else renderer_wait_seq(sync_of(A(0))->seq);  // only the submission that holds this fence
+    else renderer_wait_seq(s->seq);  // only the submission that holds this fence
+    if (host_work()) kernel_host_work_end();
+    if (frame_split() && s->ticket) g_fs_sync1 = plat_now_ns();
+    TL("syncwait done");
     RET(0);
 }
 NVN(nvnSyncCreateGLSync) { RET(0); }
@@ -360,7 +558,7 @@ static void builder_layout(uint64_t b, TexLayout *t) {
     }
 }
 
-static bool is_linear(uint64_t b) { return (G(uint32_t, b, 8) & 0x10) || G(uint32_t, b, 0xC) == 10; }
+static bool is_linear(uint64_t b) { return nvn_texture_flags_pitch(G(uint32_t, b, 8)) || G(uint32_t, b, 0xC) == 10; }
 
 static uint64_t builder_storage_size(uint64_t b) {
     if (G(uint32_t, b, 0xC) == 10) {  // buffer texture
@@ -490,6 +688,7 @@ NVN(nvnTextureFinalize) {
                               (unsigned long long)A(0), (unsigned long long)(uintptr_t)t, (unsigned long long)c->x[30]);
         return;
     }
+    if (async_exec()) { queue_put(QOP_TEXTURE_FINALIZE, 0, t); return; }  // (after the lists submitted before it)
     backend_texture_destroyed(t);
     t->finalized = true;
 }
@@ -512,7 +711,10 @@ NVN(nvnTextureGetStride) { RET(TEX->stride); }
 NVN(nvnTextureGetTextureAddress) { RET(TEX->addr); }
 NVN(nvnTextureGetMemoryPool) { RET(0); }
 NVN(nvnTextureGetMemoryOffset) { RET(TEX->pool_offset); }
-NVN(nvnTextureGetStorageSize) { RET(tegra_total_size(&TEX->layout)); }
+NVN(nvnTextureGetStorageSize) {
+    NvnTexture *t = TEX;
+    RET(nvn_texture_flags_pitch(t->flags) && t->stride ? t->stride * t->height : tegra_total_size(&t->layout));
+}
 NVN(nvnTextureGetDebugID) { RET(TEX->debug_id); }
 NVN(nvnTextureGetViewOffset) { RET(0); }
 NVN(nvnTextureGetStorageClass) { RET(0); }
@@ -545,18 +747,57 @@ NVN(nvnTextureViewGetTarget) { *(uint32_t *)AP(1) = TV->target; RET(!!(TV->setma
 NVN(nvnTextureViewCompare) { RET(memcmp(AP(0), AP(1), sizeof(NvnTextureView)) == 0); }
 
 NVN(nvnTextureWriteTexels) {
-    // (texture, view, region, data) -- linear data into block-linear storage
+    // (texture, view, region, data): tightly packed linear texels into the storage (block-linear, or rows at the stride
+    // for pitch textures) of one whole level (the view's base level), for the region's slices (3D) or layers (arrays:
+    // z, plus the view's first layer; 1D arrays: y).
+    // The renderer uploads the written levels at the texture's next use, even when the GPU has drawn into the texture
+    // since: BOTW writes level 0 of its 3D noise this way and renders the other levels from it.
     NvnTexture *t = HOST(NvnTexture, A(0));
+    const NvnTextureView *v = A(1) ? (const NvnTextureView *)AP(1) : NULL;
     const int32_t *r = AP(2);  // xoffset, yoffset, zoffset, width, height, depth
-    LevelLayout l = tegra_level(&t->layout, 0);
-    if (r && r[0] == 0 && r[1] == 0 && (uint32_t)r[3] == t->width && (uint32_t)r[4] == t->height) {
-        kernel_watch_write("WriteTexels", t->addr + l.offset, tegra_total_size(&t->layout) - l.offset);
-        tegra_swizzle(AP(3), (uint8_t *)(uintptr_t)t->addr + l.offset, l.wb, l.hb, r[5] > 0 ? (uint32_t)r[5] : 1,
-                      t->layout.fmt->bpb, l.block_height_log2, l.block_depth_log2);
-        backend_pool_written(t->addr, tegra_total_size(&t->layout));
-    } else {
-        LOG("[nvn] partial WriteTexels not implemented\n");
+    if (!t || !r || !t->addr || !t->layout.fmt) return;
+    if (getenv("SAVAGEWIND_LOG_COPIES")) {  // (debugging)
+        static int n;
+        if (n++ < 200)
+            LOG("[copy] WriteTexels #%llu %ux%ux%u target %u f%#x region %d,%d,%d %dx%dx%d view set %#x level %u layer %u\n",
+                (unsigned long long)t->debug_id, t->width, t->height, t->depth, t->target, t->format, r[0], r[1], r[2], r[3],
+                r[4], r[5], v ? v->setmask : 0, v ? v->base_level : 0, v ? v->min_layer : 0);
     }
+    uint32_t level = v && (v->setmask & 1) ? v->base_level : 0;
+    if (level >= t->layout.levels) return;
+    LevelLayout l = tegra_level(&t->layout, level);
+    bool is3d = t->target == 2, array1d = t->target == 3;
+    uint32_t y0 = array1d ? 0 : (uint32_t)r[1], h = array1d ? 1 : (uint32_t)r[4];
+    uint32_t z0 = array1d ? (uint32_t)r[1] : (uint32_t)r[2];
+    uint32_t nz = array1d ? (uint32_t)(r[4] > 0 ? r[4] : 1) : (uint32_t)(r[5] > 0 ? r[5] : 1);
+    if (!is3d && v && (v->setmask & 2)) z0 += v->min_layer;
+    uint32_t nslices = is3d ? l.d : (t->layout.layers ? t->layout.layers : 1);
+    if (r[0] || y0 || (uint32_t)r[3] != l.w || h != l.h || (is3d && (z0 || nz != l.d)) || z0 + nz > nslices) {
+        static int n;
+        if (n++ < 8) LOG("[nvn] partial WriteTexels not implemented (#%llu %ux%u level %u, region %d,%d,%d %dx%dx%d)\n",
+                         (unsigned long long)t->debug_id, t->width, t->height, level, r[0], r[1], r[2], r[3], r[4], r[5]);
+        return;
+    }
+    uint32_t bpb = t->layout.fmt->bpb;
+    uint8_t *base = (uint8_t *)(uintptr_t)t->addr;
+    if (nvn_texture_flags_pitch(t->flags)) {  // pitch storage: rows at the stride (one level, one layer)
+        uint64_t row = (uint64_t)l.wb * bpb, stride = t->stride ? t->stride : row;
+        kernel_watch_write("WriteTexels", t->addr, stride * l.hb);
+        for (uint32_t y = 0; y < l.hb; y++) memcpy(base + y * stride, (const uint8_t *)AP(3) + y * row, row);
+    } else if (is3d) {
+        kernel_watch_write("WriteTexels", t->addr + l.offset, tegra_total_size(&t->layout) - l.offset);
+        tegra_swizzle(AP(3), base + l.offset, l.wb, l.hb, l.d, bpb, l.block_height_log2, l.block_depth_log2);
+    } else {
+        uint64_t layer_size = tegra_layer_size(&t->layout), slice = (uint64_t)l.wb * l.hb * bpb;
+        for (uint32_t i = 0; i < nz; i++) {
+            uint64_t dst = (uint64_t)(z0 + i) * layer_size + l.offset;
+            kernel_watch_write("WriteTexels", t->addr + dst, slice);
+            tegra_swizzle((const uint8_t *)AP(3) + i * slice, base + dst, l.wb, l.hb, 1, bpb, l.block_height_log2,
+                          l.block_depth_log2);
+        }
+    }
+    __atomic_fetch_or(&t->cpu_levels, 1u << level, __ATOMIC_RELEASE);
+    backend_pool_written(t->addr, tegra_total_size(&t->layout));
 }
 NVN(nvnTextureWriteTexelsStrided) { LOG("[nvn] WriteTexelsStrided not implemented\n"); (void)c; }
 NVN(nvnTextureReadTexels) { LOG("[nvn] ReadTexels not implemented\n"); (void)c; }
@@ -804,7 +1045,40 @@ NVN(nvnWindowGetNumTextures) { RET(WIN->num); }
 NVN(nvnWindowGetNumActiveTextures) { RET(WIN->active); }
 NVN(nvnWindowSetNumActiveTextures) { WIN->active = (int)A(1); }
 NVN(nvnWindowGetPresentInterval) { RET(WIN->interval); }
-NVN(nvnWindowSetPresentInterval) { WIN->interval = (int)A(1); }
+// BOTW's frame loop (sead GameFrameworkNx, main 0x700101287c) sets the interval here every frame (lr 0x7001012a34,
+// x19 = the framework). It times each frame ([fw+0x250], 19.2 MHz system ticks, from the frame's start to the end of
+// its calc and draw) and goes to interval 3 (20 fps) after three frames in a row over 1.9 vsyncs (31.7 ms), back to
+// 2 after a few fast ones; [fw+0x234] is the highest interval it may pick (3).
+// SAVAGEWIND_LOG_FRAMETIME=<ms>: frames whose game time is over that, and every change of interval (tests).
+// SAVAGEWIND_MAX_INTERVAL=2: the game never picks 3, so its step per frame is fixed and a scripted run takes the same
+// path every time (benchmarks; with 3 allowed, the path depends on the frame times). The default while Savage Wind
+// paces the frames and sets the game's clock (runtime/hle/framepace.c): the interval no longer sets either.
+#define FRAME_LOOP_LR 0x7001012a34ull
+NVN(nvnWindowSetPresentInterval) {
+    int want = (int)A(1);
+    if (c->x[30] == FRAME_LOOP_LR) {
+        uint64_t fw = c->x[19];
+        static int log_ms = -2, max_iv = -1;
+        if (log_ms == -2) { const char *e = getenv("SAVAGEWIND_LOG_FRAMETIME"); log_ms = e ? atoi(e) : -1; }
+        if (max_iv < 0) {
+            const char *e = getenv("SAVAGEWIND_MAX_INTERVAL");
+            max_iv = e ? atoi(e) : framepace_on() ? 2 : 0;
+        }
+        uint32_t *max_field = (uint32_t *)(uintptr_t)(fw + 0x234);
+        if (max_iv > 0 && *max_field > (uint32_t)max_iv) *max_field = (uint32_t)max_iv;
+        if (log_ms >= 0) {
+            static uint64_t n, last_ns;
+            uint64_t now = plat_now_ns();
+            double ms = (double)*(uint64_t *)(uintptr_t)(fw + 0x250) / 19200.0;
+            if (ms > log_ms || WIN->interval != want)
+                LOG("[frame] #%llu game %.1f ms, since the last %.1f ms, interval %d -> %d\n", (unsigned long long)n, ms,
+                    (now - last_ns) / 1e6, WIN->interval, want);
+            n++;
+            last_ns = now;
+        }
+    }
+    WIN->interval = want;
+}
 NVN(nvnWindowSetCrop) { int *cr = WIN->crop; cr[0] = (int)A(1); cr[1] = (int)A(2); cr[2] = (int)A(3); cr[3] = (int)A(4); }
 NVN(nvnWindowGetCrop) { memcpy(AP(1), WIN->crop, 16); }
 NVN(nvnWindowAcquireTexture) {
@@ -823,19 +1097,29 @@ NVN(nvnQueueAcquireTexture) {
 // Presentation pace. On the console a frame reaches the screen at a vsync, and the window's present interval
 // (vsyncs per frame) sets the pace: the next acquire waits for a free texture. The HLE presented at once, so the
 // game ran as fast as the host let it (BOTW's main menu at 130 fps, its animations too fast). A present now waits
-// for its frame's turn: interval x 1/60 s after the last one, and never sooner than the frame rate cap allows
-// (SAVAGEWIND_FPS_CAP, default 60: unlocked frame rates need the game's own timing patched first; 0 = no cap).
+// for its frame's turn on a steady grid: 1 / the frame rate (Video > Frame rate, 30 in the menus; runtime/hle/
+// framepace.c) after the last one, and tells framepace.c when it went out (the game's clock follows it).
+// SAVAGEWIND_FRAMEPACE=0 (the game's own pacing): interval x 1/60 s after the last one, and never sooner than
+// SAVAGEWIND_FPS_CAP allows (default 60; 0 = no cap).
+uint64_t g_pace_sleep_ns;  // (VK_PROF hitch lines) time present_pace slept
 static void present_pace(int interval) {
     static int cap = -1;
     static uint64_t last;
     if (cap < 0) cap = getenv("SAVAGEWIND_FPS_CAP") ? atoi(getenv("SAVAGEWIND_FPS_CAP")) : 60;
-    uint64_t period = 16666667ull * (uint64_t)(interval > 0 ? interval : 0);
-    if (cap > 0 && period < 1000000000ull / (uint64_t)cap) period = 1000000000ull / (uint64_t)cap;
-    if (!period) return;
+    uint64_t period;
+    if (framepace_on()) period = framepace_period_ns();
+    else {
+        period = 16666667ull * (uint64_t)(interval > 0 ? interval : 0);
+        if (cap > 0 && period < 1000000000ull / (uint64_t)cap) period = 1000000000ull / (uint64_t)cap;
+        if (!period) return;
+    }
     uint64_t target = last + period, now = plat_now_ns();
     if (last && now < target) kernel_sleep_until_ns(target);
-    now = plat_now_ns();
+    uint64_t t1 = plat_now_ns();
+    g_pace_sleep_ns += t1 - now;
+    now = t1;
     last = last && now < target + period ? target : now;  // (steady cadence; after a long frame, start again)
+    framepace_presented(last, last == target);
 }
 
 NVN(nvnQueuePresentTexture) {
@@ -843,9 +1127,20 @@ NVN(nvnQueuePresentTexture) {
     int i = (int)A(2);
     static int logged = -1;
     if (logged != w->interval) { logged = w->interval; LOG("[nvn] window present interval %d\n", w->interval); }
+    TL("present (pace)");
     present_pace(w->interval);
+    if (frame_split()) g_fs_pace = plat_now_ns();
     perfmon_frame();
+    TL("present (backend)");
+    if (async_exec()) {
+        if (i >= 0 && i < w->num) queue_put(QOP_PRESENT, 0, HOST(NvnTexture, w->textures[i]));
+        TL("present queued");
+        return;
+    }
+    if (host_work()) kernel_host_work_begin();
     if (i >= 0 && i < w->num) backend_present(HOST(NvnTexture, w->textures[i]));
+    if (host_work()) kernel_host_work_end();
+    TL("presented");
 }
 
 // ================================================================== small state objects

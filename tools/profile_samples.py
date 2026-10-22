@@ -28,6 +28,15 @@ def symbols(path):
     return syms
 
 
+def image_size(path):
+    # SizeOfImage from the PE optional header: addresses past it belong to the next module loaded (the GPU driver
+    # often lands right after swgame.dll and was named after the library's last function)
+    with open(path, 'rb') as f:
+        d = f.read(4096)
+    pe = int.from_bytes(d[0x3c:0x40], 'little')
+    return int.from_bytes(d[pe + 24 + 56:pe + 24 + 60], 'little')
+
+
 class Map:
     def __init__(self, syms, image_base, load_base):
         self.addrs = [a for a, _ in syms]
@@ -66,11 +75,13 @@ def main():
     exe = Map(symbols(os.path.join(ROOT, 'build', 'savagewind.exe')), 0x140000000, bases.get('exe', 0x140000000))
     dll = Map(symbols(os.path.join(ROOT, 'build', 'swgame.dll')), 0x180000000, bases.get('swgame', 0x180000000))
     dll_lo = bases.get('swgame', 0)
+    dll_size = image_size(os.path.join(ROOT, 'build', 'swgame.dll'))
+    exe_size = image_size(os.path.join(ROOT, 'build', 'savagewind.exe'))
 
     def name(addr):
-        if dll_lo and dll_lo <= addr < dll_lo + 0x20000000:
+        if dll_lo and dll_lo <= addr < dll_lo + dll_size:
             return dll.name(addr) or '?swgame'
-        if bases.get('exe', 0) <= addr < bases.get('exe', 0) + 0x4000000:
+        if bases.get('exe', 0) <= addr < bases.get('exe', 0) + exe_size:
             return exe.name(addr) or '?exe'
         return '?%x' % (addr >> 20 << 20)  # system libraries: by megabyte
 

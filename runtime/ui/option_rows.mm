@@ -19,6 +19,7 @@ static std::string g_desc_first;  // the page's first row (shown until a row is 
 static const ImU32 kGold = IM_COL32(236, 194, 84, 255);
 static bool g_next_disabled;
 void opt_disable_next(void) { g_next_disabled = true; }
+static bool g_value_dim;  // the next row's value is shown greyed (a value that can't be picked yet)
 static int g_indent;
 static bool g_focus_req, g_take_first;  // (opt_focus_first: requested / this page's first row takes it)
 void opt_focus_first(bool on) { g_focus_req = on; }
@@ -65,6 +66,8 @@ static int row(const char *label, const std::string &value, bool changed, const 
     }
     bool off = g_next_disabled;  // (greyed out: still selectable, so its description shows, but it can't change)
     g_next_disabled = false;
+    bool dim = off || g_value_dim;
+    g_value_dim = false;
     bool hov = ImGui::IsItemHovered(), foc = ImGui::IsItemFocused() && ImGui::GetCurrentContext()->NavCursorVisible;
     int step = clicked && !off ? 2 : 0;
     g_held = false;
@@ -113,7 +116,7 @@ static int row(const char *label, const std::string &value, bool changed, const 
     }
     if (!value.empty()) {
         float vw = ImGui::CalcTextSize(value.c_str()).x, vx = right - vw;
-        dl->AddText(ImVec2(vx, ty), off ? IM_COL32(110, 110, 102, 255) : changed ? IM_COL32(255, 255, 255, 255)
+        dl->AddText(ImVec2(vx, ty), dim ? IM_COL32(110, 110, 102, 255) : changed ? IM_COL32(255, 255, 255, 255)
                                                                                  : IM_COL32(205, 205, 195, 255), value.c_str());
     }
     ImGui::PopID();
@@ -134,6 +137,21 @@ bool opt_choice(const char *label, int *v, const char *const *names, int n, int 
     nv = wrap ? (nv + n) % n : nv < 0 ? 0 : nv >= n ? n - 1 : nv;
     if (nv == cur) return false;
     *v = nv;
+    return true;
+}
+
+bool opt_choice_avail(const char *label, int *v, int *shown, const char *const *names, const bool *avail, int n, int def,
+                      const char *desc) {
+    int cur = *v >= 0 && *v < n ? *v : 0;
+    if (*shown < 0 || *shown >= n || (avail[*shown] && *shown != cur)) *shown = cur;  // (changed elsewhere)
+    int s = *shown;
+    g_value_dim = !avail[s];
+    int step = row(label, tr(names[s]), s != def, desc, true, true);
+    if (!step) return false;
+    s = (s + (step == 2 ? 1 : step) + n) % n;
+    *shown = s;
+    if (!avail[s] || s == cur) return false;
+    *v = s;
     return true;
 }
 
