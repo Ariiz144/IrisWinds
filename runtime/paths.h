@@ -41,6 +41,7 @@ bool rt_remove_game_files(const char *game_dir);
 unsigned long long rt_game_files_size(const char *game_dir);
 
 typedef struct SDL_Window SDL_Window;
+bool rt_user_splash(char *out, size_t n);  // the player's splash.jpg / .png in the data root, if any
 void rt_window_icon(SDL_Window *w);  // the shipped icon.png, if any
 
 #ifdef __cplusplus

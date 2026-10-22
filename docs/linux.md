@@ -10,7 +10,11 @@ package the release AppImages.
 
 Needs: a distribution with glibc 2.35 or newer (Ubuntu 22.04, Debian 12, Fedora 36, Arch, ...), a Vulkan 1.3 driver
 (Mesa RADV / ANV / NVK / Turnip / Asahi Honeykrisp, or NVIDIA's), and on x86-64 a CPU with AVX2 (2013 or newer).
-The start screen asks for the folder with your own game files and sets them up.
+The start screen asks for the folder with your own game files and sets them up; from then on the game starts
+straight away. `--config` (`./Savage_Wind-*.AppImage --config`) opens the configuration screen: Play, Settings, the
+game files, Quit. Once the AppImage is in your applications menu (AppImageLauncher, Gear Lever, or your desktop's own
+AppImage integration), its entry has a **Savage Wind Configuration** action (right-click it) that does the same. A picture of your own as `splash.jpg` / `splash.png` in the data folder below replaces the start
+screen's art.
 
 Everything the app writes lives in `~/.local/share/savagewind` (`$XDG_DATA_HOME/savagewind`): game files (`extracted/`),
 saves, settings (`savagewind.ini`), shader caches, imported fonts. Started without a terminal the log is

@@ -64,9 +64,9 @@ typedef struct {
     uint32_t in_attr_mask, out_attr_mask;
     uint32_t vs_in_comp[32];
     bool uses_branches, uses_cc, uses_local, uses_vid, uses_iid, uses_frag_coord, uses_front_facing, uses_lane;
-    bool uses_rscale;  // resolution-scale table (fragment/compute only)
+    bool uses_rscale;  // resolution-scale table (MSL: fragment / compute only)
     uint32_t flat_mask;           // fragment inputs using constant (flat) interpolation
-    uint32_t noperspective_mask;  // fragment inputs using pass (linear) interpolation
+    uint32_t noperspective_mask;  // fragment inputs the SPH interpolates linearly in screen space
     uint32_t omap_target, omap_depth;
     int tex_slot[8192];           // texture index -> Metal slot + 1
     bool tex_weak[64];            // slot type only guessed (from a size query): the next sample decides
@@ -212,6 +212,30 @@ static void fcmp_expr(char *out, int op, const char *a, const char *b) {
 
 static const char *bool_op(int op) { return op == 0 ? "&&" : op == 1 ? "||" : "!="; }
 
+// A condition code test (flow control bits 0-4, CSETP bits 8-12) on the flags kept: zero (ccz), sign (ccs) and carry
+// (cc bit 0); overflow isn't tracked (0). NULL for the tests this can't express (NUM, NaN, the CSM ones).
+static const char *cc_test(int test) {
+    switch (test) {
+    case 0: return "false";                       // F
+    case 15: return "true";                       // T
+    case 2: case 10: return "ccz";                // EQ, EQU
+    case 5: case 13: return "!ccz";               // NE, NEU
+    case 1: case 9: return "ccs";                 // LT, LTU
+    case 6: case 14: return "!ccs";               // GE, GEU
+    case 4: case 12: return "(!ccz && !ccs)";     // GT, GTU
+    case 3: case 11: return "(ccz || ccs)";       // LE, LEU
+    case 16: return "true";                       // OFF
+    case 17: return "((cc & 1u) == 0u)";          // LO
+    case 18: case 31: return "(!ccs && !ccz)";    // SFF, RGT
+    case 19: return "(ccz || (cc & 1u) == 0u)";   // LS
+    case 20: return "((cc & 1u) != 0u && !ccz)";  // HI
+    case 21: case 30: return "(ccs || ccz)";      // SFT, RLE
+    case 22: return "((cc & 1u) != 0u)";          // HS
+    case 23: return "false";                      // OFT
+    default: return NULL;
+    }
+}
+
 static void icmp_expr(char *out, int op, const char *a, const char *b, bool is_signed) {
     static const char *const ops[] = {"false", "<", "==", "<=", ">", "!=", ">=", "true"};
     if (op == 0) strcpy(out, "false");
@@ -260,7 +284,16 @@ static void attr_load(Ctx *c, int dst, uint32_t addr, const char *idx) {
                 // pass w / clip.w there to get the projected screen position of their depth lookup (taken
                 // as plain attr, each particle showed the whole depth buffer: tiled "fog" in the Shrine of
                 // Resurrection).
-                if (c->ipa_mode == 0) sprintf(e, "as_type<uint>(in.v%d[%d] * in.pos.w)", a, comp);
+                // An input the SPH interpolates linearly in screen space (declared noperspective) has no 1/w in
+                // it: "pass" yields attr itself, "multiply" attr times the register. (BOTW's HUD vertex colors:
+                // under the minimap's perspective camera, w ~ 989, attr/w left them black and transparent.)
+                bool linear = (c->noperspective_mask >> a) & 1;
+                if (c->ipa_mode == 0 && linear) sprintf(e, "as_type<uint>(in.v%d[%d])", a, comp);
+                else if (c->ipa_mode == 1 && c->ipa_mul != RZ && linear) {
+                    char rb[16];
+                    sprintf(e, "as_type<uint>(in.v%d[%d] * as_type<float>(%s))", a, comp, reg(c, c->ipa_mul, rb));
+                }
+                else if (c->ipa_mode == 0) sprintf(e, "as_type<uint>(in.v%d[%d] * in.pos.w)", a, comp);
                 else if (c->ipa_mode == 1 && c->ipa_mul != RZ) {
                     char rb[16];
                     sprintf(e, "as_type<uint>(in.v%d[%d] * in.pos.w * as_type<float>(%s))", a, comp,
@@ -534,7 +567,7 @@ static const char *RSC2(Ctx *c, int slot, const char *fmt, ...) {
     va_start(ap, fmt);
     vsnprintf(inner, sizeof inner, fmt, ap);
     va_end(ap);
-    if (c->stage == STAGE_VERTEX) { snprintf(o, 1024, "%s", inner); return o; }
+    if (c->stage == STAGE_VERTEX && !c->glsl) { snprintf(o, 1024, "%s", inner); return o; }  // (MSL: no table there)
     c->uses_rscale = true;
     snprintf(o, 1024, "rsc(%s, rscale[%d])", inner, slot + 1);
     return o;
@@ -547,6 +580,17 @@ static const char *alayer(Ctx *c, const char *r, int slot, char *buf) {
     return buf;
 }
 #define ALAYER(r, slot) alayer(c, (r), (slot), alloca(96))
+
+// Texel offsets are in guest texels: a scaled allocation (render-target scaling) has 1 / scale as many per guest
+// texel, so an offset moves the coordinates by offset * scale / allocated size (rscale[1 + slot]).
+static const char *off_scale(Ctx *c, int slot, int comps) {
+    static char bufs[4][48];
+    static int bi;
+    char *o = bufs[bi++ & 3];
+    c->uses_rscale = true;
+    snprintf(o, 48, " * rscale[%d].%s", slot + 1, comps == 1 ? "x" : "xy");
+    return o;
+}
 
 // GLSL texture lookup on slot `slot` (its type is final here: a conflicting use fails in tex_slot).
 // co: coordinate expressions (1 for 1D, 2 for 2D, 3 for 3D / cube), layer: uint expression or NULL, dref: depth
@@ -573,13 +617,13 @@ static void glsl_sample(Ctx *c, char *out, int slot, const char *const *co, cons
     char L[600], xs[1600], P[2000];
     if (lod_kind == 1) snprintf(L, sizeof L, "int(%s)", lod); else strcpy(L, "0");
     if (n == 1) {
-        if (off) snprintf(xs, sizeof xs, "(%s + float((%s).x) / float(tsize%d(%s).x))", co[0], off, slot, L);
+        if (off) snprintf(xs, sizeof xs, "(%s + float((%s).x)%s / float(tsize%d(%s).x))", co[0], off, off_scale(c, slot, 1), slot, L);
         else snprintf(xs, sizeof xs, "%s", co[0]);
     } else if (n == 2) {
-        if (off) snprintf(xs, sizeof xs, "(vec2(%s, %s) + vec2(%s) / vec2(tsize%d(%s).xy))", co[0], co[1], off, slot, L);
+        if (off) snprintf(xs, sizeof xs, "(vec2(%s, %s) + vec2(%s)%s / vec2(tsize%d(%s).xy))", co[0], co[1], off, off_scale(c, slot, 2), slot, L);
         else snprintf(xs, sizeof xs, "vec2(%s, %s)", co[0], co[1]);
     } else {
-        if (off && !cube) snprintf(xs, sizeof xs, "vec3(vec2(%s, %s) + vec2(%s) / vec2(tsize%d(%s).xy), %s)", co[0], co[1], off, slot, L, co[2]);
+        if (off && !cube) snprintf(xs, sizeof xs, "vec3(vec2(%s, %s) + vec2(%s)%s / vec2(tsize%d(%s).xy), %s)", co[0], co[1], off, off_scale(c, slot, 2), slot, L, co[2]);
         else snprintf(xs, sizeof xs, "vec3(%s, %s, %s)", co[0], co[1], co[2]);  // cube lookups take no offset
     }
     const char *extra = NULL;  // separate compare argument (cube array shadow)
@@ -827,7 +871,7 @@ static void glsl_gather(Ctx *c, char *out, int slot, const char *const *co, cons
     for (int i = 0; i < n; i++) {
         char xy[500];
         if (cube) snprintf(xy, sizeof xy, "vec3(%s, %s, %s)", co[0], co[1], co[2]);
-        else if (noff) snprintf(xy, sizeof xy, "(vec2(%s, %s) + vec2(%s) / vec2(tsize%d(0).xy))", co[0], co[1], off[i], slot);
+        else if (noff) snprintf(xy, sizeof xy, "(vec2(%s, %s) + vec2(%s)%s / vec2(tsize%d(0).xy))", co[0], co[1], off[i], off_scale(c, slot, 2), slot);
         else snprintf(xy, sizeof xy, "vec2(%s, %s)", co[0], co[1]);
         if (layer) snprintf(P[i], sizeof P[i], "vec%d(%s, float(%s))", cube ? 4 : 3, xy, layer);
         else snprintf(P[i], sizeof P[i], "%s", xy);
@@ -1046,7 +1090,22 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
     }
     bool guarded = !(pr == PT && !prn);
     if (pr == PT && prn) return;  // @!pt: never executes
-    if (guarded) sp(&c->body, "  if (%s) {\n", P(pr, prn));
+    // flow control (BRA, BRX, EXIT, KIL, BRK, CONT, SYNC) also tests the condition code (bits 0-4, T = always): BOTW's
+    // sky scattering shader branches on FSET.CC's result (BRA NEU), the ground / sky split of its table lookup
+    const char *flow_cc = NULL;
+    if (top12 == 0xe240000000000000ull || top12 == 0xe250000000000000ull || top12 == 0xe300000000000000ull ||
+        top12 == 0xe330000000000000ull || top12 == 0xe340000000000000ull || top12 == 0xe350000000000000ull ||
+        (w & 0xfff8000000000000ull) == 0xf0f8000000000000ull) {
+        int test = (int)bits(w, 0, 5);
+        if (test != 15) {
+            flow_cc = cc_test(test);
+            if (!flow_cc) { fail(c, "flow test %d at %#x", test, pc); return; }
+            c->uses_cc = true;
+            guarded = true;
+        }
+    }
+    if (flow_cc) sp(&c->body, "  if (%s && %s) {\n", P(pr, prn), flow_cc);
+    else if (guarded) sp(&c->body, "  if (%s) {\n", P(pr, prn));
 
 #define OPM(val, mask) ((w & (uint64_t)(mask)) == (uint64_t)(val))
     if (OPM(0xe300000000000000ull, 0xfff0000000000000ull)) {  // EXIT
@@ -1144,15 +1203,10 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         uint32_t mask = (uint32_t)bits(w, 31, 4);
         int slot = tex_slot(c, index, -1, false, false);  // the type comes from a sample, if any
         if (qt == 1 && c->glsl) {  // tsize<slot>() is emitted with the slot's final type
-            if (c->stage != STAGE_VERTEX) {
-                c->uses_rscale = true;
-                sp(&c->body, "    { uint lv = %s; uvec4 q = uvec4(uint(floor(float(tsize%d(int(lv)).x) / rscale[%d].x + 0.5f)), "
-                   "uint(floor(float(tsize%d(int(lv)).y) / rscale[%d].y + 0.5f)), 1u, uint(textureQueryLevels(t%d)));\n",
-                   R(a), slot, slot + 1, slot, slot + 1, slot);
-            } else {
-                sp(&c->body, "    { uint lv = %s; uvec4 q = uvec4(uint(tsize%d(int(lv)).x), uint(tsize%d(int(lv)).y), 1u, uint(textureQueryLevels(t%d)));\n",
-                   R(a), slot, slot, slot);
-            }
+            c->uses_rscale = true;
+            sp(&c->body, "    { uint lv = %s; uvec4 q = uvec4(uint(floor(float(tsize%d(int(lv)).x) / rscale[%d].x + 0.5f)), "
+               "uint(floor(float(tsize%d(int(lv)).y) / rscale[%d].y + 0.5f)), 1u, uint(textureQueryLevels(t%d)));\n",
+               R(a), slot, slot + 1, slot, slot + 1, slot);
             int n = 0;
             for (int i = 0; i < 4; i++)
                 if (mask & (1u << i)) { c->reg_used[d + n] = 1; sp(&c->body, "      r%d = q[%d];\n", d + n, i); n++; }
@@ -1242,6 +1296,10 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         fcmp_expr(cmp, (int)bits(w, 48, 4), x, y);
         sprintf(t, "((%s) %s %s)", cmp, bool_op((int)bits(w, 45, 2)), P((int)bits(w, 39, 3), bits(w, 42, 1)));
         sprintf(u, bits(w, 52, 1) ? "(%s ? 0x3f800000u : 0u)" : "(%s ? 0xFFFFFFFFu : 0u)", t);
+        if (bits(w, 47, 1)) {  // .CC (before the write: the sources may include the destination): Z, S of the result
+            c->uses_cc = true;
+            sp(&c->body, "    { uint ccv = %s; ccz = ccv == 0u; ccs = %s; cc = 0u; }\n", u, bits(w, 52, 1) ? "false" : "ccv != 0u");
+        }
         set_reg(c, d, u);
     } else if (OPM(0x5ba0000000000000ull, 0xfff0000000000000ull) || OPM(0x4ba0000000000000ull, 0xfff0000000000000ull) ||
                OPM(0x36a0000000000000ull, 0xfef0000000000000ull) || OPM(0x53a0000000000000ull, 0xfff0000000000000ull)) {  // FCMP
@@ -1805,20 +1863,10 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         // computed targets can name a scheduling word; execution continues at the next slot (as for BRA)
         sp(&c->body, "    { uint t = %uu + %s + 0x%08xu; if (((t >> 3) & 3u) == 0u) t += 8u; pc = t; continue; }\n", pc + 8, R(a),
            (uint32_t)sbits(w, 20, 24));
-    } else if (OPM(0x50a0000000000000ull, 0xfff8000000000000ull)) {  // CSETP (zero/sign flags only)
+    } else if (OPM(0x50a0000000000000ull, 0xfff8000000000000ull)) {  // CSETP
         int test = (int)bits(w, 8, 5);
-        const char *cond;
-        switch (test) {
-        case 0: cond = "false"; break;
-        case 15: cond = "true"; break;
-        case 2: case 10: cond = "ccz"; break;
-        case 5: case 13: cond = "!ccz"; break;
-        case 1: case 9: cond = "ccs"; break;
-        case 6: case 14: cond = "!ccs"; break;
-        case 4: case 12: cond = "(!ccz && !ccs)"; break;
-        case 3: case 11: cond = "(ccz || ccs)"; break;
-        default: cond = "false"; fail(c, "csetp test %d", test);
-        }
+        const char *cond = cc_test(test);
+        if (!cond) { cond = "false"; fail(c, "csetp test %d", test); }
         c->uses_cc = true;
         int p = (int)bits(w, 3, 3), q = (int)bits(w, 0, 3), bo = (int)bits(w, 45, 2);
         const char *pc_ = P((int)bits(w, 39, 3), bits(w, 42, 1));
@@ -2011,10 +2059,11 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
         if (!n) n = 1;
         sp(&s, "layout(std140, set = %d, binding = %d) uniform CB%d { uvec4 cb%d[%u]; };\n", set, i, i, i, n);
     }
+    info->writes_gmem = info->uses_gmem && c->uses_gmem_store;
     if (info->uses_gmem)
         sp(&s, "layout(std430, set = %d, binding = %d) %sbuffer GMem { uint w[]; } gmem_;\n", set, GMEM_BUFFER_INDEX,
            c->uses_gmem_store ? "" : "readonly ");
-    if (c->uses_rscale && stage != STAGE_VERTEX) {
+    if (c->uses_rscale) {  // (vertex shaders too: texel fetches from scaled targets, e.g. depth under the sun's flare)
         sp(&s, "layout(std140, set = %d, binding = 18) uniform RScale { vec4 rscale[65]; };\n", set);
         info->uses_rscale = true;
     }
@@ -2128,6 +2177,34 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
     return info;
 }
 
+// The end of a shader's code (in instruction words): the last EXIT followed by self-branch padding, or n words.
+static size_t code_end(const uint8_t *code, size_t n) {
+    if (n > 65536) n = 65536;
+    size_t end = 0;
+    for (size_t i = 0; i < n; i++) {
+        uint64_t w = ((const uint64_t *)code)[i];
+        if (i % 4 == 0) continue;
+        if ((w & 0xfff0000000000000ull) == 0xe240000000000000ull && sbits(w, 20, 24) == -8 && end) break;  // bra self
+        if (w == 0 && i > 4) break;
+        end = i + 1;
+    }
+    return end;
+}
+
+size_t maxwell_binary_size(const uint8_t *blob, size_t max_size, int stage) {
+    size_t head = stage == STAGE_COMPUTE ? 0 : 0x80;
+    if (max_size <= head) return max_size;
+    return head + code_end(blob + head, (max_size - head) / 8) * 8;
+}
+
+// (the cache of translations, runtime/nvn/vulkan/shaders.c, starts over whenever this file is built again)
+const char *maxwell_translator_id(void) { return __DATE__ " " __TIME__; }
+
+// Whether a translation depends on more than the binary and the key (debugging switches): not to be cached.
+bool maxwell_translation_uncacheable(void) {
+    return maxwell_dbg_code || maxwell_dbg_vs || getenv("SAVAGEWIND_SAVE_MSL") || getenv("SAVAGEWIND_NO_DISCARD");
+}
+
 ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, const ShaderKey *key) {
     ShaderInfo *info = calloc(1, sizeof *info);
     info->stage = stage;
@@ -2148,18 +2225,14 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
     if (stage == STAGE_FRAGMENT) {
         c->omap_target = *(const uint32_t *)(sph + 0x48);
         c->omap_depth = (*(const uint32_t *)(sph + 0x4C) >> 1) & 1;
+        // ImapGenericVector[32] (SPH 0x18): 2 bits per component of each generic input, 1 constant, 2 perspective,
+        // 3 screen-linear. An input with a screen-linear component is noperspective (in practice all its used
+        // components agree).
+        for (int i = 0; i < 32; i++)
+            for (int k = 0; k < 4; k++)
+                if (((sph[0x18 + i] >> (k * 2)) & 3) == 3) c->noperspective_mask |= 1u << i;
     }
-    // find the end: the last EXIT followed by self-branch padding, or max_size
-    size_t n = (max_size - (code - blob)) / 8;
-    if (n > 65536) n = 65536;
-    size_t end = 0;
-    for (size_t i = 0; i < n; i++) {
-        uint64_t w = ((const uint64_t *)code)[i];
-        if (i % 4 == 0) continue;
-        if ((w & 0xfff0000000000000ull) == 0xe240000000000000ull && sbits(w, 20, 24) == -8 && end) break;  // bra self
-        if (w == 0 && i > 4) break;
-        end = i + 1;
-    }
+    size_t end = code_end(code, (max_size - (code - blob)) / 8);
     // collect branch targets (labels)
     uint8_t *label = calloc(end + 4, 1);
     label[1] = 1;
@@ -2258,6 +2331,7 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
     Str args = {0};
     for (int i = 0; i < 18; i++)
         if (info->cbuf_mask & (1u << i)) sp(&args, ", constant uint4 *cb%d [[buffer(%d)]]", i, i);
+    info->writes_gmem = info->uses_gmem && c->uses_gmem_store;
     if (info->uses_gmem) {
         if (info->cbuf_mask & (1u << GMEM_BUFFER_INDEX)) {
             free(args.buf);

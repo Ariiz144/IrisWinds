@@ -8,6 +8,7 @@
 #import <Metal/Metal.h>
 #import <MetalFX/MetalFX.h>
 #include "output_scale.h"
+#include "window_size.h"
 #import <QuartzCore/CAMetalLayer.h>
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_metal.h>
@@ -212,6 +213,8 @@ uint64_t renderer_present_count(void) { return total_frames; }
 static float g_rs_x = 1, g_rs_y = 1;
 void renderer_get_scale(float *sx, float *sy) { *sx = g_rs_x; *sy = g_rs_y; }
 void renderer_set_scale(float sx, float sy) { g_rs_x = sx; g_rs_y = sy; }
+void renderer_get_scene_scale(float *sx, float *sy) { *sx = g_rs_x; *sy = g_rs_y; }  // (one scale for every target here)
+bool renderer_gpu_rtx(void) { return false; }  // (Video > Upscaler: DLSS needs an NVIDIA RTX GPU)
 
 static bool tex_scalable(const NvnTexture *t) {
     if (getenv("SAVAGEWIND_NO_SCALE")) return false;
@@ -946,15 +949,17 @@ void backend_present(NvnTexture *t) {
         id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
         // Next frame's render resolution follows the window: the 1920x1080 image scaled to fit.
         double dw = drawable.texture.width, dh = drawable.texture.height;
-        // render scale + placement in the window: runtime/nvn/output_scale.c (Video tab "Internal resolution"). The
-        // game keeps its own 16:9 framing, fitted into the window with bars (a widened camera needs a game hook).
-        extern uint64_t g_gpu_total_ns;
-        static uint64_t gpu_prev;
-        uint64_t gpu_now = __atomic_load_n(&g_gpu_total_ns, __ATOMIC_RELAXED);
-        double gpu_ms = gpu_prev ? (gpu_now - gpu_prev) / 1e6 : -1;
-        gpu_prev = gpu_now;
+        // render scale + placement in the window: runtime/nvn/output_scale.c (Video page "Upscaler"). The game keeps
+        // its own 16:9 framing, fitted into the window with bars (a widened camera needs a game hook). Fullscreen on
+        // a size the display has no mode for (runtime/window_size.c): that size, scaled to the screen.
         OutScale os;
-        output_scale(dw, dh, false, SDL_GetTicksNS() / 1e9, gpu_ms, &os);
+        int iw, ih;
+        if (winsize_virtual(&iw, &ih) && (iw != (int)dw || ih != (int)dh)) {
+            output_scale(iw, ih, false, &os);
+            output_scale_screen(dw, dh, iw, ih, &os);
+        } else {
+            output_scale(dw, dh, false, &os);
+        }
         double sx = os.sx, sy = os.sy, vx = os.vx, vy = os.vy, vw = os.vw, vh = os.vh, shape = os.shape;
         bool reshape = shape != 1.0;
         float crop[4] = {0, 0, 1, 1};  // uv origin and size: the whole image
@@ -1098,7 +1103,12 @@ void ui_window_init(void) {
     SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
     settings_load();
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) FATAL("SDL_Init: %s\n", SDL_GetError());
-    int win_w = 1280, win_h = 720;
+    // Video > Window size (runtime/window_size.c: pixels; SDL's window size is pixels / the display's pixel density)
+    winsize_refresh(NULL);
+    WinSize ws = winsize_effective(false);
+    const SDL_DisplayMode *dm = SDL_GetDesktopDisplayMode(SDL_GetPrimaryDisplay());
+    float density = dm && dm->pixel_density > 0 ? dm->pixel_density : 1;
+    int win_w = (int)lroundf(ws.w / density), win_h = (int)lroundf(ws.h / density);
     if (getenv("SAVAGEWIND_WINDOW")) sscanf(getenv("SAVAGEWIND_WINDOW"), "%dx%d", &win_w, &win_h);
     // SAVAGEWIND_HIDDEN=1: never shown (automated test runs render off screen without taking the user's focus)
     SDL_WindowFlags wflags = SDL_WINDOW_METAL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY;
@@ -1107,7 +1117,7 @@ void ui_window_init(void) {
     if (!window) FATAL("SDL_CreateWindow: %s\n", SDL_GetError());
     rt_window_icon(window);
     // the Fullscreen setting applies from the start screen on (not only once the game runs); test windows stay windows
-    if (g_settings.fullscreen && !getenv("SAVAGEWIND_WINDOW") && !getenv("SAVAGEWIND_HIDDEN")) SDL_SetWindowFullscreen(window, true);
+    winsize_apply(window);
     SDL_MetalView view = SDL_Metal_CreateView(window);
     layer = (__bridge CAMetalLayer *)SDL_Metal_GetLayer(view);
     dev = MTLCreateSystemDefaultDevice();

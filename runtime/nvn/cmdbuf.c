@@ -303,8 +303,11 @@ static CmdRec *rec(Cpu *c, NvnCmdBuf *cb, uint32_t op, uint32_t extra) {
     return rec_cost(c, cb, op, extra, cmd_cost(op, extra));
 }
 
+bool nvn_timeline(void);
+#define TL(fmt, ...) do { if (nvn_timeline()) LOG("[tl] %.3f %x " fmt "\n", plat_now_ns() / 1e6, kernel_current_thread_handle(), ##__VA_ARGS__); } while (0)
 NVN(nvnCommandBufferBeginRecording) {
     NvnCmdBuf *cb = cb_of(A(0));
+    TL("record %llx (lr %llx)", (unsigned long long)A(0), (unsigned long long)c->x[30]);
     cb->recording = true;
     rec_cost(c, cb, CMD_BARRIER, 0, 0);  // makes sure memory exists; the list starts here
     cb->start = cb->mem + cb->used - sizeof(CmdRec);
@@ -313,6 +316,7 @@ NVN(nvnCommandBufferEndRecording) {
     NvnCmdBuf *cb = cb_of(A(0));
     rec_cost(c, cb, CMD_END, 0, 0);
     cb->recording = false;
+    TL("recorded %llx", (unsigned long long)A(0));
     RET(cb->start);
 }
 NVN(nvnCommandBufferIsRecording) { RET(cb_of(A(0))->recording); }
@@ -395,6 +399,12 @@ NVN(nvnCommandBufferBindImage) {
     r->x[0] = s.x[1]; r->x[1] = s.x[2]; r->x[2] = 1;
     memcpy(r->extra, &s.x[3], 8);
 }
+// Entry points the renderer does not implement: logged on first use, so a game that needs one shows up in the log.
+#define UNIMPLEMENTED_ONCE(what) \
+    do { \
+        static int told_; \
+        if (!told_++) LOG("[nvn] CommandBuffer%s called: not implemented\n", what); \
+    } while (0)
 NVN(nvnCommandBufferBindSeparateTextures) { record_copy(c, CMD_BIND_TEXTURES, 4, (uint32_t)A(3) * 8); }
 NVN(nvnCommandBufferBindSeparateTexture) {
     Snap s = snap(c);
@@ -402,10 +412,10 @@ NVN(nvnCommandBufferBindSeparateTexture) {
     r->x[0] = s.x[1]; r->x[1] = s.x[2]; r->x[2] = 1;
     memcpy(r->extra, &s.x[3], 8);
 }
-NVN(nvnCommandBufferBindSeparateSamplers) { (void)c; }
-NVN(nvnCommandBufferBindSeparateSampler) { (void)c; }
-NVN(nvnCommandBufferBindTransformFeedbackBuffers) { (void)c; }
-NVN(nvnCommandBufferBindTransformFeedbackBuffer) { (void)c; }
+NVN(nvnCommandBufferBindSeparateSamplers) { (void)c; UNIMPLEMENTED_ONCE("BindSeparateSamplers"); }
+NVN(nvnCommandBufferBindSeparateSampler) { (void)c; UNIMPLEMENTED_ONCE("BindSeparateSampler"); }
+NVN(nvnCommandBufferBindTransformFeedbackBuffers) { (void)c; UNIMPLEMENTED_ONCE("BindTransformFeedbackBuffers"); }
+NVN(nvnCommandBufferBindTransformFeedbackBuffer) { (void)c; UNIMPLEMENTED_ONCE("BindTransformFeedbackBuffer"); }
 NVN(nvnCommandBufferBindCoverageModulationTable) { (void)c; }
 
 NVN(nvnCommandBufferSetTexturePool) {
@@ -486,7 +496,7 @@ PLAIN(nvnCommandBufferSetPointSize, CMD_SET_POINT_SIZE)
 PLAIN(nvnCommandBufferSetSampleMask, CMD_SET_SAMPLE_MASK)
 PLAIN(nvnCommandBufferSetRenderEnable, CMD_SET_RENDER_ENABLE)
 NVN(nvnCommandBufferSetRenderEnableConditional) { (void)c; }
-NVN(nvnCommandBufferSetDepthClamp) { (void)c; }
+PLAIN(nvnCommandBufferSetDepthClamp, CMD_SET_DEPTH_CLAMP)
 NVN(nvnCommandBufferSetRasterizerDiscard) { (void)c; }
 NVN(nvnCommandBufferSetConservativeRasterEnable) { (void)c; }
 NVN(nvnCommandBufferSetConservativeRasterDilate) { (void)c; }
@@ -596,16 +606,16 @@ NVN(nvnCommandBufferDrawElementsBaseVertex) {
 NVN(nvnCommandBufferDrawElementsInstanced) { trace_draw(c, c->x[3]); Snap s = snap(c); record(c, CMD_DRAW_ELEMENTS, 0, &s); }
 PLAIN(nvnCommandBufferDrawArraysIndirect, CMD_DRAW_ARRAYS_INDIRECT)
 PLAIN(nvnCommandBufferDrawElementsIndirect, CMD_DRAW_ELEMENTS_INDIRECT)
-NVN(nvnCommandBufferMultiDrawArraysIndirectCount) { (void)c; }
-NVN(nvnCommandBufferMultiDrawElementsIndirectCount) { (void)c; }
-NVN(nvnCommandBufferDrawTransformFeedback) { (void)c; }
-NVN(nvnCommandBufferDrawTexture) { (void)c; }
+NVN(nvnCommandBufferMultiDrawArraysIndirectCount) { (void)c; UNIMPLEMENTED_ONCE("MultiDrawArraysIndirectCount"); }
+NVN(nvnCommandBufferMultiDrawElementsIndirectCount) { (void)c; UNIMPLEMENTED_ONCE("MultiDrawElementsIndirectCount"); }
+NVN(nvnCommandBufferDrawTransformFeedback) { (void)c; UNIMPLEMENTED_ONCE("DrawTransformFeedback"); }
+NVN(nvnCommandBufferDrawTexture) { (void)c; UNIMPLEMENTED_ONCE("DrawTexture"); }
 PLAIN(nvnCommandBufferDispatchCompute, CMD_DISPATCH)
 PLAIN(nvnCommandBufferDispatchComputeIndirect, CMD_DISPATCH_INDIRECT)
-NVN(nvnCommandBufferBeginTransformFeedback) { (void)c; }
-NVN(nvnCommandBufferEndTransformFeedback) { (void)c; }
-NVN(nvnCommandBufferPauseTransformFeedback) { (void)c; }
-NVN(nvnCommandBufferResumeTransformFeedback) { (void)c; }
+NVN(nvnCommandBufferBeginTransformFeedback) { (void)c; UNIMPLEMENTED_ONCE("BeginTransformFeedback"); }
+NVN(nvnCommandBufferEndTransformFeedback) { (void)c; UNIMPLEMENTED_ONCE("EndTransformFeedback"); }
+NVN(nvnCommandBufferPauseTransformFeedback) { (void)c; UNIMPLEMENTED_ONCE("PauseTransformFeedback"); }
+NVN(nvnCommandBufferResumeTransformFeedback) { (void)c; UNIMPLEMENTED_ONCE("ResumeTransformFeedback"); }
 
 // ---- copies
 typedef struct { uint64_t tex; NvnTextureView view; uint8_t has_view; int32_t region[6]; } TexRef;
@@ -664,14 +674,16 @@ NVN(nvnCommandBufferFenceSync) {
     // work executes at submit time, so the sync is satisfied once this list has run
     Snap s = snap(c);
     record(c, CMD_FENCE_SYNC, 0, &s);
+    extern void nvn_sync_in_list(uint64_t guest);
+    nvn_sync_in_list(A(1));
 }
 PLAIN(nvnCommandBufferWaitSync, CMD_WAIT_SYNC)
 PLAIN(nvnCommandBufferBarrier, CMD_BARRIER)
 PLAIN(nvnCommandBufferSignalEvent, CMD_SIGNAL_EVENT)
 PLAIN(nvnCommandBufferWaitEvent, CMD_WAIT_EVENT)
 PLAIN(nvnCommandBufferReportCounter, CMD_REPORT_COUNTER)
-NVN(nvnCommandBufferReportValue) { (void)c; }
-NVN(nvnCommandBufferResetCounter) { (void)c; }
+NVN(nvnCommandBufferReportValue) { (void)c; UNIMPLEMENTED_ONCE("ReportValue"); }
+NVN(nvnCommandBufferResetCounter) { (void)c; UNIMPLEMENTED_ONCE("ResetCounter"); }  // (BOTW: before its sun occlusion query)
 NVN(nvnCommandBufferCallCommands) { record_copy(c, CMD_CALL, 2, (uint32_t)A(1) * 8); }
 NVN(nvnCommandBufferCopyCommands) { record_copy(c, CMD_CALL, 2, (uint32_t)A(1) * 8); }
 NVN(nvnCommandBufferInsertDebugMarker) { (void)c; }

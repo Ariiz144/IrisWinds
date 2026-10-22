@@ -4,7 +4,8 @@
 # paths rewritten to @rpath; Contents/Resources: the icon and what the start screen builds the game code with on the player's
 # machine (runtime/gamebuild.c): the generator helper (build/helper/swgen), the compiler (build/zig, tools/fetch_zig.sh)
 # and the headers the code is compiled against (gamelib-src/). Ad-hoc signed. No game files, game code or fonts: the
-# app keeps those in ~/Library/Application Support/<bundle id> (runtime/paths.h).
+# app keeps those in ~/Library/Application Support/<bundle id> (runtime/paths.h). One app: Option held while it opens
+# shows the configuration screen (runtime/ui/launcher.mm launcher_config_key_held), Windows' "Savage Wind Configuration".
 # MACOS_MIN=<x.y>: LSMinimumSystemVersion, and every Mach-O inside must be built for it or older (else it fails and
 # lists them); without it the newest minimum found inside is used.
 set -euo pipefail
@@ -41,8 +42,8 @@ cp runtime/cpu.h runtime/simd.h runtime/simd_fp.h runtime/gamelib.h tools/gameli
    "$C/Resources/gamelib-src/"
 cp docs/icon/icon.icns "$C/Resources/icon.icns"
 cp docs/icon/icon_1024.png "$C/Resources/icon.png"  # (window / Dock icon at run time)
-cp third_party/fonts/Baloo2/Baloo2-SemiBold.ttf "$C/Resources/Baloo2-SemiBold.ttf"  # (start screen; OFL, README "License")
-cp third_party/fonts/Baloo2/OFL.txt "$C/Resources/Baloo2-OFL.txt"
+cp third_party/fonts/FiraSans/FiraSans-SemiBold.ttf third_party/fonts/FiraSans/FiraSans-Medium.ttf "$C/Resources/"  # (menus; OFL, README "License")
+cp third_party/fonts/FiraSans/OFL.txt "$C/Resources/FiraSans-OFL.txt"
 
 # ---- dylibs: copy every non-system dependency, recursively; point all references at @rpath/<name>
 is_system() { case "$1" in /usr/lib/*|/System/*) return 0;; esac; return 1; }

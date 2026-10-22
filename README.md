@@ -13,10 +13,11 @@ your own copy of the game: a launcher, PC-style graphics options, mods, any cont
 its text and voices in any of its languages.
 
 > [!WARNING]
-> **Not playable yet.** This is early development. Today the game boots to its main menu and plays the opening in
-> the Shrine of Resurrection - lit, with its fog and effects, at the game's own 30 fps, with sound, voices and the
-> HUD - and saves. Nothing past the shrine has been tested yet. **Alpha 1** (Windows) is a preview for testers, not
-> a way to play the game through.
+> **Playable, but how far is unknown.** Savage Wind plays the opening in the Shrine of Resurrection and the Great
+> Plateau around it at 60 fps, with sound, voices, the HUD, saving and loading. Nobody has played past the Great
+> Plateau on Savage Wind yet, so expect bugs or crashes further on. This is an alpha, a preview for testers. If you
+> find a bug, please [report it on GitHub](https://github.com/Revivedx/SavageWindRecomp/issues/new/choose): every
+> report shows how far the game really works.
 
 > [!NOTE]
 > **No game files are included.** Savage Wind Recomp needs your own legally obtained copy of the game, updated to
@@ -25,47 +26,25 @@ its text and voices in any of its languages.
 > never decrypts anything: it only reads files you have already extracted yourself. The recompilation of the game
 > code happens locally, on your machine, from your files.
 
-![Savage Wind Recomp: development status and roadmap](docs/media/status.svg)
+## Getting started (Alpha 2, Windows)
 
-## What it does today
-
-- **Text and voices in different languages.** On the console the voices always follow the system language. Here
-  the menu's Language tab picks the text language (any of the game's 15, or your system's) and, separately, the
-  voice language (English, Latin American or European Spanish, French, German, Italian, Russian or Japanese): read
-  Spanish with Japanese voices, or English with Italian ones. The game reads both when it starts; in game, Restart
-  now applies a change.
-- **Menus in the game's 11 languages.** The start screen and the overlay menu follow the text language at once
-  (Russian, Japanese, Korean and Chinese use a system font for their characters).
-- **Keyboard and mouse.** Defaults made for BOTW (below), every key and mouse button remappable, a mouse camera
-  with sensitivity and Y inversion.
-- **Any controller** SDL knows, by button position, with its own button names (Nintendo, Xbox, PlayStation).
-- **Sound and voices** mixed by the game SDK's own audio renderer, with the room reverb.
-- **An overlay menu** (Esc or F1) with display, rendering, audio, language and control settings, and a
-  **performance overlay** (F10: FPS and frame times, or also CPU, memory and GPU load and temperatures).
-
-## Respect copyright
-
-- *The Legend of Zelda: Breath of the Wild* is © Nintendo. This is a fan project. It is not affiliated with,
-  endorsed by or sponsored by Nintendo. *Nintendo Switch* and *The Legend of Zelda* are trademarks of Nintendo.
-- This repository contains no game files, no game code (also not the C code the recompiler generates from it), no
-  assets, no fonts, no keys - and release builds won't either.
-- The game code you generate and the build made from it contain Nintendo's code. They are for your own use only:
-  don't share them, upload them or ship them.
-- Issues, pull requests or discussions that contain game files, keys, generated code or links to pirated copies
-  will be removed. Piracy is not supported in any way.
-- Follow the copyright laws of your country. Dumping a game you own for personal use is legal in some countries and
-  not in others; that is your responsibility.
-
-## Getting started (Alpha 1, Windows)
-
-1. Download `SavageWind-0.1.0-alpha.1-windows.zip` from [Releases](https://github.com/Revivedx/SavageWindRecomp/releases)
+1. Download `SavageWind-0.2.0-alpha.2-windows.zip` from [Releases](https://github.com/Revivedx/SavageWindRecomp/releases)
    and extract it to a folder you can write to (not Program Files): your game files, saves and settings are kept in
    that folder.
-2. Run `savagewind.exe`. On the start screen choose **Set up game files**, pick the folder with your own extracted
-   game (`exefs/` and `romfs/`, version 1.8.2, see below) and start the setup. It checks the version, copies the
-   files, builds the data image and recompiles the game code on your machine - once, and it takes a while (about 40
-   minutes with a 12-thread CPU). Your own files aren't changed.
-3. **Play**. The overlay menu (Esc or F1) has the settings, including the text and voice languages.
+2. Run `savagewind.exe`. The first time it asks for your game files: pick the folder with your own extracted game
+   (`exefs/` and `romfs/`, version 1.8.2, see below) and choose **Set up game files**. It checks the version, copies
+   the files, builds the data image and recompiles the game code on your machine - once, and it takes a while (about
+   40 minutes with a 12-thread CPU). Your own files aren't changed. When it's done the game starts.
+3. From then on `savagewind.exe` goes straight into the game. The settings, including the text and voice languages,
+   are in the game's Options (pause menu > System > Options, or Options on the title screen).
+4. **Savage Wind Configuration** (`Savage Wind Configuration.exe`, in the same folder) opens the configuration
+   screen: Play, Settings, your game files (set them up again, rebuild the game code, delete them) and Quit. In
+   game, Quit to Start Screen also comes back to it. (Built from source on Linux or macOS: `--config`, the
+   AppImage's **Savage Wind Configuration** desktop action, or Option held while opening the Mac app.)
+
+The setup and configuration screens show Savage Wind's own art. To see a picture of your own there instead, put it
+next to `savagewind.exe` as `splash.jpg` or `splash.png`; it's only read from your folder and never part of
+Savage Wind.
 
 Needs Windows 10 or later, a CPU with AVX2, a GPU with Vulkan 1.3 and about 35 GB of free disk space.
 
@@ -87,6 +66,64 @@ extracted/
 
 The `main` module's build id tells the exact version; `python tools/sw_probe.py` (it reads `extracted/exefs`)
 prints it and what the recompiler will find there.
+
+## Status
+
+Estimates of where each part stands. "Tested in game" is how much of the game has been played through on Savage Wind so far.
+
+| | Part | Progress | What it means |
+|---|---|---|---|
+| ✅ | **Recompiler** | ![100%](https://progress-bar.xyz/100/?width=150&style=square&progress_color=5cb85c) | The whole game (main, sdk and multimedia modules) recompiles to native code |
+| ✅ | **Game files setup** | ![100%](https://progress-bar.xyz/100/?width=150&style=square&progress_color=5cb85c) | Version check, copy, data image and code build, all from your own files |
+| ✅ | **Latest game version** | ![100%](https://progress-bar.xyz/100/?width=150&style=square&progress_color=5cb85c) | Version 1.8.2, the latest |
+| ✅ | **Text and voice languages** | ![100%](https://progress-bar.xyz/100/?width=150&style=square&progress_color=5cb85c) | Any of the game's 15 text languages with any of its 8 voice languages |
+| ✅ | **Menus in 11 languages** | ![100%](https://progress-bar.xyz/100/?width=150&style=square&progress_color=5cb85c) | Savage Wind's own screens follow the text language |
+| ✅ | **Sound and voices** | ![100%](https://progress-bar.xyz/100/?width=150&style=square&progress_color=5cb85c) | Mixed by the game SDK's own audio renderer, with room reverb |
+| ✅ | **Keyboard and mouse** | ![100%](https://progress-bar.xyz/100/?width=150&style=square&progress_color=5cb85c) | Every key and mouse button remappable, mouse camera |
+| ✅ | **Settings in the game's Options** | ![100%](https://progress-bar.xyz/100/?width=150&style=square&progress_color=5cb85c) | Video, audio, controls and language pages drawn by the game itself |
+| ✅ | **Direct start + Configuration** | ![100%](https://progress-bar.xyz/100/?width=150&style=square&progress_color=5cb85c) | savagewind.exe goes straight into the game; Savage Wind Configuration has the rest |
+| ✅ | **Window sizes and fullscreen** | ![100%](https://progress-bar.xyz/100/?width=150&style=square&progress_color=5cb85c) | The sizes your display can show; windowed, borderless or exclusive |
+| ✅ | **Internal resolution and FSR 1** | ![100%](https://progress-bar.xyz/100/?width=150&style=square&progress_color=5cb85c) | Native resolution up to 4K, or AMD FSR 1 quality modes |
+| ✅ | **Shader and pipeline cache** | ![100%](https://progress-bar.xyz/100/?width=150&style=square&progress_color=5cb85c) | Places you've already seen don't stutter again |
+| ✅ | **Frame rate** | ![100%](https://progress-bar.xyz/100/?width=150&style=square&progress_color=5cb85c) | 60 fps by default, or 30, 90, 120 or no limit, with the game at the same speed; menus, cutscenes and conversations at 30, as on the console |
+| 🔧 | **Horizon OS services** | ![90%](https://progress-bar.xyz/90/?width=150&style=square&progress_color=5cb85c) | Threads, files, controllers, applets and time: all the opening and the Great Plateau use |
+| 🔧 | **Maxwell shader translator** | ![90%](https://progress-bar.xyz/90/?width=150&style=square&progress_color=5cb85c) | Every shader seen so far translates to Vulkan |
+| 🔧 | **Graphics (NVN on Vulkan)** | ![75%](https://progress-bar.xyz/75/?width=150&style=square&progress_color=5cb85c) | Shrine and Great Plateau look right, shadows included; two save-screen glitches and a black pause menu background after an in-game restart left |
+| 🔧 | **Controllers** | ![70%](https://progress-bar.xyz/70/?width=150&style=square&progress_color=5cb85c) | Any controller SDL knows, by button position; automatic recognition is next |
+| 🔧 | **Steady 60 fps in the open world** | ![90%](https://progress-bar.xyz/90/?width=150&style=square&progress_color=5cb85c) | 60 fps in a scripted walk at 2560x1440 (RTX 3060, Ryzen 5 5600X); real play still drops to 45-50 fps in places, and the first time an effect appears it stutters while its pipeline is made |
+| 🔧 | **Tested in game** | ![10%](https://progress-bar.xyz/10/?width=150&style=square&progress_color=d9534f) | The Shrine of Resurrection and the Great Plateau; the rest of Hyrule is untested: [report what breaks](https://github.com/Revivedx/SavageWindRecomp/issues/new/choose) |
+| 🗺️ | **Linux** | ![30%](https://progress-bar.xyz/30/?width=150&style=square&progress_color=f0ad4e) | Builds and runs on x86-64 (from LAS Recomp); not yet tested with this game |
+| 🗺️ | **AMD FSR 3 + frame generation** | ![5%](https://progress-bar.xyz/5/?width=150&style=square&progress_color=d9534f) | Planned: motion vectors from depth and the camera, FidelityFX SDK |
+| 🗺️ | **NVIDIA DLSS (RTX)** | ![0%](https://progress-bar.xyz/0/?width=150&style=square&progress_color=d9534f) | Planned, after FSR 3; under NVIDIA's own SDK license |
+| 🗺️ | **Variable refresh rate (VRR)** | ![0%](https://progress-bar.xyz/0/?width=150&style=square&progress_color=d9534f) | Planned: on G-SYNC and FreeSync displays every frame shows as soon as it's ready, without tearing or vsync stutter |
+| 🗺️ | **Faster game code build** | ![0%](https://progress-bar.xyz/0/?width=150&style=square&progress_color=d9534f) | Planned: the one-time setup build in about 20 minutes instead of about 40 (12 threads) |
+| 🗺️ | **Full shader precompilation** | ![0%](https://progress-bar.xyz/0/?width=150&style=square&progress_color=d9534f) | Optional, at setup or in Configuration: no first-time stutter anywhere |
+| 🗺️ | **Mods** | ![0%](https://progress-bar.xyz/0/?width=150&style=square&progress_color=d9534f) | Planned |
+| 🗺️ | **Accessibility options** | ![0%](https://progress-bar.xyz/0/?width=150&style=square&progress_color=d9534f) | Planned: text size, colour-blind filters and toggles in place of held buttons; enemy and Link health, damage dealt and damage taken |
+| 🗺️ | **Button icons for your device** | ![0%](https://progress-bar.xyz/0/?width=150&style=square&progress_color=d9534f) | Planned: the game's button prompts show your keyboard and mouse keys, or the buttons of the controller you're using |
+| 🗺️ | **DLC** | ![0%](https://progress-bar.xyz/0/?width=150&style=square&progress_color=d9534f) | Later |
+| 🗺️ | **amiibo rewards without figures** | ![0%](https://progress-bar.xyz/0/?width=150&style=square&progress_color=d9534f) | Planned |
+
+✅ done · 🔧 in progress · 🗺️ roadmap
+
+## Controls
+
+Any controller SDL knows works, by button position. Keyboard and mouse defaults:
+
+| Action | Key | Action | Key |
+|---|---|---|---|
+| Move | W A S D | Camera | Mouse (or I J K L) |
+| Walk (hold) | C | Crouch | Left Ctrl |
+| Jump (X) | Space | Sprint / back (B) | Left Shift |
+| Interact / confirm (A) | E | Attack (Y) | Left click |
+| Shield / lock on (ZL) | Right click | Bow (ZR) | F |
+| Rune (L) | Q | Throw (R) | R |
+| Look (right stick press) | Middle click | D-pad | Arrow keys |
+| Inventory (Plus) | Tab | Map (Minus) | M |
+
+Every key and mouse button can be remapped in the game's Options (the Keyboard pages), next to the mouse sensitivity
+and Y inversion (Controls). Esc frees the cursor, a click in the window takes it back. F10 cycles the performance
+overlay (off, FPS, full).
 
 ## Building from source
 
@@ -114,42 +151,18 @@ Memory Allocator (`build/savagewind`, `build/swgame.so`).
 Developer notes (in Spanish) - what was changed from LAS Recomp, how the boot got this far, and the debugging
 switches - are in [docs/SAVAGE-WIND.md](docs/SAVAGE-WIND.md).
 
-## Roadmap
+## Respect copyright
 
-- Correct graphics on the Great Plateau, then the rest of the game
-- Always the latest game version (1.8.2 today); DLC support later
-- A launcher for Windows and Linux with PC-style graphics options (the start screen: Windows in Alpha 1, Linux next)
-- Higher internal resolutions, up to 4K and beyond
-- Upscaling with frame generation: AMD FSR and NVIDIA DLSS (each under its SDK's own license)
-- Mods
-- Automatic recognition of any controller (today: any controller SDL knows, by button position)
-- Higher frame rates than the console's 30 fps (needs the game's timing patched)
-
-## Controls
-
-Any controller SDL knows works, by button position. Keyboard and mouse defaults:
-
-| Action | Key | Action | Key |
-|---|---|---|---|
-| Move | W A S D | Camera | Mouse (or I J K L) |
-| Walk (hold) | C | Crouch | Left Ctrl |
-| Jump (X) | Space | Sprint / back (B) | Left Shift |
-| Interact / confirm (A) | E | Attack (Y) | Left click |
-| Shield / lock on (ZL) | Right click | Bow (ZR) | F |
-| Rune (L) | Q | Throw (R) | R |
-| Look (right stick press) | Middle click | D-pad | Arrow keys |
-| Inventory (Plus) | Tab | Map (Minus) | M |
-
-Every key and mouse button can be remapped in the overlay menu (Esc or F1), which also frees the cursor and has the
-mouse sensitivity and Y inversion. F10 cycles the performance overlay (off, FPS, full).
-
-## How it works
-
-The game's AArch64 executables are translated to C (`tools/gen.py`) and compiled into a library next to the app. The
-runtime replaces the Switch underneath it: a kernel and the system services (IPC), the NVN graphics API on top of
-Vulkan with a Maxwell shader translator, and audio. This is not emulation of the console; the game's own code runs
-natively. All of this comes from LAS Recomp, generalized for a much bigger game (about 196,000 functions in three
-modules).
+- *The Legend of Zelda: Breath of the Wild* is © Nintendo. This is a fan project. It is not affiliated with,
+  endorsed by or sponsored by Nintendo. *Nintendo Switch* and *The Legend of Zelda* are trademarks of Nintendo.
+- This repository contains no game files, no game code (also not the C code the recompiler generates from it), no
+  assets, no fonts, no keys - and release builds won't either.
+- The game code you generate and the build made from it contain Nintendo's code. They are for your own use only:
+  don't share them, upload them or ship them.
+- Issues, pull requests or discussions that contain game files, keys, generated code or links to pirated copies
+  will be removed. Piracy is not supported in any way.
+- Follow the copyright laws of your country. Dumping a game you own for personal use is legal in some countries and
+  not in others; that is your responsibility.
 
 ## Credits
 
@@ -165,7 +178,8 @@ modules).
   [Dear ImGui](https://github.com/ocornut/imgui) (MIT),
   [Vulkan Memory Allocator](https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator) (MIT),
   [SMAA](https://github.com/iryoku/smaa) (MIT), [AMD FidelityFX Super Resolution 1](https://github.com/GPUOpen-Effects/FidelityFX-FSR)
-  (MIT), [Baloo 2](https://github.com/EkType/Baloo2) (SIL OFL 1.1), [shaderc](https://github.com/google/shaderc)
+  (MIT), [Fira Sans](https://github.com/mozilla/Fira) (SIL OFL 1.1), [stb_image](https://github.com/nothings/stb)
+  (public domain / MIT), [shaderc](https://github.com/google/shaderc)
   (Apache 2.0), [Zig](https://ziglang.org) (MIT), [Capstone](https://www.capstone-engine.org) (BSD),
   [Unicorn](https://www.unicorn-engine.org) (GPL 2.0), [python-lz4](https://github.com/python-lz4/python-lz4) (BSD).
 
@@ -189,27 +203,4 @@ The Windows release zip also bundles, unchanged unless noted, under their own li
 - `swgen/`, this project's generator frozen with PyInstaller 6.22 (GPL 2.0 with the bootloader exception): Python
   3.14 (PSF License), Capstone 5.0.9 (BSD), [Unicorn 2.1.4](https://github.com/unicorn-engine/unicorn/tree/2.1.4)
   (GPL 2.0, source at that link) and python-lz4 4.4.5 (BSD).
-- The Baloo 2 font (SIL OFL 1.1, `Baloo2-OFL.txt`).
-
----
-
-## Español (resumen)
-
-**Savage Wind Recomp** es una recompilación estática, en desarrollo, de *The Legend of Zelda: Breath of the Wild*
-(Switch, versión 1.8.2) para Windows y Linux. **Todavía no se puede jugar**: hoy llega al menú principal y corre la
-introducción en el Santuario de la Vida, iluminado, a los 30 FPS del juego, con sonido y voces.
-
-- **Texto y voces en idiomas distintos**: en la consola las voces siguen siempre al idioma del sistema; aquí eliges
-  el idioma del texto (cualquiera de los 15 del juego) y, por separado, el de las voces (por ejemplo, texto en
-  español con voces en japonés). Los menús de Savage Wind están en los 11 idiomas del juego.
-- Teclado y ratón con todas las teclas reasignables, cualquier mando, y un indicador de rendimiento (F10).
-- **Alpha 1** (Windows), una versión de prueba: descarga el zip desde
-  [Releases](https://github.com/Revivedx/SavageWindRecomp/releases), extráelo en una carpeta donde puedas escribir,
-  abre `savagewind.exe`, elige **Set up game files** con tu juego extraído (1.8.2) y después **Play**. La preparación
-  se hace una sola vez y tarda unos 40 minutos; necesita unos 35 GB libres.
-
-- No incluye archivos del juego, código del juego, assets, fuentes ni keys, y nunca los va a incluir.
-- Necesitas tu propia copia legal del juego actualizada a la **1.8.2**, extraída de **tu propia** consola. Este
-  proyecto no da ni va a dar herramientas, keys ni instrucciones para obtener esos archivos, y no desencripta nada.
-- El código que se genera a partir de tu copia es solo para tu uso: no lo compartas.
-- Respeta las leyes de derechos de autor de tu país. No es un proyecto de Nintendo ni está respaldado por Nintendo.
+- The Fira Sans font, Medium and SemiBold (SIL OFL 1.1, `FiraSans-OFL.txt`).

@@ -145,21 +145,38 @@ static bool format_supports(VkFormat f, VkFormatFeatureFlags want) {
 }
 
 // ================================================================== output resolution / per-frame clears
-// Same rules as metal.m (see the comments there).
-static float g_rs_x = 1, g_rs_y = 1;
-void renderer_get_scale(float *sx, float *sy) { *sx = g_rs_x; *sy = g_rs_y; }
-void renderer_set_scale(float sx, float sy) { g_rs_x = sx; g_rs_y = sy; }
+// Render targets are allocated at one of two scales (runtime/nvn/output_scale.c sets both every presented frame):
+//   RS_OUT    the game's final image (1920x1080, its halves) and the display images: the window's resolution, so the
+//             HUD and menus are drawn sharp at any window size
+//   RS_SCENE  the 3D scene's targets (1600x900 docked, and their fractions): the internal resolution, the window's
+//             with the upscaler off, smaller by the upscaler's factor with it on (exec.c upscales at the composite)
+static float g_rs[3][2] = {{1, 1}, {1, 1}, {1, 1}};
+void renderer_get_scale(float *sx, float *sy) { *sx = g_rs[RS_OUT][0]; *sy = g_rs[RS_OUT][1]; }
+void renderer_set_scale(float sx, float sy) { g_rs[RS_OUT][0] = sx; g_rs[RS_OUT][1] = sy; }
+void renderer_get_scene_scale(float *sx, float *sy) { *sx = g_rs[RS_SCENE][0]; *sy = g_rs[RS_SCENE][1]; }
+void renderer_set_scene_scale(float sx, float sy) { g_rs[RS_SCENE][0] = sx; g_rs[RS_SCENE][1] = sy; }
 uint64_t renderer_present_count(void);
+static bool rs_stale(const TexBackend *b) {
+    return b->rs_group && (b->sx != g_rs[b->rs_group][0] || b->sy != g_rs[b->rs_group][1]);
+}
 
-// Render targets at the output scale (Link's Awakening's "Internal resolution"). Off unless
-// SAVAGEWIND_SCALE_TARGETS=1: BOTW 1.8.2's deferred pipeline came out with only its emissive parts lit with it on.
-static bool tex_scalable(const NvnTexture *t) {
+// Which scale a texture takes (RS_*): the game's screen-sized targets are 16:9 2D images or 2D arrays (BOTW renders
+// some half-size passes into layers of 800x450x2 arrays) with the compressible flag (render targets) or the display
+// flag. Everything else keeps its guest size: shadow maps, LUTs, cubemaps, the small odd-sized steps of the bloom and
+// exposure chains (sampled with normalized coordinates, they work at any size). SAVAGEWIND_NO_SCALE=1: none scaled.
+static uint8_t tex_scale_group(const NvnTexture *t) {
     static int on = -1;
-    if (on < 0) on = getenv("SAVAGEWIND_SCALE_TARGETS") && !getenv("SAVAGEWIND_NO_SCALE");
-    if (!on) return false;
-    if (t->target != 1 || t->samples > 1 || !(t->flags & 8) || t->width < 32 || t->height < 16) return false;
+    if (on < 0) on = getenv("SAVAGEWIND_NO_SCALE") == NULL;
+    if (!on) return RS_NONE;
+    if ((t->target != 1 && t->target != 4) || t->samples > 1 || !(t->flags & 9) || t->width < 32 || t->height < 16) return RS_NONE;
     float a = (float)t->width / (float)t->height;
-    return a > 1.74f && a < 1.81f;
+    if (a < 1.74f || a > 1.81f) return RS_NONE;
+    if (t->flags & 1) return RS_OUT;  // NVN_TEXTURE_FLAGS_DISPLAY: the images the game presents
+    for (int k = 0; k < 4; k++)       // the final image's 1920x1080 and its halves (rounded either way)
+        if ((t->width == 1920u >> k || t->width == (1920u + (1u << k) - 1) >> k) &&
+            (t->height == 1080u >> k || t->height == (1080u + (1u << k) - 1) >> k))
+            return RS_OUT;
+    return RS_SCENE;
 }
 
 bool renderer_texture_first_write(NvnTexture *t) {
@@ -173,9 +190,11 @@ bool renderer_texture_first_write(NvnTexture *t) {
 // Bumped when the scene's render targets should start clean (a level change: a game-specific hook; none yet).
 static uint32_t g_level_gen = 1;
 
+// (Link's Awakening cleared its scaled scene targets at their first use in each frame. BOTW keeps data in them from
+// frame to frame, as on the Switch, where nothing clears them: opt-in, SAVAGEWIND_FRAME_CLEAR=1.)
 bool renderer_texture_frame_fresh(NvnTexture *t) {
     static int on = -1;
-    if (on < 0) on = getenv("SAVAGEWIND_NO_FRAME_CLEAR") == NULL;
+    if (on < 0) on = getenv("SAVAGEWIND_FRAME_CLEAR") != NULL;
     TexBackend *b = t ? (TexBackend *)t->backend : NULL;
     uint64_t total_frames = renderer_present_count();
     if (!on || !b || !b->scalable || b->frame_cleared == total_frames + 1) return false;
@@ -241,8 +260,9 @@ void vk_collect_dead(void) {
 
 static void create_image(NvnTexture *t, TexBackend *b) {
     VkFmt mf = fmt_of(t->format);
-    b->sx = b->scalable ? g_rs_x : 1;
-    b->sy = b->scalable ? g_rs_y : 1;
+    b->scalable = b->rs_group != RS_NONE;
+    b->sx = g_rs[b->rs_group][0];
+    b->sy = g_rs[b->rs_group][1];
     uint32_t tw = t->width ? t->width : 1, th = t->height ? t->height : 1;
     if (b->scalable) {
         tw = (uint32_t)lroundf(tw * b->sx); th = (uint32_t)lroundf(th * b->sy);
@@ -293,12 +313,22 @@ static void create_image(NvnTexture *t, TexBackend *b) {
     VkImageCreateFlags flags = 0;
     if (!depthfmt) flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;  // format views (NVN texture views, raw sRGB views)
     if (type == VK_IMAGE_TYPE_2D && layers >= 6 && tw == th && samples == 1) flags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
+    b->slices_renderable = type == VK_IMAGE_TYPE_3D && (usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+    if (b->slices_renderable) flags |= VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT;  // (Vulkan 1.1) 2D views of slices
     VkImageCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .flags = flags, .imageType = type, .format = vf,
                             .extent = {tw, th, depth}, .mipLevels = levels, .arrayLayers = layers,
                             .samples = (VkSampleCountFlagBits)samples, .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = usage,
                             .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
     VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+    // 2D color targets may be sampled by the draws that render into them (exec.c resolve_feedback: a feedback loop)
+    b->feedback_ok = g_vk.feedback_loop && type == VK_IMAGE_TYPE_2D && samples == 1 && (usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+    if (b->feedback_ok) ci.usage |= VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;
     VkResult r = vmaCreateImage(g_vk.vma, &ci, &ai, &b->image, &b->mem, NULL);
+    if (r != VK_SUCCESS && b->feedback_ok) {
+        b->feedback_ok = false;
+        ci.usage &= ~VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;
+        r = vmaCreateImage(g_vk.vma, &ci, &ai, &b->image, &b->mem, NULL);
+    }
     if (r != VK_SUCCESS) {
         LOG("[vk] image creation failed (%d): nvn fmt %#x %ux%ux%u target %u\n", r, t->format, t->width, t->height, t->depth, t->target);
         ci.format = vf = VK_FORMAT_R8G8B8A8_UNORM;
@@ -308,6 +338,8 @@ static void create_image(NvnTexture *t, TexBackend *b) {
         VK_CHECK(vmaCreateImage(g_vk.vma, &ci, &ai, &b->image, &b->mem, NULL));
         depthfmt = false;
     }
+    static uint64_t serials;
+    b->serial = __atomic_add_fetch(&serials, 1, __ATOMIC_RELAXED);
     b->format = vf;
     b->width = tw; b->height = th; b->depth = depth; b->layers = layers; b->levels = levels; b->samples = samples;
     b->aspect = depthfmt ? aspect_of(t->format) : VK_IMAGE_ASPECT_COLOR_BIT;
@@ -316,6 +348,12 @@ static void create_image(NvnTexture *t, TexBackend *b) {
                  : t->target == 8 ? VK_IMAGE_VIEW_TYPE_CUBE : t->target == 9 ? VK_IMAGE_VIEW_TYPE_CUBE_ARRAY
                  : layers > 1 || t->target == 4 || t->target == 6 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
     vk_image_init_layout(vk_upload_cmd(), b->image, b->aspect);
+    if (b->scalable && !depthfmt) {  // (made again at a new scale: no stale memory in what frames keep)
+        VkCommandBuffer cb = vk_upload_cmd();
+        VkClearColorValue zero = {{0}};
+        VkImageSubresourceRange rg = {VK_IMAGE_ASPECT_COLOR_BIT, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS};
+        vkCmdClearColorImage(cb, b->image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &rg);
+    }
     if (depthfmt) {
         // New depth / stencil images start zeroed (as fresh memory reads on Apple GPUs). The game builds its depth
         // pyramid with depth-only copies, so the stencil of those images was never written: whatever the memory
@@ -459,20 +497,24 @@ static TexBackend *tex_backend(NvnTexture *t) {
     TexBackend *b = t->backend;
     if (b) {
         if (t->finalized) b->used_frame = renderer_present_count();
-        if (b->scalable && (b->sx != g_rs_x || b->sy != g_rs_y)) {  // output resolution changed: reallocate
+        if (rs_stale(b)) {  // output resolution changed: reallocate
             destroy_image(b);
             create_image(t, b);
         }
         return b;
     }
-    vk_collect_dead();
-    zombies_expire();
-    idle_expire();
+    static uint64_t expired_at = ~0ull;  // the lists run to thousands in the open world: once a frame is enough
+    if (expired_at != renderer_present_count()) {
+        expired_at = renderer_present_count();
+        vk_collect_dead();
+        zombies_expire();
+        idle_expire();
+    }
     b = t->addr ? keyed_find(t) : NULL;
-    if (b && b->scalable && (b->sx != g_rs_x || b->sy != g_rs_y)) { destroy_image(b); create_image(t, b); }
+    if (b && rs_stale(b)) { destroy_image(b); create_image(t, b); }
     if (!b) {
         b = calloc(1, sizeof *b);
-        b->scalable = tex_scalable(t);
+        b->rs_group = tex_scale_group(t);
         create_image(t, b);
         images_add(b);
         if (t->addr) keyed_add(b, t);
@@ -529,14 +571,19 @@ static uint64_t hash_full(const uint8_t *p, uint64_t n) {
     return h ^ (h >> 31);
 }
 
+// 8 bytes at each of up to 2048 places (a byte at each of 4096 was a cache miss per byte: ~50 textures a frame are
+// sampled in the open world).
 static uint64_t fnv_sample(const uint8_t *p, uint64_t n) {
     uint64_t h = 1469598103934665603ull;
-    uint64_t step = n > 4096 ? n / 4096 : 1;
-    for (uint64_t i = 0; i < n; i += step) { h ^= p[i]; h *= 1099511628211ull; }
+    uint64_t words = n / 8, step = words > 2048 ? words / 2048 : 1;
+    for (uint64_t i = 0; i < words; i += step) { uint64_t w; memcpy(&w, p + i * 8, 8); h = (h ^ w) * 1099511628211ull; h ^= h >> 29; }
+    for (uint64_t i = words * 8; i < n; i++) { h ^= p[i]; h *= 1099511628211ull; }
     return h ^ n;
 }
 
 static pthread_mutex_t pending_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void upload_scaled(VkCommandBuffer cb, TexBackend *b, VkSpan s, VkBufferImageCopy rg, uint32_t gw, uint32_t gh);
 
 static void upload_pending(TexBackend *b) {
     pthread_mutex_lock(&pending_lock);
@@ -545,30 +592,45 @@ static void upload_pending(TexBackend *b) {
     b->pending_rgba = NULL;
     pthread_mutex_unlock(&pending_lock);
     if (!px) return;
-    if (w > b->width) w = b->width;
-    if (h > b->height) h = b->height;
+    bool scaled = b->scalable && (w != b->width || h != b->height);
+    if (!scaled && w > b->width) w = b->width;
+    if (!scaled && h > b->height) h = b->height;
     VkSpan s = vk_transient_copy(px, (uint64_t)stride * h, 16);
     free(px);
     VkBufferImageCopy rg = {.bufferOffset = s.off, .bufferRowLength = stride / 4,
                             .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .imageExtent = {w, h, 1}};
     VkCommandBuffer cb = vk_upload_cmd();
+    if (scaled) { upload_scaled(cb, b, s, rg, w, h); return; }
     vk_dl_note_upload((void *)b->image, rg.imageExtent.width, rg.imageExtent.height, rg.imageSubresource.mipLevel);
                 vkCmdCopyBufferToImage(cb, s.buf, b->image, VK_IMAGE_LAYOUT_GENERAL, 1, &rg);
 }
 
 uint64_t prof_tex_checks, prof_tex_samples, prof_tex_full, prof_tex_full_bytes, prof_tex_dyn;
-static void upload_texture(NvnTexture *t, TexBackend *b) {
+static void upload_levels(NvnTexture *t, TexBackend *b, uint32_t level_mask);
+
+// Bytes of guest storage the texels occupy: rows at the stride for pitch textures, else the block-linear size.
+static uint64_t storage_size(const NvnTexture *t) {
+    if (nvn_texture_flags_pitch(t->flags) && t->stride && t->target != 2)
+        return t->stride * (t->layout.height ? t->layout.height : 1) * (t->layout.layers ? t->layout.layers : 1);
+    return tegra_total_size(&t->layout);
+}
+
+// Whether the texture's storage is readable guest memory (a virtual pool may have been mapped since it was made).
+static bool storage_readable(NvnTexture *t, uint64_t total) {
+    if (t->addr < GUEST_LO && t->pool && t->pool->storage) t->addr = t->pool->storage + t->pool_offset;
+    return t->addr >= GUEST_LO && t->addr + total <= GUEST_HI;
+}
+
+// written: nvnTextureWriteTexels changed the texels (checked now, and that change does not make the texture dynamic)
+static void upload_texture(NvnTexture *t, TexBackend *b, bool written) {
     if (!t->addr || t->target == 10) return;
     uint64_t frame = vk_frame_counter();
-    if (b->uploaded && b->checked_frame == frame) return;
-    if (b->uploaded && !b->dynamic && ((frame + ((uintptr_t)b >> 6)) & 7)) return;
+    if (!written && b->uploaded && b->checked_frame == frame) return;
+    if (!written && b->uploaded && !b->dynamic && ((frame + ((uintptr_t)b >> 6)) & 7)) return;
     const FormatInfo *fi = t->layout.fmt;
     if (!fi || !fi->bpb) return;
-    VkFmt mf = fmt_of(t->format);
-    uint64_t total = tegra_total_size(&t->layout);
-    if (t->addr < GUEST_LO && t->pool && t->pool->storage)  // a virtual pool mapped after the texture was made
-        t->addr = t->pool->storage + t->pool_offset;
-    if (t->addr < GUEST_LO || t->addr + total > GUEST_HI) {  // storage outside guest memory: nothing to read
+    uint64_t total = storage_size(t);
+    if (!storage_readable(t, total)) {  // storage outside guest memory: nothing to read
         static int logged;
         if (logged++ < 8)
             LOG("[vk] texture %llx (%ux%u fmt %u, %llu bytes) has storage %llx outside guest memory (pool %llx: %llx+%llx, "
@@ -598,18 +660,70 @@ static void upload_texture(NvnTexture *t, TexBackend *b) {
     b->full_frame = frame;
     b->sample_hash = fnv_sample(mem, total);
     if (b->uploaded && h == b->data_hash) return;
-    if (b->uploaded && h != b->data_hash) b->dynamic = true;
+    if (b->uploaded && h != b->data_hash && !written) b->dynamic = true;
     b->data_hash = h;
     b->uploaded = true;
+    {   // (debugging) SAVAGEWIND_DUMP_RAW=<w>x<h>x<nvn format hex>: the guest storage of such textures as uploaded
+        static const char *e = (const char *)1;
+        if (e == (const char *)1) e = getenv("SAVAGEWIND_DUMP_RAW");
+        unsigned w, hh, f;
+        if (e && sscanf(e, "%ux%ux%x", &w, &hh, &f) == 3 && t->width == w && t->height == hh && t->format == f) {
+            static int n;
+            char path[160];
+            snprintf(path, sizeof path, "build/raw_%llu_%u_%ux%u_f%x_l%u_d%u_lv%u_bh%u.bin", (unsigned long long)t->debug_id, n++,
+                     t->width, t->height, t->format, t->layout.layers, t->layout.depth, t->layout.levels, t->layout.block_height_log2);
+            FILE *fp = n <= 8 ? fopen(path, "wb") : NULL;
+            if (fp) {
+                fwrite(mem, 1, total, fp);
+                fclose(fp);
+                LOG("[vk] texture #%llu flags %#x stride %llu storage saved as %s\n", (unsigned long long)t->debug_id, t->flags,
+                    (unsigned long long)t->stride, path);
+            }
+        }
+    }
+    upload_levels(t, b, ~0u);
+}
+
+// Guest texels for a scaled image (the CPU filled a render target: the title screen's save pictures): they go into a
+// guest-size image of their own, then a filtered blit brings them to the allocation's size.
+static void upload_scaled(VkCommandBuffer cb, TexBackend *b, VkSpan s, VkBufferImageCopy rg, uint32_t gw, uint32_t gh) {
+    VkImageCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D, .format = b->format,
+                            .extent = {gw, gh, 1}, .mipLevels = 1, .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT,
+                            .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT};
+    VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+    VkImage img;
+    VmaAllocation mem;
+    if (vmaCreateImage(g_vk.vma, &ci, &ai, &img, &mem, NULL) != VK_SUCCESS) return;
+    vk_image_init_layout(cb, img, VK_IMAGE_ASPECT_COLOR_BIT);
+    uint32_t lv = rg.imageSubresource.mipLevel, layer = rg.imageSubresource.baseArrayLayer;
+    rg.imageSubresource.mipLevel = 0;
+    rg.imageSubresource.baseArrayLayer = 0;
+    rg.imageExtent = (VkExtent3D){gw, gh, 1};
+    vkCmdCopyBufferToImage(cb, s.buf, img, VK_IMAGE_LAYOUT_GENERAL, 1, &rg);
+    vk_full_barrier(cb);
+    VkImageBlit bl = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .srcOffsets = {{0, 0, 0}, {(int32_t)gw, (int32_t)gh, 1}},
+                      .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, lv, layer, 1},
+                      .dstOffsets = {{0, 0, 0}, {(int32_t)level_w(b, lv), (int32_t)level_h(b, lv), 1}}};
+    bool lin = format_supports(b->format, VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT);
+    vkCmdBlitImage(cb, img, VK_IMAGE_LAYOUT_GENERAL, b->image, VK_IMAGE_LAYOUT_GENERAL, 1, &bl, lin ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
+    vk_defer_image(img, mem);
+}
+
+// Guest memory -> image for the levels in level_mask (bit per level), every layer or slice.
+static void upload_levels(NvnTexture *t, TexBackend *b, uint32_t level_mask) {
+    const FormatInfo *fi = t->layout.fmt;
+    VkFmt mf = fmt_of(t->format);
+    if (!t->addr || t->target == 10 || !fi || !fi->bpb || !storage_readable(t, storage_size(t))) return;
     if (b->format != mf.vf && !b->astc_bw) return;  // unsupported format: nothing sensible to copy
     VkCommandBuffer cb = vk_upload_cmd();
     uint32_t layers = t->layout.layers ? t->layout.layers : 1;
     if (layers > b->layers && b->depth == 1) layers = b->layers;
-    uint64_t layer_size = tegra_layer_size(&t->layout);
-    bool linear = (t->flags & 0x10) != 0;
+    bool linear = nvn_texture_flags_pitch(t->flags);
+    uint64_t layer_size = linear ? t->stride * (t->layout.height ? t->layout.height : 1) : tegra_layer_size(&t->layout);
     uint32_t levels = t->layout.levels < b->levels ? t->layout.levels : b->levels;
     for (uint32_t layer = 0; layer < layers; layer++) {
         for (uint32_t lv = 0; lv < levels; lv++) {
+            if (!((level_mask >> lv) & 1)) continue;
             LevelLayout l = tegra_level(&t->layout, lv);
             if (b->astc_bw) {  // blocks -> linear block rows -> RGBA8 texels
                 const uint8_t *src = (const uint8_t *)(uintptr_t)t->addr + layer * layer_size + l.offset;
@@ -634,9 +748,22 @@ static void upload_texture(NvnTexture *t, TexBackend *b) {
             uint8_t *lin = expand ? malloc(sz) : s.ptr;
             const uint8_t *src = (const uint8_t *)(uintptr_t)t->addr + layer * layer_size + l.offset;
             if (linear) {
-                for (uint32_t y = 0; y < l.hb; y++) memcpy(lin + (uint64_t)y * row, src + (uint64_t)y * t->stride, row);
+                for (uint32_t y = 0; y < l.hb; y++) memcpy(lin + (uint64_t)y * row, src + (uint64_t)y * (t->stride ? t->stride : row), row);
             } else {
                 tegra_deswizzle(src, lin, l.wb, l.hb, l.d, fi->bpb, l.block_height_log2, l.block_depth_log2);
+            }
+            if (t->target == 2 && lv == 0 && getenv("SAVAGEWIND_DUMP_TEX3D")) {  // (debugging) 3D texels as uploaded
+                char path[128];
+                snprintf(path, sizeof path, "build/tex3d_%llu_%ux%ux%u_f%x.raw", (unsigned long long)t->debug_id, l.w, l.h, l.d,
+                         t->format);
+                FILE *f = fopen(path, "wb");
+                if (f) {
+                    fwrite(lin, 1, sz, f);
+                    fclose(f);
+                    LOG("[vk] 3D texture #%llu at %llx flags %#x stride %llu levels %u bh %u bd %u saved as %s\n",
+                        (unsigned long long)t->debug_id, (unsigned long long)t->addr, t->flags, (unsigned long long)t->stride, t->levels,
+                        l.block_height_log2, l.block_depth_log2, path);
+                }
             }
             if (expand) {  // RGB8 -> RGBA8
                 uint8_t *o = s.ptr;
@@ -657,6 +784,11 @@ static void upload_texture(NvnTexture *t, TexBackend *b) {
                                     .imageExtent = {w, b->base_type == VK_IMAGE_VIEW_TYPE_1D || b->base_type == VK_IMAGE_VIEW_TYPE_1D_ARRAY ? 1 : hh,
                                                     b->depth > 1 ? d : 1}};
             if (b->aspect == (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) continue;  // packed D/S: no CPU layout
+            if (b->scalable && b->aspect == VK_IMAGE_ASPECT_COLOR_BIT && b->depth == 1 &&
+                (l.w != level_w(b, lv) || l.h != level_h(b, lv))) {
+                upload_scaled(cb, b, s, rg, l.w, l.h);
+                continue;
+            }
             vk_dl_note_upload((void *)b->image, rg.imageExtent.width, rg.imageExtent.height, rg.imageSubresource.mipLevel);
                 vkCmdCopyBufferToImage(cb, s.buf, b->image, VK_IMAGE_LAYOUT_GENERAL, 1, &rg);
         }
@@ -767,11 +899,19 @@ TexBackend *vk_tex(NvnTexture *t, bool for_render) {
     if (!for_render && !b->gpu_owned && vk_trace_tex(t))  // (CPU-owned: guest memory is uploaded when it changed)
         vk_trace_event(t, 1, NULL, 0, "use: CPU-owned, uploaded %d dynamic %d", b->uploaded, b->dynamic);
     if (b->pending_rgba) upload_pending(b);
+    // Levels nvnTextureWriteTexels filled go up now, also into an image the GPU draws into: BOTW writes level 0 of its
+    // 32x32x32 noise that way and then renders the smaller levels from it (the noise stayed black: GPU-owned images
+    // never read guest memory again).
+    uint32_t written = __atomic_exchange_n(&t->cpu_levels, 0, __ATOMIC_ACQ_REL);
+    if (written) {
+        if (b->gpu_owned) upload_levels(t, b, written);
+        else upload_texture(t, b, true);
+    }
     if (for_render) b->gpu_owned = true;
     else if (!b->gpu_owned) {
         extern uint64_t prof_up_ns;
         uint64_t t0 = prof_up_ns != ~0ull ? SDL_GetTicksNS() : 0;
-        upload_texture(t, b);
+        upload_texture(t, b, false);
         if (prof_up_ns != ~0ull) prof_up_ns += SDL_GetTicksNS() - t0;
     }
     return b;
@@ -779,17 +919,30 @@ TexBackend *vk_tex(NvnTexture *t, bool for_render) {
 
 void renderer_mark_gpu_owned(NvnTexture *t) { tex_backend(t)->gpu_owned = true; }
 
+// Guest memory -> image for every level, whoever owns the image (exec.c: linear render targets the CPU wrote).
+void vk_texture_reload(NvnTexture *t) {
+    TexBackend *b = tex_backend(t);
+    upload_levels(t, b, ~0u);
+}
+uint64_t vk_hash_bytes(const void *p, uint64_t n) { return hash_full(p, n); }
+
 bool renderer_texture_scalable(NvnTexture *t) { return tex_backend(t)->scalable; }
 
 // Render at the output scale from now on: a target drawn into together with scaled ones (its contents so far, kept
 // at the guest size, are dropped: the pass about to run writes it).
-void renderer_make_scalable(NvnTexture *t) {
+void renderer_make_scalable(NvnTexture *t) { vk_make_scalable_like(t, NULL); }
+
+// ... at the scale of `like` (another attachment of the same pass; NULL: the scene's)
+void vk_make_scalable_like(NvnTexture *t, NvnTexture *like) {
     TexBackend *b = tex_backend(t);
-    if (b->scalable || t->target != 1 || t->samples > 1) return;
-    b->scalable = true;
+    uint8_t g = like ? tex_backend(like)->rs_group : RS_SCENE;
+    if (b->rs_group || !g || (t->target != 1 && t->target != 4) || t->samples > 1) return;  // (a group stays)
+    b->rs_group = g;
     destroy_image(b);
     create_image(t, b);
 }
+
+uint8_t vk_texture_scale_group(NvnTexture *t) { return tex_backend(t)->rs_group; }
 bool renderer_is_gpu_owned(NvnTexture *t) { return tex_backend(t)->gpu_owned; }
 void backend_pool_written(uint64_t addr, uint64_t size) { (void)addr; (void)size; }
 
@@ -882,9 +1035,14 @@ VkImageView vk_view(NvnTexture *t, const NvnTextureView *v, bool has_view, bool 
     if (ly0 >= b->layers) ly0 = b->layers - 1;
     if (ly0 + nly > b->layers) nly = b->layers - ly0;
     if (render) {
-        VkImageViewType type = b->base_type == VK_IMAGE_VIEW_TYPE_3D ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
-        if (b->base_type == VK_IMAGE_VIEW_TYPE_3D) return VK_NULL_HANDLE;  // (3D render targets: not used by the game)
-        return vk_image_view(b, type, fmt, lv0, 1, ly0, 1, IDENTITY, b->aspect);
+        if (b->base_type == VK_IMAGE_VIEW_TYPE_3D) {
+            // One slice of one level (the view's layer is the slice), as a 2D view of the 2D-array-compatible image.
+            // BOTW renders the levels of its 3D noise and an 8x8x8 light volume slice by slice.
+            uint32_t z = v && (v->setmask & 2) ? v->min_layer : 0, d = b->depth >> lv0 ? b->depth >> lv0 : 1;
+            if (!b->slices_renderable || z >= d) return VK_NULL_HANDLE;
+            return vk_image_view(b, VK_IMAGE_VIEW_TYPE_2D, fmt, lv0, 1, z, 1, IDENTITY, b->aspect);
+        }
+        return vk_image_view(b, VK_IMAGE_VIEW_TYPE_2D, fmt, lv0, 1, ly0, 1, IDENTITY, b->aspect);
     }
     VkImageAspectFlags aspect = b->aspect & VK_IMAGE_ASPECT_DEPTH_BIT ? VK_IMAGE_ASPECT_DEPTH_BIT : b->aspect;
     VkComponentMapping sw = IDENTITY;

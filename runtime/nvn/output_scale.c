@@ -1,12 +1,16 @@
 // Output resolution, shared by the Metal and Vulkan backends (each calls output_scale() once per presented frame).
-// Render targets the game sizes for the Switch's 1920x1080 screen are allocated at (sx, sy) times their size; the
-// image is then drawn into (vx, vy, vw, vh) of the window. Video tab "Internal resolution" (g_settings.res_mode):
-//   Match display  render at the window's own pixel size (default)
-//   1x .. 4x       N times the Switch's docked image: 1080 lines x N (wide windows keep their shape: 32:9 at 2x =
-//                  7680 x 2160); capped to the GPU's 16384-pixel texture limit
-//   .75x / .50x / .25x  of Match display (scaled up to the window - with MetalFX on macOS when chosen)
-//   Dynamic        Match display, lowered in steps while the GPU can't hold 60 fps and raised again when it can
-//                  (each change reallocates the render targets: a short hitch, so it changes rarely, with hysteresis)
+// Render targets the game sizes for the Switch's 1920x1080 screen are allocated at (sx, sy) times their size (the
+// final image: the window's resolution, so the HUD and menus are sharp), the 3D scene's (1600x900 docked) at
+// (scene_sx, scene_sy) times theirs (vulkan/textures.c RS_OUT / RS_SCENE); the image is then drawn into
+// (vx, vy, vw, vh) of the window. Video page "Upscaler" (g_settings.upscaler):
+//   Off            the 3D scene renders at the window's own pixel size (its 16:9 part: the game keeps its framing)
+//   AMD FSR 1      the 3D scene renders smaller by the quality mode's factor per axis (AMD's: Ultra Quality 1.3,
+//                  Quality 1.5, Balanced 1.7, Performance 2.0); FSR 1 brings it to its size in the final image at the
+//                  game's composite (vulkan/exec.c scene_upscale)
+//   MetalFX        (macOS) metal.m has no scene / final split yet: the modes stay greyed there, and MetalFX scales the
+//                  game's image to a bigger window
+//   FSR 3, DLSS    listed as coming later (temporal: they need motion vectors, which the game has none of)
+// The window size itself is Video > Window size (runtime/window_size.c).
 // Test overrides: SAVAGEWIND_SCALE=<f> (render height = 1080 x f), SAVAGEWIND_WIDE_TEST=<f> (forced shape).
 #include <math.h>
 #include <stdlib.h>
@@ -16,48 +20,40 @@
 #include "output_scale.h"
 
 #define MAX_TEX 16384.0
+#define SCENE_LINES 900.0  // the height of the game's 3D scene targets (docked)
 
-// Dynamic resolution: a factor on the Match display scale, 0.5 .. 1 in 0.05 steps.
-static double g_dyn = 1.0;
-static double g_dyn_gpu_sum, g_dyn_dt_sum, g_last_t;
-static int g_dyn_n, g_dyn_gpu_n, g_dyn_good;
-static double g_dyn_cool_until, g_dyn_probe_wait = 5.0, g_dyn_probe_at;
-static double g_dyn_last_raise = -100;
-
-static void dyn_update(double now, double gpu_ms) {
-    double dt = g_last_t > 0 ? (now - g_last_t) * 1000.0 : 16.7;
-    g_last_t = now;
-    if (dt > 250) return;  // (loading, menus, a stall: not the GPU's steady state)
-    g_dyn_dt_sum += dt;
-    g_dyn_n++;
-    if (gpu_ms >= 0) { g_dyn_gpu_sum += gpu_ms; g_dyn_gpu_n++; }
-    if (g_dyn_n < 30) return;  // decide every ~half second
-    double avg_dt = g_dyn_dt_sum / g_dyn_n, avg_gpu = g_dyn_gpu_n ? g_dyn_gpu_sum / g_dyn_gpu_n : -1;
-    g_dyn_dt_sum = g_dyn_gpu_sum = 0;
-    g_dyn_n = g_dyn_gpu_n = 0;
-    if (now < g_dyn_cool_until) return;
-    double prev = g_dyn;
-    bool slow = avg_dt > 17.4 || (avg_gpu >= 0 && avg_gpu > 14.5);
-    if (slow) {
-        g_dyn = fmax(0.5, g_dyn - (avg_dt > 22 ? 0.1 : 0.05));
-        g_dyn_good = 0;
-        if (now - g_dyn_last_raise < 3.0) g_dyn_probe_wait = fmin(g_dyn_probe_wait * 2, 60.0);  // raised too eagerly
-    } else if (g_dyn < 1.0) {
-        g_dyn_good++;
-        // with GPU timing: raise when there is clear headroom; without (Vulkan): probe upwards now and then
-        bool room = avg_gpu >= 0 ? avg_gpu < 10.5 && g_dyn_good >= 4 : now >= g_dyn_probe_at && g_dyn_good >= 2 * (int)g_dyn_probe_wait;
-        if (room) { g_dyn = fmin(1.0, g_dyn + 0.05); g_dyn_good = 0; g_dyn_last_raise = now; g_dyn_probe_at = now + g_dyn_probe_wait; }
-    }
-    g_dyn = round(g_dyn * 20) / 20;
-    if (g_dyn != prev) {
-        g_dyn_cool_until = now + 1.5;
-        LOG("[dynres] %.2f -> %.2f (frame %.1f ms, gpu %.1f ms)\n", prev, g_dyn, avg_dt, avg_gpu);
-    }
+bool upscaler_available(int u) {
+#ifdef __APPLE__
+    return u == UPSCALE_OFF || u == UPSCALE_METALFX;
+#else
+    return u == UPSCALE_OFF || u == UPSCALE_FSR1;
+#endif
 }
 
-double output_scale_dynamic_factor(void) { return g_dyn; }
+double upscale_mode_factor(int q) {
+    static const double f[UPQ_COUNT] = {1.3, 1.5, 1.7, 2.0};
+    return q >= 0 && q < UPQ_COUNT ? f[q] : 1.5;
+}
 
-void output_scale(double dw, double dh, bool reshape_allowed, double now, double gpu_ms, OutScale *o) {
+// Rendering below the window's size: the 3D scene's render targets at their own scale (vulkan/textures.c). Metal has
+// that only with SAVAGEWIND_SCALE_TARGETS=1 (untested with BOTW); SAVAGEWIND_NO_SCALE=1 turns it off (game sizes).
+bool upscale_modes_available(void) {
+    static int on = -1;
+#ifdef __APPLE__
+    if (on < 0) on = getenv("SAVAGEWIND_SCALE_TARGETS") && !getenv("SAVAGEWIND_NO_SCALE");
+#else
+    if (on < 0) on = !getenv("SAVAGEWIND_NO_SCALE");
+#endif
+    return on;
+}
+
+double upscale_factor(void) {
+    int u = g_settings.upscaler;
+    return u != UPSCALE_OFF && upscaler_available(u) && upscale_modes_available()
+               ? upscale_mode_factor(g_settings.upscale_quality) : 1.0;
+}
+
+void output_scale(double dw, double dh, bool reshape_allowed, OutScale *o) {
     double fit = fmin(dw / 1920.0, dh / 1080.0);
     static double forced = -1, wide_test = -1;
     if (forced < 0) forced = getenv("SAVAGEWIND_SCALE") ? atof(getenv("SAVAGEWIND_SCALE")) : 0;
@@ -65,23 +61,24 @@ void output_scale(double dw, double dh, bool reshape_allowed, double now, double
     double shape = wide_test > 0 ? wide_test : (dw / dh) / (16.0 / 9.0);
     bool reshape = reshape_allowed && fabs(shape - 1.0) > 0.005;
     if (!reshape) shape = 1.0;
-    // render height in units of the Switch's 1080 lines
-    double h;
-    int mode = g_settings.res_mode;
-    if (forced > 0) h = forced;
-    else if (mode >= 1 && mode <= 8) h = mode;
-    else {
-        h = reshape ? dh / 1080.0 : fit;  // Match display
-        if (mode == RES_DYNAMIC) { dyn_update(now, gpu_ms); h *= g_dyn; }
-        else if (mode == RES_Q75) h *= 0.75;
-        else if (mode == RES_Q25) h *= 0.25;
-        else if (mode == RES_Q50) h *= 0.5;
-    }
-    h = fmax(h, 0.1);  // (.25x of a small window)
+    // render height in units of the Switch's 1080 lines: the window's (Metal: divided by the upscaler's factor)
+#ifdef __APPLE__
+    double out_div = upscale_factor(), scene_div = 1.0;
+#else
+    double out_div = 1.0, scene_div = upscale_factor();
+#endif
+    double h = forced > 0 ? forced : (reshape ? dh / 1080.0 : fit) / out_div;
+    h = fmax(h, 0.1);  // (a tiny window)
     double sx = h * shape, sy = h;
     double cap = fmin(MAX_TEX / (1920.0 * sx), MAX_TEX / (1080.0 * sy));
     if (cap < 1.0) { sx *= cap; sy *= cap; }
     o->sx = sx; o->sy = sy; o->shape = shape;
+    // the 3D scene (BOTW docked: 1600x900, composited into the 1920x1080 final image) at the final image's
+    // resolution, divided by the upscaler's factor
+    double k = 1080.0 / SCENE_LINES / scene_div;
+    o->scene_sx = sx * k; o->scene_sy = sy * k;
+    double scap = fmin(MAX_TEX / (1920.0 * o->scene_sx), MAX_TEX / (1080.0 * o->scene_sy));
+    if (scap < 1.0) { o->scene_sx *= scap; o->scene_sy *= scap; }
     // where the image goes in the window: fills it when reshaped, else a fitted 16:9 box
     if (reshape) { o->vw = dw; o->vh = dh; }
     else { o->vw = 1920.0 * fit; o->vh = 1080.0 * fit; }
@@ -90,4 +87,10 @@ void output_scale(double dw, double dh, bool reshape_allowed, double now, double
         o->vw = 1920.0 * wide_test * f2; o->vh = 1080.0 * f2;
     }
     o->vx = (dw - o->vw) / 2; o->vy = (dh - o->vh) / 2;
+}
+
+void output_scale_screen(double sw, double sh, int iw, int ih, OutScale *o) {
+    double k = fmin(sw / iw, sh / ih), ox = (sw - iw * k) / 2, oy = (sh - ih * k) / 2;
+    o->vx = ox + o->vx * k; o->vy = oy + o->vy * k;
+    o->vw *= k; o->vh *= k;
 }

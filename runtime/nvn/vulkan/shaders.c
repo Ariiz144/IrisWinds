@@ -1,5 +1,6 @@
 // GLSL -> SPIR-V (shaderc), descriptor layouts from the SPIR-V itself, translated NVN programs, built-in shaders.
 #include <pthread.h>
+#include <stddef.h>
 #include <shaderc/shaderc.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,17 +18,44 @@ static shaderc_shader_kind kind_of(int stage) {
     return stage == STAGE_VERTEX ? shaderc_vertex_shader : stage == STAGE_FRAGMENT ? shaderc_fragment_shader : shaderc_compute_shader;
 }
 
+// The shader and pipeline caches live in cache/ under the data root (the working directory), or in the folder
+// SAVAGEWIND_CACHE_DIR names (tests that must not touch the player's caches).
+const char *vk_cache_dir(void) {
+    static const char *dir;
+    if (!dir) {
+        const char *e = getenv("SAVAGEWIND_CACHE_DIR");
+        dir = e && *e ? e : "cache";
+        mkdir(dir, 0755);
+    }
+    return dir;
+}
+
+void vk_cache_path(char *out, size_t n, const char *name) {
+    snprintf(out, n, "%s/%s", vk_cache_dir(), name);
+}
+
+// What the translated shaders depend on besides their binaries: the translator's build and the SPIR-V
+// post-processing below. Caches built from translated shaders (cache/xlate, the pipeline cache, the pipeline list)
+// are valid for one value of this only.
+#define SPIRV_POST_VERSION 3  // (no_contraction)
+const char *vk_shader_version(void) {
+    static char v[64];
+    if (!v[0]) snprintf(v, sizeof v, "%s/spv%d", maxwell_translator_id(), SPIRV_POST_VERSION);
+    return v;
+}
+
 // SPIR-V disk cache: cache/spirv/<hash of stage + source>.spv, so a known shader costs a file read instead of a
 // GLSL compile (the driver's pipeline cache only covers the step after this one).
 static uint64_t src_hash(const char *src, int stage) {
-    uint64_t h = (0xcbf29ce484222325ull ^ (uint64_t)stage) + 3;  // + version of the post-processing (no_contraction)
+    uint64_t h = (0xcbf29ce484222325ull ^ (uint64_t)stage) + SPIRV_POST_VERSION;
     for (const char *p = src; *p; p++) { h ^= (uint8_t)*p; h *= 0x100000001B3ull; }
     return h;
 }
 
 static uint32_t *cache_load(uint64_t h, size_t *nwords) {
-    char path[64];
-    snprintf(path, sizeof path, "cache/spirv/%016llx.spv", (unsigned long long)h);
+    char path[512], name[64];
+    snprintf(name, sizeof name, "spirv/%016llx.spv", (unsigned long long)h);
+    vk_cache_path(path, sizeof path, name);
     FILE *f = fopen(path, "rb");
     if (!f) return NULL;
     fseek(f, 0, SEEK_END);
@@ -43,15 +71,176 @@ static uint32_t *cache_load(uint64_t h, size_t *nwords) {
 
 static void cache_store(uint64_t h, const uint32_t *spv, size_t nwords) {
     static int made;
-    if (!made) { made = 1; mkdir("cache", 0755); mkdir("cache/spirv", 0755); }
-    char path[64], tmp[80];
-    snprintf(path, sizeof path, "cache/spirv/%016llx.spv", (unsigned long long)h);
+    char path[512], tmp[540], name[64];
+    if (!made) { made = 1; vk_cache_path(path, sizeof path, "spirv"); mkdir(path, 0755); }
+    snprintf(name, sizeof name, "spirv/%016llx.spv", (unsigned long long)h);
+    vk_cache_path(path, sizeof path, name);
     snprintf(tmp, sizeof tmp, "%s.%llx", path, (unsigned long long)(uintptr_t)&made ^ (unsigned long long)(uintptr_t)spv);
     FILE *f = fopen(tmp, "wb");
     if (!f) return;
     bool ok = fwrite(spv, 4, nwords, f) == nwords;
     fclose(f);
     if (!ok || rename(tmp, path) != 0) remove(tmp);  // (another thread may have stored it first)
+}
+
+// ---- translated shaders (Maxwell -> GLSL): 1-4 ms each in the open world, on the GPU thread while compiles are
+// synchronous, and programs share their vertex and fragment shaders. Kept in memory by stage, binary and key, and on
+// disk as cache/xlate/<hash>.bin, so a shader seen in an earlier session costs a file read. The hash covers the bytes
+// the translator reads, the key and the translator's build (a new build of translate.c starts over).
+// The hash is also the translation's id (vk_translate_id): the pipeline list (exec.c) names shaders by it.
+typedef struct { char magic[4]; uint32_t info_size, msl_len, bin_size; ShaderKey key; int32_t stage; } XlateHeader;
+#define XLATE_TAB 16384
+static struct { uint64_t h; ShaderInfo *si; } xlate_tab[XLATE_TAB];
+static struct { const ShaderInfo *si; uint64_t h; } xlate_ids[XLATE_TAB];  // the other way round
+static pthread_mutex_t xlate_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static uint64_t hash64(uint64_t h, const void *p, size_t n) {
+    const uint8_t *b = p;
+    for (; n >= 8; n -= 8, b += 8) { uint64_t w; memcpy(&w, b, 8); h = (h ^ w) * 0x9E3779B97F4A7C15ull; h ^= h >> 29; }
+    for (; n; n--, b++) h = (h ^ *b) * 0x100000001B3ull;
+    return h ^ (h >> 32);
+}
+
+// want: the header the file must have (all but msl_len), or NULL to take the one in the file (by id: the hash
+// covers it) when it is sane and of that stage.
+static ShaderInfo *xlate_load(uint64_t h, const XlateHeader *want, int stage) {
+    char path[512], name[64];
+    snprintf(name, sizeof name, "xlate/%016llx.bin", (unsigned long long)h);
+    vk_cache_path(path, sizeof path, name);
+    FILE *f = fopen(path, "rb");
+    if (!f) return NULL;
+    XlateHeader hd;
+    ShaderInfo *si = NULL;
+    bool ok = fread(&hd, sizeof hd, 1, f) == 1 && hd.msl_len < (64u << 20);
+    if (ok && want)
+        ok = !memcmp(&hd, want, offsetof(XlateHeader, msl_len)) && hd.bin_size == want->bin_size &&
+             !memcmp(&hd.key, &want->key, sizeof hd.key) && hd.stage == want->stage;
+    else if (ok)
+        ok = !memcmp(hd.magic, "SWX1", 4) && hd.info_size == sizeof(ShaderInfo) && hd.stage == stage && hd.msl_len;
+    if (ok) {
+        si = malloc(sizeof *si);
+        char *msl = malloc(hd.msl_len + 1);
+        if (si && msl && fread(si, sizeof *si, 1, f) == 1 && fread(msl, 1, hd.msl_len, f) == hd.msl_len && si->stage == hd.stage) {
+            msl[hd.msl_len] = 0;
+            si->msl = msl;
+        } else {
+            free(si);
+            free(msl);
+            si = NULL;
+        }
+    }
+    fclose(f);
+    return si;
+}
+
+// Into the tables (xlate_lock held): the first translation stored under h wins, so that every caller gets the
+// same ShaderInfo for the same id. Returns that one (si freed when another was there first).
+static ShaderInfo *xlate_keep(uint64_t h, ShaderInfo *si) {
+    uint32_t slot = (uint32_t)h & (XLATE_TAB - 1), probes = 0;
+    while (xlate_tab[slot].h && xlate_tab[slot].h != h && probes++ < XLATE_TAB) slot = (slot + 1) & (XLATE_TAB - 1);
+    if (xlate_tab[slot].h == h) {
+        if (xlate_tab[slot].si != si) maxwell_free(si);
+        return xlate_tab[slot].si;
+    }
+    if (xlate_tab[slot].h) return si;  // (full: not kept)
+    xlate_tab[slot].h = h;
+    xlate_tab[slot].si = si;
+    uint32_t r = (uint32_t)(((uintptr_t)si >> 4) * 0x9E3779B1u) & (XLATE_TAB - 1);
+    for (probes = 0; xlate_ids[r].si && probes < XLATE_TAB; probes++) r = (r + 1) & (XLATE_TAB - 1);
+    if (!xlate_ids[r].si) { xlate_ids[r].si = si; xlate_ids[r].h = h; }
+    return si;
+}
+
+uint64_t vk_translate_id(const ShaderInfo *si) {
+    uint64_t h = 0;
+    pthread_mutex_lock(&xlate_lock);
+    uint32_t r = (uint32_t)(((uintptr_t)si >> 4) * 0x9E3779B1u) & (XLATE_TAB - 1);
+    for (uint32_t probes = 0; xlate_ids[r].si && probes < XLATE_TAB; probes++, r = (r + 1) & (XLATE_TAB - 1))
+        if (xlate_ids[r].si == si) { h = xlate_ids[r].h; break; }
+    pthread_mutex_unlock(&xlate_lock);
+    return h;
+}
+
+ShaderInfo *vk_translate_load_id(uint64_t id, int stage) {
+    if (!id) return NULL;
+    pthread_mutex_lock(&xlate_lock);
+    uint32_t slot = (uint32_t)id & (XLATE_TAB - 1), probes = 0;
+    while (xlate_tab[slot].h && xlate_tab[slot].h != id && probes++ < XLATE_TAB) slot = (slot + 1) & (XLATE_TAB - 1);
+    ShaderInfo *si = xlate_tab[slot].h == id ? xlate_tab[slot].si : NULL;
+    pthread_mutex_unlock(&xlate_lock);
+    if (si) return si->stage == stage ? si : NULL;
+    si = xlate_load(id, NULL, stage);
+    if (!si) return NULL;
+    pthread_mutex_lock(&xlate_lock);
+    si = xlate_keep(id, si);
+    pthread_mutex_unlock(&xlate_lock);
+    return si;
+}
+
+static void xlate_store(uint64_t h, const XlateHeader *hd, const ShaderInfo *si) {
+    static int made;
+    char path[512], tmp[540], name[64];
+    if (!made) { made = 1; vk_cache_path(path, sizeof path, "xlate"); mkdir(path, 0755); }
+    snprintf(name, sizeof name, "xlate/%016llx.bin", (unsigned long long)h);
+    vk_cache_path(path, sizeof path, name);
+    snprintf(tmp, sizeof tmp, "%s.%llx", path, (unsigned long long)(uintptr_t)si);
+    FILE *f = fopen(tmp, "wb");
+    if (!f) return;
+    ShaderInfo copy = *si;
+    copy.msl = NULL;
+    bool ok = fwrite(hd, sizeof *hd, 1, f) == 1 && fwrite(&copy, sizeof copy, 1, f) == 1 &&
+              fwrite(si->msl, 1, hd->msl_len, f) == hd->msl_len;
+    fclose(f);
+    if (!ok || rename(tmp, path) != 0) remove(tmp);  // (another thread may have stored it first)
+}
+
+ShaderInfo *vk_translate_cached(const uint8_t *code, size_t max_size, int stage, const ShaderKey *key) {
+    static int off = -1;  // SAVAGEWIND_NO_XLATE_CACHE=1: translate every time
+    if (off < 0) off = getenv("SAVAGEWIND_NO_XLATE_CACHE") != NULL;
+    if (off || maxwell_translation_uncacheable()) return maxwell_translate(code, max_size, stage, key);
+    XlateHeader hd;
+    memset(&hd, 0, sizeof hd);
+    memcpy(hd.magic, "SWX1", 4);
+    hd.info_size = sizeof(ShaderInfo);
+    hd.bin_size = (uint32_t)maxwell_binary_size(code, max_size, stage);
+    hd.key = *key;
+    hd.stage = stage;
+    const char *id = maxwell_translator_id();
+    uint64_t h = hash64(0xcbf29ce484222325ull, id, strlen(id));
+    h = hash64(h, &hd, sizeof hd);
+    h = hash64(h, code, hd.bin_size);
+    if (!h) h = 1;
+    pthread_mutex_lock(&xlate_lock);
+    uint32_t slot = (uint32_t)h & (XLATE_TAB - 1), probes = 0;
+    while (xlate_tab[slot].h && xlate_tab[slot].h != h && probes++ < XLATE_TAB) slot = (slot + 1) & (XLATE_TAB - 1);
+    ShaderInfo *si = xlate_tab[slot].h == h ? xlate_tab[slot].si : NULL;
+    pthread_mutex_unlock(&xlate_lock);
+    if (si) return si;
+    si = xlate_load(h, &hd, stage);
+    if (si && getenv("SAVAGEWIND_XLATE_VERIFY")) {  // (debugging) the cached translation is the one the translator gives
+        ShaderInfo *f = maxwell_translate(code, max_size, stage, key);
+        ShaderInfo a = *si, b = *f;
+        a.msl = b.msl = NULL;
+        bool same = f->msl && !strcmp(f->msl, si->msl) && !memcmp(&a, &b, sizeof a);
+        static int nlog;
+        if (!same && nlog++ < 20) {
+            size_t i = 0;
+            while (f->msl && si->msl[i] && si->msl[i] == f->msl[i]) i++;
+            LOG("[xlate] cached translation differs (stage %d, %zu / %zu bytes, first at %zu, struct %s)\n", stage, strlen(si->msl),
+                f->msl ? strlen(f->msl) : 0, i, memcmp(&a, &b, sizeof a) ? "differs" : "same");
+        }
+        maxwell_free(f);
+    }
+    if (!si) {
+        si = maxwell_translate(code, max_size, stage, key);
+        if (!si->msl) return si;
+        hd.msl_len = (uint32_t)strlen(si->msl);
+        xlate_store(h, &hd, si);
+    }
+    pthread_mutex_lock(&xlate_lock);
+    si = xlate_keep(h, si);
+    pthread_mutex_unlock(&xlate_lock);
+    return si;
 }
 
 // Vertex shaders: every float add/sub/mul/div/fma gets NoContraction, so no compiler fuses or splits them. Depth
@@ -311,7 +500,7 @@ static const char *builtin_src(const char *name, int *stage) {
         return src[k];
     }
     // AMD FidelityFX Super Resolution 1 (MIT), EASU: edge-adaptive upscale. a = (in / out scale xy, offset zw),
-    // b.xy = input size. 12 taps around the source pixel, direction / edge length from luma, Lanczos-2-like
+    // b.xy = input size (alpha: bilinear, for the 3D scene's composite, exec.c scene_upscale). 12 taps around the source pixel, direction / edge length from luma, Lanczos-2-like
     // weights stretched along the edge, clamped to the nearest 4 (no ringing).
     if (!strcmp(name, "easu.frag")) {
         *stage = STAGE_FRAGMENT;
@@ -338,6 +527,7 @@ static const char *builtin_src(const char *name, int *stage) {
                "}\n"
                "void main() {\n"
                "  vec2 pp = floor(gl_FragCoord.xy) * pc.a.xy + pc.a.zw;\n"
+               "  float alpha = texture(t, (pp + 0.5) / pc.b.xy).a;\n"
                "  vec2 fpf = floor(pp); pp -= fpf;\n"
                "  ivec2 fp = ivec2(fpf);\n"
                "  //    b c\n"
@@ -378,7 +568,7 @@ static const char *builtin_src(const char *name, int *stage) {
                "  tapf(ac, aw, vec2(1.0, 0.0) - pp, dir, len2, lob, clp, gC);\n"
                "  tapf(ac, aw, vec2(1.0, 2.0) - pp, dir, len2, lob, clp, oC);\n"
                "  tapf(ac, aw, vec2(0.0, 2.0) - pp, dir, len2, lob, clp, nC);\n"
-               "  o = vec4(min(mx, max(mn, ac / aw)), 1.0);\n"
+               "  o = vec4(min(mx, max(mn, ac / aw)), alpha);\n"
                "}\n";
     }
     // FSR 1 RCAS: contrast-adaptive sharpening of the EASU output (same size). a.x = sharpness (exp2(-stops)),
@@ -406,7 +596,7 @@ static const char *builtin_src(const char *name, int *stage) {
                "  vec3 hitMax = (1.0 - max(mx4, e)) / min(4.0 * mn4 - 4.0, vec3(-1.0 / 65536.0));\n"
                "  vec3 lobeRGB = max(-hitMin, hitMax);\n"
                "  float lobe = max(-(0.25 - 1.0 / 16.0), min(max(lobeRGB.r, max(lobeRGB.g, lobeRGB.b)), 0.0)) * pc.a.x * nz;\n"
-               "  o = vec4((lobe * (b + d + f + h) + e) / (4.0 * lobe + 1.0), 1.0);\n"
+               "  o = vec4((lobe * (b + d + f + h) + e) / (4.0 * lobe + 1.0), texelFetch(t, ip, 0).a);\n"
                "}\n";
     }
     if (!strcmp(name, "clear.vert")) {

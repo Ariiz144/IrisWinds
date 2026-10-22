@@ -2,6 +2,7 @@
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
 #include <math.h>
+#include <pthread.h>
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
@@ -11,19 +12,41 @@
 #include "../../paths.h"
 #include "../../settings.h"
 #include "../../ui/menu.h"
+#include "../../window_size.h"
 #include "vk.h"
 #include "../output_scale.h"
 #include "../renderer.h"
+
+#ifdef _WIN32  // (kernel32; windows.h itself clashes with names used here)
+__declspec(dllimport) int __stdcall MoveFileExA(const char *from, const char *to, unsigned long flags);
+#define MOVEFILE_REPLACE_EXISTING 0x1
+#define MOVEFILE_WRITE_THROUGH 0x8
+#endif
 
 VkG g_vk;
 static SDL_Window *window;
 static atomic_bool ui_ready;
 static VkDebugUtilsMessengerEXT messenger;
+uint64_t g_addr_report_lo, g_addr_report_hi;  // (SAVAGEWIND_VK_ADDR_REPORT)
+uint64_t renderer_present_count(void);
 
 // ================================================================== instance / device
 static VKAPI_ATTR VkBool32 VKAPI_CALL debug_cb(VkDebugUtilsMessageSeverityFlagBitsEXT sev, VkDebugUtilsMessageTypeFlagsEXT type,
                                                const VkDebugUtilsMessengerCallbackDataEXT *d, void *user) {
-    (void)type, (void)user;
+    (void)user;
+    if (type & VK_DEBUG_UTILS_MESSAGE_TYPE_DEVICE_ADDRESS_BINDING_BIT_EXT) {  // (SAVAGEWIND_VK_ADDR_REPORT)
+        extern uint64_t g_addr_report_lo, g_addr_report_hi;
+        const VkDeviceAddressBindingCallbackDataEXT *ab = NULL;
+        for (const VkBaseInStructure *x = d->pNext; x; x = x->pNext)
+            if (x->sType == VK_STRUCTURE_TYPE_DEVICE_ADDRESS_BINDING_CALLBACK_DATA_EXT) ab = (const void *)x;
+        if (ab && ab->baseAddress < g_addr_report_hi && ab->baseAddress + ab->size > g_addr_report_lo)
+            LOG("[vkaddr] %s %#llx+%#llx %s obj type %d handle %#llx (frame %llu)\n",
+                ab->bindingType == VK_DEVICE_ADDRESS_BINDING_TYPE_BIND_EXT ? "bind" : "unbind", (unsigned long long)ab->baseAddress,
+                (unsigned long long)ab->size, (ab->flags & VK_DEVICE_ADDRESS_BINDING_INTERNAL_OBJECT_BIT_EXT) ? "internal" : "",
+                d->objectCount ? (int)d->pObjects[0].objectType : -1, d->objectCount ? (unsigned long long)d->pObjects[0].objectHandle : 0ull,
+                (unsigned long long)renderer_present_count());
+        return VK_FALSE;
+    }
     static int n;
     if (sev >= VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT && n++ < 500) LOG("[vk] %s\n", d->pMessage);
     return VK_FALSE;
@@ -37,7 +60,11 @@ static void create_instance(void) {
     uint32_t n_ext = 0;
     for (Uint32 i = 0; i < n_sdl && n_ext < 14; i++) ext[n_ext++] = sdl_ext[i];
     bool validate = getenv("SAVAGEWIND_VK_VALIDATION") != NULL;
-    if (validate) ext[n_ext++] = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
+    // (debugging) SAVAGEWIND_VK_ADDR_REPORT=<lo>-<hi> (hex GPU addresses): every bind and unbind of GPU memory in that
+    // range ("[vkaddr]"), to name what a device fault's address was
+    const char *ar = getenv("SAVAGEWIND_VK_ADDR_REPORT");
+    if (ar) sscanf(ar, "%llx-%llx", (unsigned long long *)&g_addr_report_lo, (unsigned long long *)&g_addr_report_hi);
+    if (validate || ar) ext[n_ext++] = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
     const char *layers[] = {"VK_LAYER_KHRONOS_validation"};
     VkApplicationInfo app = {.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .pApplicationName = "Savage Wind",
                              .pEngineName = "Savage Wind", .apiVersion = VK_API_VERSION_1_3};
@@ -53,14 +80,16 @@ static void create_instance(void) {
         r = vkCreateInstance(&ci, NULL, &g_vk.inst);
     }
     if (r != VK_SUCCESS) FATAL("vkCreateInstance: %d (is a Vulkan 1.3 driver installed?)\n", r);
-    if (validate) {
+    if (validate || ar) {
         PFN_vkCreateDebugUtilsMessengerEXT f =
             (PFN_vkCreateDebugUtilsMessengerEXT)vkGetInstanceProcAddr(g_vk.inst, "vkCreateDebugUtilsMessengerEXT");
         VkDebugUtilsMessengerCreateInfoEXT mi = {
             .sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT,
-            .messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT,
+            .messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT |
+                               (ar ? VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT : 0),
             .messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT |
-                           VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT,
+                           VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT |
+                           (ar ? VK_DEBUG_UTILS_MESSAGE_TYPE_DEVICE_ADDRESS_BINDING_BIT_EXT : 0),
             .pfnUserCallback = debug_cb};
         if (f) f(g_vk.inst, &mi, NULL, &messenger);
     }
@@ -101,12 +130,22 @@ static void pick_device(void) {
     for (uint32_t i = 0; i < nq; i++) {
         VkBool32 present = VK_FALSE;
         vkGetPhysicalDeviceSurfaceSupportKHR(g_vk.phys, i, g_vk.surface, &present);
-        if ((qp[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) && (qp[i].queueFlags & VK_QUEUE_COMPUTE_BIT) && present) { g_vk.qfam = i; break; }
+        if ((qp[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) && (qp[i].queueFlags & VK_QUEUE_COMPUTE_BIT) && present) {
+            g_vk.qfam = i;
+            g_vk.qfam_count = qp[i].queueCount;
+            break;
+        }
     }
     free(qp);
     if (g_vk.qfam == UINT32_MAX) FATAL("no graphics+present queue\n");
     LOG("[vk] using %s\n", g_vk.props.deviceName);
     { extern void perfmon_set_gpu_hint(const char *n); perfmon_set_gpu_hint(g_vk.props.deviceName); }
+}
+
+// Video > Upscaler: NVIDIA DLSS needs an NVIDIA RTX GPU (tensor cores: GeForce / Quadro RTX, the RTX A / Ada
+// workstation cards; not the GTX 16 series)
+bool renderer_gpu_rtx(void) {
+    return g_vk.phys && g_vk.props.vendorID == 0x10DE && strstr(g_vk.props.deviceName, "RTX") != NULL;
 }
 
 static bool g_fault_ext;
@@ -135,14 +174,20 @@ void vk_device_fault_report(void) {
             (unsigned long long)vend[i].vendorFaultData);
 }
 
+static void pipeline_cache_load(void);
+static void *pc_saver(void *arg);
+
 static void create_device(void) {
     uint32_t ne = 0;
     vkEnumerateDeviceExtensionProperties(g_vk.phys, NULL, &ne, NULL);
     VkExtensionProperties *ep = calloc(ne, sizeof *ep);
     vkEnumerateDeviceExtensionProperties(g_vk.phys, NULL, &ne, ep);
-    const char *ext[8];
+    const char *ext[16];
     uint32_t n_ext = 0;
     ext[n_ext++] = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
+    bool addr_report = g_addr_report_hi && has_ext(ep, ne, VK_EXT_DEVICE_ADDRESS_BINDING_REPORT_EXTENSION_NAME);
+    if (addr_report) ext[n_ext++] = VK_EXT_DEVICE_ADDRESS_BINDING_REPORT_EXTENSION_NAME;
+    if (g_addr_report_hi) LOG("[vk] address binding report %s\n", addr_report ? "on" : "not supported");
     g_vk.custom_border = has_ext(ep, ne, VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME);
     if (g_vk.custom_border) ext[n_ext++] = VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME;
     g_vk.divisor = has_ext(ep, ne, VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME);
@@ -152,11 +197,30 @@ static void create_device(void) {
     bool fault = has_ext(ep, ne, VK_EXT_DEVICE_FAULT_EXTENSION_NAME);  // device-lost diagnostics (vk_device_fault_report)
     if (fault) ext[n_ext++] = VK_EXT_DEVICE_FAULT_EXTENSION_NAME;
     g_fault_ext = fault;
+    // Color targets a draw samples while it writes them (exec.c resolve_feedback): a feedback loop in GENERAL layout
+    // with a barrier inside the pass between such draws, instead of a copy of the target before each one.
+    // SAVAGEWIND_VK_NO_FEEDBACK_LOOP=1: copies, as before.
+    bool fbl = !getenv("SAVAGEWIND_VK_NO_FEEDBACK_LOOP") && has_ext(ep, ne, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME) &&
+               has_ext(ep, ne, VK_KHR_UNIFIED_IMAGE_LAYOUTS_EXTENSION_NAME) &&
+               has_ext(ep, ne, VK_KHR_DYNAMIC_RENDERING_LOCAL_READ_EXTENSION_NAME);
     free(ep);
 
     // features the backend relies on (all present on current desktop drivers)
-    VkPhysicalDeviceFeatures2 have = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+    VkPhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT fbl_have = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_FEATURES_EXT};
+    VkPhysicalDeviceUnifiedImageLayoutsFeaturesKHR uil_have = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_UNIFIED_IMAGE_LAYOUTS_FEATURES_KHR,
+                                                               .pNext = &fbl_have};
+    VkPhysicalDeviceDynamicRenderingLocalReadFeaturesKHR lr_have = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_LOCAL_READ_FEATURES_KHR, .pNext = &uil_have};
+    VkPhysicalDeviceFeatures2 have = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = fbl ? &lr_have : NULL};
     vkGetPhysicalDeviceFeatures2(g_vk.phys, &have);
+    g_vk.feedback_loop = fbl && fbl_have.attachmentFeedbackLoopLayout && uil_have.unifiedImageLayouts && lr_have.dynamicRenderingLocalRead;
+    if (g_vk.feedback_loop) {
+        ext[n_ext++] = VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME;
+        ext[n_ext++] = VK_KHR_UNIFIED_IMAGE_LAYOUTS_EXTENSION_NAME;
+        ext[n_ext++] = VK_KHR_DYNAMIC_RENDERING_LOCAL_READ_EXTENSION_NAME;
+    }
+    LOG("[vk] attachment feedback loops %s\n", g_vk.feedback_loop ? "on" : "off (target copies)");
     VkPhysicalDeviceVertexAttributeDivisorFeaturesEXT div = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_EXT,
         .vertexAttributeInstanceRateDivisor = VK_TRUE, .vertexAttributeInstanceRateZeroDivisor = VK_FALSE};
@@ -176,7 +240,18 @@ static void create_device(void) {
                                             .storageBuffer16BitAccess = VK_TRUE, .pNext = &f12};
     VkPhysicalDeviceFaultFeaturesEXT ff = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT, .deviceFault = VK_TRUE,
                                            .pNext = &f11};
-    VkPhysicalDeviceFeatures2 f = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = fault ? (void *)&ff : (void *)&f11};
+    VkPhysicalDeviceAddressBindingReportFeaturesEXT abr = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ADDRESS_BINDING_REPORT_FEATURES_EXT,
+                                                           .reportAddressBinding = VK_TRUE, .pNext = fault ? (void *)&ff : (void *)&f11};
+    VkPhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT fbl_on = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_FEATURES_EXT, .attachmentFeedbackLoopLayout = VK_TRUE,
+        .pNext = addr_report ? (void *)&abr : fault ? (void *)&ff : (void *)&f11};
+    VkPhysicalDeviceUnifiedImageLayoutsFeaturesKHR uil_on = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_UNIFIED_IMAGE_LAYOUTS_FEATURES_KHR,
+                                                             .unifiedImageLayouts = VK_TRUE, .pNext = &fbl_on};
+    VkPhysicalDeviceDynamicRenderingLocalReadFeaturesKHR lr_on = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_LOCAL_READ_FEATURES_KHR, .dynamicRenderingLocalRead = VK_TRUE,
+        .pNext = &uil_on};
+    VkPhysicalDeviceFeatures2 f = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+                                   .pNext = g_vk.feedback_loop ? (void *)&lr_on : addr_report ? (void *)&abr : fault ? (void *)&ff : (void *)&f11};
     VkPhysicalDeviceFeatures *b = &f.features, *h = &have.features;
     b->independentBlend = h->independentBlend;
     b->dualSrcBlend = h->dualSrcBlend;
@@ -186,8 +261,10 @@ static void create_device(void) {
     b->shaderInt64 = h->shaderInt64;
     b->depthBiasClamp = h->depthBiasClamp;
     b->depthClamp = h->depthClamp;
+    g_vk.depth_clamp = h->depthClamp;
     b->largePoints = h->largePoints;
     b->wideLines = h->wideLines;
+    g_vk.wide_lines = h->wideLines;
     b->imageCubeArray = h->imageCubeArray;
     b->sampleRateShading = h->sampleRateShading;
     b->fragmentStoresAndAtomics = h->fragmentStoresAndAtomics;
@@ -195,13 +272,16 @@ static void create_device(void) {
     b->robustBufferAccess = h->robustBufferAccess;  // guest shaders index cbufs freely: keep OOB reads harmless
     b->shaderClipDistance = h->shaderClipDistance;
     if (!h->shaderInt64) LOG("[vk] warning: no shaderInt64 (64-bit address math in shaders)\n");
-    float prio = 1.0f;
+    float prio[2] = {1.0f, 1.0f};
+    // two queues when the family has them: the second one presents (present thread below)
     VkDeviceQueueCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex = g_vk.qfam,
-                                  .queueCount = 1, .pQueuePriorities = &prio};
+                                  .queueCount = g_vk.qfam_count >= 2 ? 2 : 1, .pQueuePriorities = prio};
     VkDeviceCreateInfo di = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .pNext = &f, .queueCreateInfoCount = 1,
                              .pQueueCreateInfos = &qi, .enabledExtensionCount = n_ext, .ppEnabledExtensionNames = ext};
     VK_CHECK(vkCreateDevice(g_vk.phys, &di, NULL, &g_vk.dev));
     vkGetDeviceQueue(g_vk.dev, g_vk.qfam, 0, &g_vk.queue);
+    g_vk.present_queue = g_vk.queue;
+    if (qi.queueCount == 2) vkGetDeviceQueue(g_vk.dev, g_vk.qfam, 1, &g_vk.present_queue);
 
     VmaAllocatorCreateInfo ai = {.physicalDevice = g_vk.phys, .device = g_vk.dev, .instance = g_vk.inst,
                                  .vulkanApiVersion = VK_API_VERSION_1_3};
@@ -215,41 +295,196 @@ static void create_device(void) {
                                   .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, .queueFamilyIndex = g_vk.qfam};
     VK_CHECK(vkCreateCommandPool(g_vk.dev, &pi, NULL, &g_vk.pool));
 
-    // pipeline cache: cache/vk_pipelines.bin (written by vk_pipeline_cache_save)
+    pipeline_cache_load();
+    pthread_t saver;
+    pthread_create(&saver, NULL, pc_saver, NULL);
+}
+
+// ================================================================== pipeline cache
+// cache/vk_pipelines.bin: PcHeader, then the driver's pipeline cache data. The header says what the data is good
+// for - this GPU, this driver, this build of the shader translator - and checks it is whole: with any of that
+// different, or the file damaged or cut short, the cache starts empty (the file is replaced at the next save). The
+// driver checks its own header too, and data it rejects starts the cache empty as well.
+// Saved at exit and, while the game runs, from a thread of its own a few seconds after new pipelines stop coming
+// (at most every 30 s, at least every 2 minutes while there are new ones), so a crash loses little. A temporary
+// file replaces the old one only once complete. SAVAGEWIND_VK_NO_PIPELINE_CACHE=1: neither loaded nor saved.
+#define PC_VERSION 1
+typedef struct {
+    char magic[8];  // "SWPCACHE"
+    uint32_t version, vendor, device, driver;
+    uint8_t uuid[VK_UUID_SIZE];
+    char shaders[64];  // vk_shader_version()
+    uint64_t size, hash;  // of the data after the header
+} PcHeader;
+
+const char *vk_shader_version(void);
+void vk_cache_path(char *out, size_t n, const char *name);
+static _Atomic int pc_new;         // pipelines made since the last save that the cache did not have
+static _Atomic uint64_t pc_new_at; // when the last one was made (ms)
+static uint64_t pc_saved_at;
+static pthread_mutex_t pc_save_lock = PTHREAD_MUTEX_INITIALIZER;
+static bool pc_off;
+
+static uint64_t data_hash(const void *p, size_t n) {
+    const uint8_t *b = p;
+    uint64_t h = 0xcbf29ce484222325ull ^ n;
+    for (; n >= 8; n -= 8, b += 8) { uint64_t w; memcpy(&w, b, 8); h = (h ^ w) * 0x9E3779B97F4A7C15ull; h ^= h >> 29; }
+    for (; n; n--, b++) h = (h ^ *b) * 0x100000001B3ull;
+    return h ^ (h >> 32);
+}
+
+static void pc_header(PcHeader *h) {
+    memset(h, 0, sizeof *h);
+    memcpy(h->magic, "SWPCACHE", 8);
+    h->version = PC_VERSION;
+    h->vendor = g_vk.props.vendorID;
+    h->device = g_vk.props.deviceID;
+    h->driver = g_vk.props.driverVersion;
+    memcpy(h->uuid, g_vk.props.pipelineCacheUUID, VK_UUID_SIZE);
+    snprintf(h->shaders, sizeof h->shaders, "%s", vk_shader_version());
+}
+
+// The data of a cache file, or NULL with *why saying what is wrong with it.
+static void *pc_read(FILE *f, size_t *size, const char **why) {
+    PcHeader h, want;
+    pc_header(&want);
+    fseek(f, 0, SEEK_END);
+    long n = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (n < (long)sizeof h || fread(&h, sizeof h, 1, f) != 1) { *why = "too short"; return NULL; }
+    if (memcmp(h.magic, "SWPC", 4) && n > 16 + VK_UUID_SIZE) {
+        // the format before the header (the driver's data alone, saved at exit only): taken once if the driver's own
+        // header says it is for this GPU and driver; the next save writes the new format
+        uint8_t *d = malloc((size_t)n);
+        uint32_t w[4];
+        fseek(f, 0, SEEK_SET);
+        if (d && fread(d, 1, (size_t)n, f) == (size_t)n && (memcpy(w, d, 16), w[0] >= 16 + VK_UUID_SIZE) &&
+            w[1] == VK_PIPELINE_CACHE_HEADER_VERSION_ONE && w[2] == want.vendor && w[3] == want.device &&
+            !memcmp(d + 16, want.uuid, VK_UUID_SIZE)) {
+            *size = (size_t)n;
+            *why = "older format, taken";
+            atomic_store(&pc_new, 1);  // (rewritten in the new format at the next save)
+            return d;
+        }
+        free(d);
+        *why = "older format, for another GPU or driver";
+        return NULL;
+    }
+    if (memcmp(h.magic, want.magic, 8) || h.version != want.version) { *why = "older format"; return NULL; }
+    if (h.vendor != want.vendor || h.device != want.device) { *why = "made on another GPU"; return NULL; }
+    if (h.driver != want.driver || memcmp(h.uuid, want.uuid, VK_UUID_SIZE)) { *why = "made with another driver"; return NULL; }
+    if (memcmp(h.shaders, want.shaders, sizeof h.shaders)) { *why = "made by another shader translator build"; return NULL; }
+    if (h.size != (uint64_t)n - sizeof h) { *why = "cut short"; return NULL; }
+    uint8_t *d = malloc(h.size ? h.size : 1);
+    if (!d || fread(d, 1, h.size, f) != h.size || data_hash(d, h.size) != h.hash) { free(d); *why = "damaged"; return NULL; }
+    // the driver's own header (VkPipelineCacheHeaderVersionOne): length, version 1, vendor, device, UUID
+    uint32_t w[4];
+    if (h.size < 16 + VK_UUID_SIZE) { free(d); *why = "empty"; return NULL; }
+    memcpy(w, d, 16);
+    if (w[0] < 16 + VK_UUID_SIZE || w[1] != VK_PIPELINE_CACHE_HEADER_VERSION_ONE || w[2] != want.vendor || w[3] != want.device ||
+        memcmp(d + 16, want.uuid, VK_UUID_SIZE)) { free(d); *why = "driver header does not match"; return NULL; }
+    *size = h.size;
+    return d;
+}
+
+static void pipeline_cache_load(void) {
+    pc_off = getenv("SAVAGEWIND_VK_NO_PIPELINE_CACHE") != NULL;
+    char path[512];
+    vk_cache_path(path, sizeof path, "vk_pipelines.bin");
     size_t sz = 0;
     void *data = NULL;
-    FILE *fp = fopen("cache/vk_pipelines.bin", "rb");
+    const char *why = pc_off ? "off (SAVAGEWIND_VK_NO_PIPELINE_CACHE)" : "no file yet";
+    FILE *fp = pc_off ? NULL : fopen(path, "rb");
     if (fp) {
-        fseek(fp, 0, SEEK_END);
-        sz = (size_t)ftell(fp);
-        fseek(fp, 0, SEEK_SET);
-        data = malloc(sz);
-        if (fread(data, 1, sz, fp) != sz) sz = 0;
+        why = NULL;
+        data = pc_read(fp, &sz, &why);
         fclose(fp);
     }
-    VkPipelineCacheCreateInfo pc = {.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO, .initialDataSize = sz,
+    VkPipelineCacheCreateInfo pc = {.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO, .initialDataSize = data ? sz : 0,
                                     .pInitialData = data};
-    if (vkCreatePipelineCache(g_vk.dev, &pc, NULL, &g_vk.pcache) != VK_SUCCESS) {
+    VkResult r = vkCreatePipelineCache(g_vk.dev, &pc, NULL, &g_vk.pcache);
+    if (r != VK_SUCCESS && data) {
+        why = "rejected by the driver";
+        free(data);
+        data = NULL;
         pc.initialDataSize = 0;
-        VK_CHECK(vkCreatePipelineCache(g_vk.dev, &pc, NULL, &g_vk.pcache));
+        pc.pInitialData = NULL;
+        r = vkCreatePipelineCache(g_vk.dev, &pc, NULL, &g_vk.pcache);
     }
+    VK_CHECK(r);
+    if (data) LOG("[vk] pipeline cache: %s, %.1f MB%s%s%s\n", path, sz / 1048576.0, why ? " (" : "", why ? why : "", why ? ")" : "");
+    else LOG("[vk] pipeline cache: starts empty (%s: %s)\n", path, why);
     free(data);
+    pc_saved_at = SDL_GetTicks();
+}
+
+// A finished temporary file in place of path, in one step (the old file stays whole until then).
+bool vk_replace_file(const char *tmp, const char *path) {
+#ifdef _WIN32
+    return MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+#else
+    return rename(tmp, path) == 0;
+#endif
+}
+
+// exec.c, after each pipeline made: hit = the pipeline cache had it (creation feedback; false when unknown).
+void vk_pipeline_cache_note(bool hit) {
+    if (hit) return;
+    atomic_fetch_add(&pc_new, 1);
+    atomic_store(&pc_new_at, SDL_GetTicks());
 }
 
 void vk_pipeline_cache_save(void) {
+    if (pc_off || !g_vk.pcache) return;
+    pthread_mutex_lock(&pc_save_lock);
+    int news = atomic_exchange(&pc_new, 0);
+    if (!news) { pthread_mutex_unlock(&pc_save_lock); return; }
+    uint64_t t0 = SDL_GetTicksNS();
+    PcHeader h;
+    pc_header(&h);
     size_t sz = 0;
-    if (vkGetPipelineCacheData(g_vk.dev, g_vk.pcache, &sz, NULL) != VK_SUCCESS || !sz) return;
-    void *data = malloc(sz);
-    if (vkGetPipelineCacheData(g_vk.dev, g_vk.pcache, &sz, data) == VK_SUCCESS) {
-        mkdir("cache", 0755);
-        FILE *f = fopen("cache/vk_pipelines.bin.tmp", "wb");
-        if (f) {
-            bool ok = fwrite(data, 1, sz, f) == sz;
-            fclose(f);
-            if (ok) { remove("cache/vk_pipelines.bin"); rename("cache/vk_pipelines.bin.tmp", "cache/vk_pipelines.bin"); }
-        }
+    uint8_t *buf = NULL;
+    VkResult r = VK_INCOMPLETE;
+    for (int tries = 0; tries < 4 && r == VK_INCOMPLETE; tries++) {  // (pipelines made meanwhile make it grow)
+        if (vkGetPipelineCacheData(g_vk.dev, g_vk.pcache, &sz, NULL) != VK_SUCCESS || !sz) break;
+        sz += sz / 16;
+        free(buf);
+        buf = malloc(sizeof h + sz);
+        if (!buf) break;
+        r = vkGetPipelineCacheData(g_vk.dev, g_vk.pcache, &sz, buf + sizeof h);
     }
-    free(data);
+    char path[512], tmp[540];
+    vk_cache_path(path, sizeof path, "vk_pipelines.bin");
+    snprintf(tmp, sizeof tmp, "%s.%d.tmp", path, (int)getpid());
+    bool ok = r == VK_SUCCESS && buf;
+    if (ok) {
+        h.size = sz;
+        h.hash = data_hash(buf + sizeof h, sz);
+        memcpy(buf, &h, sizeof h);
+        FILE *f = fopen(tmp, "wb");
+        ok = f && fwrite(buf, 1, sizeof h + sz, f) == sizeof h + sz;
+        if (f && fclose(f)) ok = false;
+        if (!ok || !vk_replace_file(tmp, path)) { ok = false; remove(tmp); }
+    }
+    free(buf);
+    if (!ok) atomic_fetch_add(&pc_new, news);  // (try again later)
+    pc_saved_at = SDL_GetTicks();
+    LOG("[vk] pipeline cache %s: %.1f MB, %d new pipelines, %.0f ms\n", ok ? "saved" : "NOT saved", sz / 1048576.0, news,
+        (SDL_GetTicksNS() - t0) / 1e6);
+    pthread_mutex_unlock(&pc_save_lock);
+}
+
+static void *pc_saver(void *arg) {
+    (void)arg;
+    for (;;) {
+        SDL_Delay(1000);
+        extern void vk_pso_flush(void);
+        vk_pso_flush();  // (exec.c: the pipeline list's new records)
+        if (!atomic_load(&pc_new)) continue;
+        uint64_t now = SDL_GetTicks(), quiet = now - atomic_load(&pc_new_at), since = now - pc_saved_at;
+        if ((quiet >= 3000 && since >= 30000) || since >= 120000) vk_pipeline_cache_save();
+    }
+    return NULL;
 }
 
 // ================================================================== swapchain
@@ -313,8 +548,81 @@ static void create_swapchain(void) {
 }
 
 static void recreate_swapchain(void) {
+    vk_present_idle();
     vkDeviceWaitIdle(g_vk.dev);
     create_swapchain();
+}
+
+// ================================================================== present thread
+// vkQueuePresentKHR waits until the GPU has finished the frame (NVIDIA on Windows, windowed). On the game's GPU thread
+// that wait (13-18 ms on a fifth of the open-world frames: the frame's last submission goes to the GPU just before)
+// came on top of translating the next frame, and BOTW's frame timer dropped the game to 20 fps (interval 3) whenever
+// three frames in a row ran over 31.7 ms. On the console a present only queues the frame. Here a thread of its own
+// presents, on a second queue of the same family (queues are externally synchronized: the GPU thread keeps submitting
+// on the first one meanwhile). One present at a time; the next acquire, a swapchain change and teardown wait for it.
+// SAVAGEWIND_VK_PRESENT_THREAD=0 (or a family with one queue): presents on the calling thread, as before.
+static pthread_mutex_t pres_m = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t pres_cv = PTHREAD_COND_INITIALIZER;
+static bool pres_busy;           // a present is queued or in progress
+static VkPresentInfoKHR pres_info;
+static VkSwapchainKHR pres_sc;
+static VkSemaphore pres_sem;
+static uint32_t pres_img;
+static _Atomic int pres_stale;   // that present said the swapchain is out of date or suboptimal
+
+static void *present_thread(void *arg) {
+    (void)arg;
+    pthread_mutex_lock(&pres_m);
+    for (;;) {
+        while (!pres_busy) pthread_cond_wait(&pres_cv, &pres_m);
+        VkPresentInfoKHR pi = pres_info;
+        pthread_mutex_unlock(&pres_m);
+        VkResult r = vkQueuePresentKHR(g_vk.present_queue, &pi);
+        if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) atomic_store(&pres_stale, 1);
+        else if (r != VK_SUCCESS) { static int n; if (n++ < 5) LOG("[vk] present failed: %d\n", r); }
+        pthread_mutex_lock(&pres_m);
+        pres_busy = false;
+        pthread_cond_broadcast(&pres_cv);
+    }
+    return NULL;
+}
+
+static bool present_threaded(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("SAVAGEWIND_VK_PRESENT_THREAD");
+        on = g_vk.present_queue != g_vk.queue && !(e && !strcmp(e, "0"));
+        if (on) { pthread_t t; pthread_create(&t, NULL, present_thread, NULL); }
+        LOG("[vk] presents on %s\n", on ? "a thread of their own (second queue)" : "the calling thread");
+    }
+    return on;
+}
+
+void vk_present_idle(void) {
+    pthread_mutex_lock(&pres_m);
+    while (pres_busy) pthread_cond_wait(&pres_cv, &pres_m);
+    pthread_mutex_unlock(&pres_m);
+}
+
+// Present window image img once sem is signalled. Returns false when the swapchain must be made again.
+static bool present_image(uint32_t img, VkSemaphore sem) {
+    if (!present_threaded()) {
+        VkPresentInfoKHR pi = {.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, .waitSemaphoreCount = 1, .pWaitSemaphores = &sem,
+                               .swapchainCount = 1, .pSwapchains = &g_vk.swapchain, .pImageIndices = &img};
+        VkResult r = vkQueuePresentKHR(g_vk.queue, &pi);
+        return !(r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR);
+    }
+    pthread_mutex_lock(&pres_m);
+    while (pres_busy) pthread_cond_wait(&pres_cv, &pres_m);
+    pres_sc = g_vk.swapchain;
+    pres_sem = sem;
+    pres_img = img;
+    pres_info = (VkPresentInfoKHR){.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, .waitSemaphoreCount = 1, .pWaitSemaphores = &pres_sem,
+                                   .swapchainCount = 1, .pSwapchains = &pres_sc, .pImageIndices = &pres_img};
+    pres_busy = true;
+    pthread_cond_signal(&pres_cv);
+    pthread_mutex_unlock(&pres_m);
+    return true;
 }
 
 // ================================================================== frames (start screen and game)
@@ -343,6 +651,7 @@ static void image_barrier(VkCommandBuffer cb, VkImage img, VkImageLayout from, V
     vkCmdPipelineBarrier2(cb, &di);
 }
 
+uint64_t g_present_split[6];  // (VK_PROF) acquire, end pass, draw + menu, submit, present, slot wait
 typedef struct { uint32_t image; VkSemaphore acquired; bool ok; } Frame;
 static Frame cur_frame;
 
@@ -354,15 +663,24 @@ bool vk_frame_begin(const float clear[4]) {
     SDL_GetWindowSizeInPixels(window, &w, &h);
     // minimised (Windows keeps the window's size then, but its surface is 0 x 0: every acquire was out of date)
     if (!w || !h || (SDL_GetWindowFlags(window) & SDL_WINDOW_MINIMIZED)) return false;
-    if (!g_vk.swapchain || (uint32_t)w != g_vk.sc_extent.width || (uint32_t)h != g_vk.sc_extent.height) recreate_swapchain();
+    uint64_t tp = SDL_GetTicksNS();
+    vk_present_idle();  // (the swapchain is externally synchronized: no acquire while the present thread presents)
+    g_present_split[4] += SDL_GetTicksNS() - tp;
+    if (!g_vk.swapchain || (uint32_t)w != g_vk.sc_extent.width || (uint32_t)h != g_vk.sc_extent.height ||
+        atomic_exchange(&pres_stale, 0))
+        recreate_swapchain();
     if (!g_vk.swapchain) return false;
     static int trace = -1;
     if (trace < 0) trace = getenv("SAVAGEWIND_VK_TRACE") != NULL;
     if (trace) LOG("[vk] frame begin %dx%d (swapchain %ux%u)\n", w, h, g_vk.sc_extent.width, g_vk.sc_extent.height);
     slot = (slot + 1) % FRAMES;
     if (!acquire_sem[slot]) acquire_sem[slot] = binary_semaphore();
+    uint64_t tw = SDL_GetTicksNS();
     vk_wait_seq(slot_seq[slot]);
+    g_present_split[5] += SDL_GetTicksNS() - tw;
+    uint64_t ta = SDL_GetTicksNS();
     VkResult r = vkAcquireNextImageKHR(g_vk.dev, g_vk.swapchain, UINT64_MAX, acquire_sem[slot], VK_NULL_HANDLE, &cur_frame.image);
+    g_present_split[0] += SDL_GetTicksNS() - ta;
     if (r == VK_ERROR_OUT_OF_DATE_KHR) {
         recreate_swapchain();
         r = vkAcquireNextImageKHR(g_vk.dev, g_vk.swapchain, UINT64_MAX, acquire_sem[slot], VK_NULL_HANDLE, &cur_frame.image);
@@ -387,6 +705,7 @@ bool vk_frame_begin(const float clear[4]) {
     VkRect2D sc = {{0, 0}, g_vk.sc_extent};
     vkCmdSetViewport(cb, 0, 1, &vp);
     vkCmdSetScissor(cb, 0, 1, &sc);
+    vk_dyn_forget();
     cur_frame.ok = true;
     return true;
 }
@@ -409,6 +728,7 @@ void vk_frame_resume(void) {
     VkRect2D sc = {{0, 0}, g_vk.sc_extent};
     vkCmdSetViewport(cb, 0, 1, &vp);
     vkCmdSetScissor(cb, 0, 1, &sc);
+    vk_dyn_forget();
 }
 
 VkExtent2D vk_frame_extent(void) { return g_vk.sc_extent; }
@@ -435,11 +755,12 @@ void vk_frame_end(const char *shot_path) {
     uint32_t img = cur_frame.image;
     if (!done_sem[img]) done_sem[img] = binary_semaphore();
     uint64_t seq = vk_pending_seq();
+    uint64_t ts = SDL_GetTicksNS();
     vk_submit_extra(cur_frame.acquired, done_sem[img], VK_NULL_HANDLE);
-    VkPresentInfoKHR pi = {.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, .waitSemaphoreCount = 1, .pWaitSemaphores = &done_sem[img],
-                           .swapchainCount = 1, .pSwapchains = &g_vk.swapchain, .pImageIndices = &img};
-    VkResult r = vkQueuePresentKHR(g_vk.queue, &pi);
-    if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) recreate_swapchain();
+    g_present_split[3] += SDL_GetTicksNS() - ts;
+    ts = SDL_GetTicksNS();
+    if (!present_image(img, done_sem[img])) recreate_swapchain();
+    g_present_split[4] += SDL_GetTicksNS() - ts;
     cur_frame.ok = false;
     if (shot_path) {
         vk_wait_seq(seq);
@@ -470,6 +791,7 @@ void vk_save_png(const char *path, const uint8_t *rgba, uint32_t w, uint32_t h) 
 extern void vk_present_draw(VkCommandBuffer cb, TexBackend *b, float vx, float vy, float vw, float vh, const float pv[8]);
 void renderer_submit(void);
 void renderer_set_scale(float sx, float sy);
+void renderer_set_scene_scale(float sx, float sy);
 uint64_t renderer_present_count(void);
 void renderer_save_texture_tex(TexBackend *b, const char *path);
 
@@ -488,13 +810,57 @@ void backend_represent(void) {
     else SDL_Delay(16);
 }
 
+// ---- pipeline pre-warm (exec.c): the first frame that looks like gameplay waits until the pipelines of the list are
+// built. When that takes more than a moment, the window shows a bar of how far it is meanwhile (black, the bar a
+// third of the width near the bottom; clears only, nothing to compile).
+bool vk_pso_wait_needed(void);
+bool vk_pso_wait(int ms, float *done);
+
+static void present_progress(float done) {
+    static const float black[4] = {0, 0, 0, 1};
+    if (!vk_frame_begin(black)) return;
+    VkCommandBuffer cb = vk_cmd();
+    int32_t w = (int32_t)g_vk.sc_extent.width, h = (int32_t)g_vk.sc_extent.height;
+    int32_t bw = w / 3, bh = h / 90 > 4 ? h / 90 : 4, x = (w - bw) / 2, y = h - h / 8;
+    int32_t fill = (int32_t)(done * (float)bw);
+    struct { VkRect2D r; float c; } parts[3] = {{{{x - 2, y - 2}, {(uint32_t)bw + 4, (uint32_t)bh + 4}}, 0.4f},
+                                                {{{x, y}, {(uint32_t)bw, (uint32_t)bh}}, 0.06f},
+                                                {{{x, y}, {(uint32_t)(fill > 0 ? fill : 0), (uint32_t)bh}}, 0.85f}};
+    for (int i = 0; i < 3; i++) {
+        if (!parts[i].r.extent.width || x < 2 || y < 2) continue;
+        VkClearAttachment a = {.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT, .colorAttachment = 0,
+                               .clearValue.color.float32 = {parts[i].c, parts[i].c, parts[i].c, 1}};
+        VkClearRect cr = {parts[i].r, 0, 1};
+        vkCmdClearAttachments(cb, 1, &a, 1, &cr);
+    }
+    static int shot;  // (SAVAGEWIND_PSO_SLOW_MS, exec.c: the first bar frame past a quarter)
+    bool save = !shot && done > 0.25f && getenv("SAVAGEWIND_PSO_SLOW_MS");
+    if (save) { shot = 1; mkdir("build", 0755); }
+    vk_frame_end(save ? "build/pso_wait.png" : NULL);
+}
+
+static uint64_t pso_wait(void) {  // ns waited
+    if (!vk_pso_wait_needed()) return 0;
+    uint64_t t0 = SDL_GetTicksNS();
+    float done = 0;
+    int bars = 0;
+    while (!vk_pso_wait(100, &done))
+        if (SDL_GetTicksNS() - t0 > 300000000ull) { present_progress(done); bars++; }
+    uint64_t dt = SDL_GetTicksNS() - t0;
+    LOG("[pso] frame %llu waited %.0f ms for the pipeline pre-warm (%d frames with the bar)\n", (unsigned long long)total_frames + 1,
+        dt / 1e6, bars);
+    return dt;
+}
+
 static void present_locked(NvnTexture *t) {
     g_last_presented = t;
     TexBackend *b = vk_tex(t, true);
     b->presented = true;
-    vk_end_pass();
-    static const float black[4] = {0, 0, 0, 1};
     uint64_t t0 = SDL_GetTicksNS();
+    vk_end_pass();
+    g_present_split[1] += SDL_GetTicksNS() - t0;
+    t0 += pso_wait();  // (not the acquire's time)
+    static const float black[4] = {0, 0, 0, 1};
     bool have = vk_frame_begin(black);
     uint64_t nd = SDL_GetTicksNS() - t0;
     if (nd > 30000000) {
@@ -503,22 +869,31 @@ static void present_locked(NvnTexture *t) {
     }
     if (have) {
         double dw = g_vk.sc_extent.width, dh = g_vk.sc_extent.height;
-        // render scale + placement in the window: runtime/nvn/output_scale.c (Video tab "Internal resolution");
-        // no GPU timer here (-1): dynamic resolution goes by the frame time. The game keeps its own 16:9 framing,
-        // fitted into the window with bars (a widened camera needs a game-specific hook).
+        // render scale + placement in the window: runtime/nvn/output_scale.c (Video page "Upscaler"). The game keeps
+        // its own 16:9 framing, fitted into the window with bars (a widened camera needs a game-specific hook).
+        // Fullscreen on a size the display has no mode for (runtime/window_size.c): that size, scaled to the screen.
         OutScale os;
-        output_scale(dw, dh, false, SDL_GetTicksNS() / 1e9, -1, &os);
+        int iw, ih;
+        if (winsize_virtual(&iw, &ih) && (iw != (int)dw || ih != (int)dh)) {
+            output_scale(iw, ih, false, &os);
+            output_scale_screen(dw, dh, iw, ih, &os);
+        } else {
+            output_scale(dw, dh, false, &os);
+        }
         double sx = os.sx, sy = os.sy, vx = os.vx, vy = os.vy, vw = os.vw, vh = os.vh;
         float crop[4] = {0, 0, 1, 1};  // uv origin and size: the whole image
         renderer_set_scale((float)sx, (float)sy);
+        renderer_set_scene_scale((float)os.scene_sx, (float)os.scene_sy);
         VkCommandBuffer cb = vk_cmd();
         float pv[8] = {renderer_origin_lower_left() ? 1.0f : 0.0f, 0, 0, 0, crop[0], crop[1], crop[2], crop[3]};
         memcpy(g_shot_crop, crop, sizeof crop);
+        uint64_t td = SDL_GetTicksNS();
         vk_present_draw(cb, b, (float)vx, (float)vy, (float)vw, (float)vh, pv);
         static long menu_at = -1;
         if (menu_at < 0) menu_at = getenv("SAVAGEWIND_MENU_AT") ? atol(getenv("SAVAGEWIND_MENU_AT")) : 0;
         if (menu_at && (long)total_frames + 1 == menu_at) { extern void menu_test_open(void); menu_test_open(); }
         menu_render((void *)cb, g_vk.sc_extent.width, g_vk.sc_extent.height);
+        g_present_split[2] += SDL_GetTicksNS() - td;
         static long win_shot = -1;
         if (win_shot < 0) win_shot = getenv("SAVAGEWIND_WINDOW_SHOT") ? atol(getenv("SAVAGEWIND_WINDOW_SHOT")) : 0;
         bool shot = win_shot && (long)total_frames + 1 == win_shot;
@@ -529,11 +904,19 @@ static void present_locked(NvnTexture *t) {
     }
     extern void vk_prof_frame(uint64_t frame, uint64_t present_ns);
     vk_prof_frame(total_frames, SDL_GetTicksNS() - t0);
+    {   // SAVAGEWIND_FRAME_LOG=1: "[ft] <ms> <frame> <target fps>" at every present (frame time statistics)
+        static int ft = -1;
+        if (ft < 0) ft = getenv("SAVAGEWIND_FRAME_LOG") != NULL;
+        extern int framepace_target(void);
+        if (ft) LOG("[ft] %.3f %llu %d\n", SDL_GetTicksNS() / 1e6, (unsigned long long)total_frames, framepace_target());
+    }
     frames++;
     total_frames++;
     g_frame_counter++;
     extern void input_frame(uint64_t frame);
-    input_frame(total_frames);
+    extern uint64_t framepace_script_frame(uint64_t presented);
+    uint64_t script_frame = framepace_script_frame(total_frames);  // (SAVAGEWIND_SCRIPT_CLOCK: 30ths of a second)
+    input_frame(script_frame);
     static long slow_ms = -1;
     if (slow_ms < 0) slow_ms = getenv("SAVAGEWIND_SLOW_FRAME_MS") ? atol(getenv("SAVAGEWIND_SLOW_FRAME_MS")) : 0;
     if (slow_ms > 0 && total_frames > 2600) SDL_Delay((Uint32)slow_ms);
@@ -565,16 +948,36 @@ static void present_locked(NvnTexture *t) {
         }
     }
     if (g_debug_frame) LOG("===== debug frame %llu =====\n", (unsigned long long)total_frames);
+    {   // (testing) SAVAGEWIND_UPSCALE_AT=<frame>:<off|ultra|quality|balanced|performance>,... (ascending): the
+        // upscaler from that frame on, as the Video page sets it (A/B of the same view a few frames apart)
+        static const char *next;
+        static int init;
+        if (!init) { init = 1; next = getenv("SAVAGEWIND_UPSCALE_AT"); }
+        while (next && *next) {
+            char *end;
+            long at = strtol(next, &end, 10);
+            if ((long)total_frames < at) break;
+            const char *m = *end == ':' ? end + 1 : end;
+            static const char *const names[] = {"ultra", "quality", "balanced", "performance"};
+            g_settings.upscaler = UPSCALE_OFF;
+            for (int i = 0; i < 4; i++)
+                if (!strncmp(m, names[i], strlen(names[i]))) g_settings.upscaler = UPSCALE_FSR1, g_settings.upscale_quality = i;
+            LOG("[test] frame %llu: upscaler %d mode %d\n", (unsigned long long)total_frames, g_settings.upscaler,
+                g_settings.upscale_quality);
+            next = strchr(m, ',');
+            if (next) next++;
+        }
+    }
     {   // SAVAGEWIND_SHOT_AT=<frame>,<frame>,... (ascending): the game image at those frames -> build/frames/frame_N.png
         static const char *next;
         static int init;
         if (!init) { init = 1; next = getenv("SAVAGEWIND_SHOT_AT"); if (next) mkdir("build/frames", 0755); }
         while (next && *next) {
             long at = strtol(next, (char **)&next, 10);
-            if ((long)total_frames < at) { while (next > getenv("SAVAGEWIND_SHOT_AT") && next[-1] != ',') next--; break; }
-            if ((long)total_frames == at) {
+            if ((long)script_frame < at) { while (next > getenv("SAVAGEWIND_SHOT_AT") && next[-1] != ',') next--; break; }
+            if ((long)script_frame >= at) {  // (the script clock can step over a number)
                 char path[256];
-                snprintf(path, sizeof path, "build/frames/frame_%05llu.png", (unsigned long long)total_frames);
+                snprintf(path, sizeof path, "build/frames/frame_%05ld.png", at);
                 renderer_save_texture_tex(b, path);
             }
             if (*next == ',') next++;
@@ -632,9 +1035,12 @@ static void quick_exit_handler(void) {
     if (trace < 0) trace = getenv("SAVAGEWIND_VK_TRACE") != NULL;
     if (trace) LOG("[vk] exit: waiting for the GPU\n");
     if (g_vk.dev) {
+        vk_present_idle();
         vkDeviceWaitIdle(g_vk.dev);
         if (trace) LOG("[vk] exit: saving the pipeline cache\n");
         vk_pipeline_cache_save();
+        extern void vk_pso_flush(void);
+        vk_pso_flush();
     }
     if (trace) LOG("[vk] exit: terminating\n");
     fflush(stdout);
@@ -650,7 +1056,12 @@ void ui_window_init(void) {
     SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
     settings_load();
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) FATAL("SDL_Init: %s\n", SDL_GetError());
-    int win_w = 1280, win_h = 720;
+    // Video > Window size (runtime/window_size.c: pixels; SDL's window size is pixels / the display's pixel density)
+    winsize_refresh(NULL);
+    WinSize ws = winsize_effective(false);
+    const SDL_DisplayMode *dm = SDL_GetDesktopDisplayMode(SDL_GetPrimaryDisplay());
+    float density = dm && dm->pixel_density > 0 ? dm->pixel_density : 1;
+    int win_w = (int)lroundf(ws.w / density), win_h = (int)lroundf(ws.h / density);
     if (getenv("SAVAGEWIND_WINDOW")) sscanf(getenv("SAVAGEWIND_WINDOW"), "%dx%d", &win_w, &win_h);
     SDL_WindowFlags wflags = SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY;
     if (getenv("SAVAGEWIND_HIDDEN")) wflags |= SDL_WINDOW_HIDDEN;
@@ -658,7 +1069,7 @@ void ui_window_init(void) {
     if (!window) FATAL("SDL_CreateWindow: %s\n", SDL_GetError());
     rt_window_icon(window);
     // the Fullscreen setting applies from the start screen on (not only once the game runs); test windows stay windows
-    if (g_settings.fullscreen && !getenv("SAVAGEWIND_WINDOW") && !getenv("SAVAGEWIND_HIDDEN")) SDL_SetWindowFullscreen(window, true);
+    winsize_apply(window);
     create_instance();
     if (!SDL_Vulkan_CreateSurface(window, g_vk.inst, NULL, &g_vk.surface)) FATAL("SDL_Vulkan_CreateSurface: %s\n", SDL_GetError());
     pick_device();
@@ -678,6 +1089,7 @@ void backend_init(void) {
 // ---- in-place reboot (runtime/main.c teardown; main thread, guest threads stopped)
 void backend_reset(void) {
     if (!g_vk.dev) return;
+    vk_present_idle();
     vkDeviceWaitIdle(g_vk.dev);
     extern void vk_textures_reset(void);
     extern void vk_exec_reset(void);

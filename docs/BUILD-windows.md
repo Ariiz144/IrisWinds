@@ -38,8 +38,13 @@ start screen's build doesn't compile zig's own libraries on the player's machine
 `SAVAGEWIND_VERSION` in `runtime/ui/launcher.mm`. Before a release, test the zip as a player would: extract it to a
 new folder, run it with a PATH without MSYS2, set up the game files from the start screen and play.
 
-The zip's `Savage Wind/` folder holds `savagewind.exe` (icon from `docs/icon/icon.ico`, via windres), `swgen/`,
-`zig/` and the MSYS2 DLLs. No installer: game files, saves and settings are kept next to the exe, so
+The zip's `Savage Wind/` folder holds `savagewind.exe` (icon from `docs/icon/icon.ico`, via windres),
+`Savage Wind Configuration.exe` (`build/savagewind-config.exe`, runtime/platform/windows_config.c: starts
+`savagewind.exe --config`, the configuration screen; same icon), the Fira Sans font files, `swgen/`, `zig/` and the
+MSYS2 DLLs. A plain start of `savagewind.exe` shows only the game files setup until they're ready, then goes
+straight into the game; `--config` shows the configuration screen (Play, Settings, game files, Quit). Never in the
+zip: a start screen picture (`splash.jpg` / `splash.png` is the player's own, read from the data folder; `make dist`
+checks). No installer: game files, saves and settings are kept next to the exe, so
 the folder must be writable (the app says so and quits if it isn't, e.g. under Program Files). A source checkout
 with `extracted/` in the starting folder keeps using that folder instead.
 

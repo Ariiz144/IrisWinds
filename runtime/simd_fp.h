@@ -73,8 +73,9 @@ SN T FN(rsqrts)(T a, T b) {
     return __builtin_elementwise_fma(a, b, K(3)) * K(0.5);
 }
 
-// ARM result for a lane flagged by FBAD (operands already flushed).
+// ARM result for a lane flagged by FBAD. (The fast paths' operands aren't flushed: FZ is the host's there.)
 SN T FN(fix)(Cpu *c, int op, T a, T b, T d) {
+    a = FN(fz)(c, a), b = FN(fz)(c, b), d = FN(fz)(c, d);
     U x = FN(fb)(a), y = FN(fb)(b), z = FN(fb)(d);
     int nan = FN(isnan)(x) || FN(isnan)(y);
     switch (op) {
@@ -150,7 +151,7 @@ SN T FN(slow)(Cpu *c, int op, T a, T b, T d) {
 // Scalar FP op (constant op folds the selection).
 SI T FN(op)(Cpu *c, int op, T a, T b, T d) {
     if (__builtin_expect(c->fpcr & FPCR_SLOW, 0)) return FN(slow)(c, op, a, b, d);
-    if (FMINMAX(op)) return FN(minmax)(c, op, a, b);
+    if (FMINMAX(op)) return FN(minmax)(c, op, FN(fz)(c, a), FN(fz)(c, b));  // (picks an operand: flushed by hand)
     T r = FCALC(op, a, b, d, K);
     if (__builtin_expect(FBAD(op, r), 0)) r = FN(fix)(c, op, a, b, d);
     return r;
@@ -164,11 +165,21 @@ SN VT FN(vslow)(Cpu *c, int op, VT a, VT b, VT d) {
 
 SI VTU FN(vsel)(VTS m, VTU x, VTU y) { return (x & (VTU)m) | (y & ~(VTU)m); }
 
-// Vector FP op: native lanes, any NaN (or FPCR.FZ/RMode) reruns all lanes through the scalar path.
+SI VT FN(vfz)(Cpu *c, VT a) {
+    if (__builtin_expect(c->fpcr & FPCR_FZ, 0)) {
+        VTU u = (VTU)a, mag = u & ~((VTU){} + SGN);
+        VTS den = (mag != 0) & ((u & EXPM) == 0);
+        a = (VT)FN(vsel)(den, u & SGN, u);
+    }
+    return a;
+}
+
+// Vector FP op: native lanes, any NaN (or an FPCR_SLOW setting) reruns all lanes through the scalar path.
 SI VT FN(vop)(Cpu *c, int op, VT a, VT b, VT d) {
     if (__builtin_expect(c->fpcr & FPCR_SLOW, 0)) return FN(vslow)(c, op, a, b, d);
     VT r;
     if (FMINMAX(op)) {
+        a = FN(vfz)(c, a), b = FN(vfz)(c, b);  // (picks an operand: flushed by hand)
         if (__builtin_expect(__builtin_reduce_or((a != a) | (b != b)) != 0, 0)) return FN(vslow)(c, op, a, b, d);
         VTU x = (VTU)a, y = (VTU)b;
         if (op == FOP_MAX || op == FOP_MAXNM)
@@ -180,15 +191,6 @@ SI VT FN(vop)(Cpu *c, int op, VT a, VT b, VT d) {
     r = FCALC(op, a, b, d, VK);
     if (__builtin_expect(__builtin_reduce_or(FBAD(op, r)) != 0, 0)) return FN(vslow)(c, op, a, b, d);
     return r;
-}
-
-SI VT FN(vfz)(Cpu *c, VT a) {
-    if (__builtin_expect(c->fpcr & FPCR_FZ, 0)) {
-        VTU u = (VTU)a, mag = u & ~((VTU){} + SGN);
-        VTS den = (mag != 0) & ((u & EXPM) == 0);
-        a = (VT)FN(vsel)(den, u & SGN, u);
-    }
-    return a;
 }
 
 // ---- compares

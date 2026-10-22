@@ -20,10 +20,15 @@ static uint32_t block_depth_for(uint32_t depth) {
     return log2;
 }
 
+// A block holds at most 16 GOBs when it can: for 3D textures the depth takes them first and the block height gives
+// way. BOTW's 256x32x16 RGBA16F sky scattering table (copied in already swizzled) is laid out 1 GOB tall and 16 deep:
+// read as 4 tall and 16 deep, its rows and slices came out interleaved (a seam every 8 rows, none with 1 x 16).
 void tegra_layout_init(TexLayout *t) {
     uint32_t hb = div_up(t->height, t->fmt->bh);
     t->block_height_log2 = tegra_default_block_height_log2(hb);
     t->block_depth_log2 = t->depth > 1 ? block_depth_for(t->depth) : 0;
+    if (t->block_height_log2 + t->block_depth_log2 > 4)
+        t->block_height_log2 = t->block_depth_log2 >= 4 ? 0 : 4 - t->block_depth_log2;
 }
 
 // Block height shrinks with the level so a block never exceeds the level height.

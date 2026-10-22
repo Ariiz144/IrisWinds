@@ -28,13 +28,16 @@ typedef struct {
     VkPhysicalDevice phys;
     VkDevice dev;
     VkQueue queue;
-    uint32_t qfam;
+    VkQueue present_queue;     // a second queue of the same family for presentation (device.c), or queue
+    uint32_t qfam, qfam_count;
     VmaAllocator vma;
     VkPhysicalDeviceProperties props;
     VkPipelineCache pcache;
     VkSemaphore timeline;      // value = last completed submission number
     VkCommandPool pool;        // render thread only
-    bool custom_border, divisor, host_import;
+    bool custom_border, divisor, host_import, wide_lines;
+    bool depth_clamp;          // depthClamp feature (nvnCommandBufferSetDepthClamp: shadow maps keep occluders before the near plane)
+    bool feedback_loop;        // attachment feedback loops in GENERAL layout + barriers inside dynamic rendering (exec.c)
     // window
     VkSurfaceKHR surface;
     VkSwapchainKHR swapchain;
@@ -56,6 +59,8 @@ void vk_wait_seq(uint64_t seq);
 void vk_full_barrier(VkCommandBuffer cb);
 void vk_end_pass(void);
 void vk_submit_extra(VkSemaphore wait, VkSemaphore signal, VkCommandBuffer extra);  // submit + one more cb (present)
+void vk_present_idle(void);  // device.c: the presentation thread has no present queued or in progress
+void vk_dyn_forget(void);    // exec.c: graphics pipeline / dynamic state of the main command buffer changed elsewhere
 
 // Transient GPU-visible memory that lives until the submission it was allocated for completes.
 typedef struct { VkBuffer buf; uint64_t off; void *ptr; } VkSpan;
@@ -65,6 +70,10 @@ VkSpan vk_readback(uint64_t size);  // host-cached GPU -> CPU staging (read righ
 VkDescriptorSet vk_alloc_set(VkDescriptorSetLayout layout);
 
 // ---- textures (textures.c)
+// Render-target scale groups (textures.c tex_scale_group): none, the 3D scene's (internal resolution), the final
+// image's (the window's resolution)
+enum { RS_NONE = 0, RS_SCENE = 1, RS_OUT = 2 };
+
 typedef struct TexBackend {
     VkImage image;
     VmaAllocation mem;
@@ -73,8 +82,12 @@ typedef struct TexBackend {
     uint32_t width, height, depth, layers, levels, samples;
     VkImageAspectFlags aspect;
     bool gpu_owned, uploaded, dynamic;
+    bool slices_renderable;  // 3D image made 2D-array compatible: its slices are render targets
+    bool feedback_ok;        // made with VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT (sampled while it is rendered to)
+    bool feedback_seen;      // a draw sampled it while writing it: its passes begin with the feedback loop enabled
     uint64_t data_hash, sample_hash, checked_frame, full_frame;
     bool scalable, presented;
+    uint8_t rs_group;            // RS_*: which output scale its allocation follows (textures.c)
     uint64_t touched_frame, frame_cleared;
     uint32_t level_gen;
     float sx, sy;
@@ -89,6 +102,7 @@ typedef struct TexBackend {
     int refs;                    // textures holding the image
     int all, idle;               // slots + 1 in textures.c's lists of all images / images no texture holds
     uint64_t idle_frame, used_frame;  // when it was let go / last asked for by a finalized texture (zombies)
+    uint64_t serial;             // which image this is: every image made gets a new one (exec.c's linear targets)
 } TexBackend;
 
 TexBackend *vk_tex(NvnTexture *t, bool for_render);  // backend image (uploads CPU contents unless for_render)
@@ -106,6 +120,10 @@ void vk_image_init_layout(VkCommandBuffer cb, VkImage img, VkImageAspectFlags as
 void vk_defer_image(VkImage img, VmaAllocation mem);
 void vk_defer_view(VkImageView v);
 void vk_views_forget(TexBackend *b);  // drop (deferred) the cached views of an image being replaced
+void vk_make_scalable_like(NvnTexture *t, NvnTexture *like);  // a pass's attachments share one scale
+uint8_t vk_texture_scale_group(NvnTexture *t);
+void renderer_get_scene_scale(float *sx, float *sy);
+void renderer_set_scene_scale(float sx, float sy);
 uint64_t vk_frame_counter(void);
 
 // ---- shaders / pipelines (shaders.c)
@@ -114,3 +132,4 @@ VkShaderModule vk_builtin_shader(const char *name);  // internal shaders (clear,
 
 // ---- device / window (device.c)
 void vk_save_png(const char *path, const uint8_t *rgba, uint32_t w, uint32_t h);
+bool vk_replace_file(const char *tmp, const char *path);  // rename over an existing file, atomically
