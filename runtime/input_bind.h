@@ -21,13 +21,19 @@ enum {
     BIND_LS_UP = BIND_PAD_COUNT, BIND_LS_DOWN, BIND_LS_LEFT, BIND_LS_RIGHT,
     BIND_RS_UP, BIND_RS_DOWN, BIND_RS_LEFT, BIND_RS_RIGHT,
     BIND_WALK,                                           // keyboard only: held, the left stick keys tilt it part way
-    BIND_KEY_COUNT                                       // keyboard: buttons + both sticks + walk
+    BIND_TILT,                                           // keyboard only: held, the mouse tilts the controller (motion)
+    BIND_KEY_COUNT                                       // keyboard: buttons + both sticks + walk + tilt
 };
 enum { BIND_DEV_PAD, BIND_DEV_KEY };
 // A keyboard binding can also be a mouse button: BIND_MOUSE + SDL_BUTTON_LEFT (1) .. SDL_BUTTON_X2 (5), past every
 // SDL scancode.
 #define BIND_MOUSE 0x400
 #define BIND_MOUSE_LAST (BIND_MOUSE + 5)
+// What the player uses (runtime/hle/input.c input_last_device)
+enum { DEVICE_KEYBOARD, DEVICE_PAD };
+int input_last_device(void);
+int input_pad_family(void);  // the open controller: 0 Nintendo / other / none, 1 Xbox, 2 PlayStation
+
 // Controller binding values: an SDL_GamepadButton, or the analog triggers as buttons
 enum { PADB_LTRIGGER = 26 /* SDL_GAMEPAD_BUTTON_COUNT */, PADB_RTRIGGER, PADB_HOST_COUNT };
 

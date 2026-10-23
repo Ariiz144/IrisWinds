@@ -19,14 +19,17 @@ Notas de desarrollo. El README explica qué hace falta y las reglas de copyright
 ## Publicación
 
 GitHub: `Revivedx/SavageWindRecomp` (remote `origin`, público desde el 2026-10-16). No se sube el historial
-local: la importación de LASRecomp trae capturas de *Link's Awakening* y su randomizer. El `main` remoto es la
-rama local `public`, un commit por publicación con el árbol de `main` y el email noreply de GitHub:
+local: la importación de LASRecomp trae capturas de *Link's Awakening* y su randomizer. La rama local `public`
+lleva un commit por publicación con el árbol de `main` y el email noreply de GitHub. Desde el 2026-10-21 se sube a
+la rama remota `test`: el `main` remoto tiene un ruleset ("main": sin borrado, sin force push, cambios por pull
+request y "Restrict updates" sin bypass), así que entra a `main` con un pull request de `test` (#1 para Alpha 2),
+que solo se puede fusionar si el dueño del repo cambia ese ruleset:
 
 ```
 export GIT_AUTHOR_NAME=Revivedx GIT_AUTHOR_EMAIL=82332536+Revivedx@users.noreply.github.com
 export GIT_COMMITTER_NAME=$GIT_AUTHOR_NAME GIT_COMMITTER_EMAIL=$GIT_AUTHOR_EMAIL
 git branch -f public $(git commit-tree "main^{tree}" -p public -m "<qué cambia>")
-git -c credential.helper= -c "credential.helper=!gh auth git-credential" push origin public:main
+git -c credential.helper= -c "credential.helper=!gh auth git-credential" push origin public:test
 ```
 
 Antes de cada publicación: `git ls-tree -r --name-only main` no debe tener archivos del juego, código generado,
@@ -49,6 +52,12 @@ del `.desktop` del AppImage; en macOS mantener Opción al abrir la app) muestra 
 (runtime/ui/splash.mm) es arte propio dibujado (un claro de bosque con la espada del icono en una piedra), o `splash.jpg` / `splash.png` del
 jugador en la carpeta de datos (nunca en el repo ni en el zip).
 
+Antes de copiar nada, la preparación comprueba el RomFS elegido contra la versión del `exefs/main`, con la columna de
+ficheros del RomFS de `runtime/game_versions.h` (los que tiene con la actualización aplicada; 1.8.2: 41.056; 0: sin
+recuento). El RomFS debe decir esa versión en `System/Version.txt` y tener al menos el 95 % de esos ficheros: así se
+detectan el RomFS del cartucho sin la actualización (dice 1.0.0) y el RomFS de la actualización sola (muchos menos
+ficheros).
+
 ## Estructura de entrada esperada
 
 ```
@@ -57,8 +66,11 @@ savage_wind/extracted/
   romfs/   contenido completo de la romfs (base + actualización ya fusionadas)
 ```
 
-La versión objetivo es la 1.8.2 (versión de título v1048576), la última. El build id del módulo `main`
-identifica la versión exacta; `tools/sw_probe.py` lo imprime.
+La versión principal y la única con soporte es la 1.9.0 (2026-02-17, v1114112: texto en tailandés en Switch 2,
+SDK 21.4.1), la última: un dump legal hecho hoy la trae. La 1.8.2 (versión de título v1048576) se sigue instalando y
+funciona, pero sin soporte: un issue de 1.8.2 se arregla solo si también pasa en la 1.9.0 (decisión del usuario,
+2026-10-22; ver "Versiones del juego"). El build id del módulo `main` identifica
+la versión exacta; `tools/sw_probe.py` lo imprime.
 
 ## Cambios respecto de LASRecomp
 
@@ -143,6 +155,17 @@ Hechos:
     ranura de la pila, o el índice acotado con `and`/`ubfx` sin `cmp`. Usan el respaldo de siempre: cada
     instrucción de la función es una etiqueta y el `br` salta por un `switch`. Como la función ya no está
     partida, igual llegan.
+  - Ese respaldo depende de `computed_target`: busca hacia atrás desde el `br` la instrucción que escribe su
+    registro y lo da por tabla si es un `add`/`sub` o un `adr`. Comparaba solo los 5 bits bajos de cada
+    instrucción, que también son el registro que guarda un store y los destinos de FP/SIMD: en `main`, un
+    `stp s9, s8, [sp, #0x80]` entre `add x9, x9, x10, lsl #2` y `br x9` lo cortaba (1.8.2 0x700109c950, 1.9.0
+    0x70011b06e0, una tabla `ldrb` con base `adr` y sin guarda). El `br` quedaba como despacho simple y el
+    juego moría al llamar al caballo ("no function at 700109c954", issue #22). Ahora `writes_gpr` mira con
+    capstone qué registros escribe la instrucción. En la 1.9.0 cambian 2 `br` de `main`, ninguno del `sdk` ni de
+    `subsdk0`, y ninguno deja de reconocerse; el otro (0x70003d7a84) ya se resolvía como tabla, así que el C
+    solo cambia en esa función. `tools/test_layout.py` tiene su forma (la función K: falla con el `gen.py`
+    anterior). En una prueba oculta (1.9.0) no se pudo llegar a esa función: hace falta un caballo que acuda al
+    silbido, y ninguno de los saves de prueba tiene uno.
   - Costo: el C con todas las etiquetas crece en `main` de 312k a 485k instrucciones y en el `sdk` de 37k a
     171k. La función más grande sigue siendo la misma (11883 instrucciones, en `main`).
   - `tools/test_layout.py` agrega un módulo sintético con la forma de `printf_core`, y una función partida
@@ -287,6 +310,50 @@ Pendiente:
      SDL) y su velocidad se vuelve el stick derecho (≈1200 px/s a fondo con sensibilidad 1, más un 12% para pasar la
      zona muerta del juego; `SAVAGEWIND_MOUSE_SCALE`, `SAVAGEWIND_MOUSE_DEADZONE`). Esc suelta el cursor y un clic
      en la ventana lo vuelve a retener. Ajustes: `mouse_camera`, `mouse_sensitivity`, `mouse_invert_y`.
+   - Controles de movimiento (2026-10-22, `runtime/hle/motion.c`): BOTW importa cuatro funciones del sensor de seis
+     ejes de nn::hid: `GetSixAxisSensorHandles` y `StartSixAxisSensor` (cuando cambia el estilo del mando,
+     `FUN_7100d9e24c`), `GetSixAxisSensorStates` (cada frame, las 16 muestras más nuevas de cada handle) y
+     `SetGyroscopeZeroDriftMode`; la familia `SevenSixAxisSensor` solo se usa en modo VR (`nn::pl::IsVrMode`). El
+     addon de seis ejes (`FUN_7100feb48c`, vtable 0x7101bbe588) copia aceleración, velocidad angular, ángulo y
+     dirección de las 16 muestras a los ejes de sead (x = -x, y = z, z = y), cuenta las nuevas por el número de
+     muestreo (máximo 16) y toma una aceleración cero o una dirección identidad como "sin datos". El apuntado por
+     movimiento (`FUN_7100c28eac`, opción del juego GyroOnOff) lee la velocidad angular y la dirección de la muestra
+     más nueva y compara la dirección con la del frame anterior. Antes no había implementación: el handle no existía
+     y el juego veía el mando quieto, así que los santuarios de inclinación no se podían resolver.
+     Ahora la orientación sale del giroscopio y el acelerómetro del mando (eventos de sensor de SDL3, pasados a los
+     ejes de Switch: X derecha, Y adelante, Z arriba; aceleración en G como dirección de la gravedad, giro en vueltas
+     por segundo), fusionados en el hilo principal: el giroscopio la gira, la gravedad corrige la inclinación poco a
+     poco (Mahony, solo con |a| entre 0,75 y 1,25 G) y el sesgo del giroscopio se aprende en reposo. Sin sensores, la
+     tecla de inclinar (T por defecto, `bind_key_tilt`) mantenida hace que el ratón incline el mando (0,2° por
+     píxel, hasta 50°; al soltarla vuelve a nivel en ~0,15 s) en lugar de girar la cámara. Lo que recibe el juego es
+     esa orientación como guiñada / cabeceo / alabeo con la sensibilidad y la inversión del jugador aplicadas a
+     guiñada y cabeceo; las muestras se generan a 200 Hz según el tiempo pasado, y la velocidad angular de cada una
+     es el giro desde la anterior, así que todo concuerda con la dirección. Ajustes: `motion_sensitivity`,
+     `motion_invert` (`off`, `up_down`, `left_right`, `both`); la opción del juego "Controles por movimiento" pasa a
+     la página Controles. Pruebas: `SAVAGEWIND_INPUT` acepta `TILT_UP/DOWN/LEFT/RIGHT` y
+     `TURN_UP/DOWN/LEFT/RIGHT`; `SAVAGEWIND_MOTION_LOG=1` registra la orientación una vez por segundo.
+   - Iconos de botones (2026-10-22, `runtime/nvn/glyphs.c`): BOTW dibuja los botones de sus avisos (HUD, menús,
+     diálogos) como caracteres de su propia fuente de mapa de bits `External_00.bffnt` (en `Font/Font_*.sbfarc`,
+     igual en todas las regiones): 51 glifos en U+E040..E091, celdas de 50x50 (a 51 px) en una hoja BC4 de 256x1024
+     guardada de abajo arriba (A B X Y en E040..E043, L R ZL ZR en E044..E047, la cruceta en E049 y E060..E065, Home
+     en E04A, + y - en E04B/E04C, direcciones y pulsaciones de los sticks en E050..E05B, los sticks en E05D..E05F).
+     Los textos no llevan esos caracteres: una etiqueta del mensaje los elige en tiempo de ejecución, así que se
+     cambia la hoja, no los textos. nn::font copia la hoja (los bytes del archivo desde 0x2000) a un pool de memoria
+     propio: la textura se reconoce por tamaño, formato y un hash FNV-1a de sus 0x20000 bytes, y sus téxeles se
+     sustituyen al subirla (ya desentrelazados) por glifos dibujados aquí en las mismas celdas, dentro de la caja del
+     glifo original (los anchos del juego no cambian). Teclado: teclas con la tecla asignada ("E", "Shift", "Space",
+     flechas) y ratón con el botón asignado; el stick izquierdo como "WASD" y el derecho como ratón con flechas (o sus teclas si el
+     ratón no mueve la cámara). Xbox y PlayStation: sus botones a través de las asignaciones del mando (A B X Y o
+     cruz / círculo / cuadrado / triángulo, LB/RB/LT/RT o L1/R1/L2/R2, Menu/View u Options/Create, cruceta). Los
+     sticks y el resto de símbolos quedan los del juego. Nintendo: los glifos del juego, movidos de celda si las
+     asignaciones del mando no son las de fábrica. Formas trazadas con SDF; rótulos en Fira Sans (OFL, ya incluida).
+     Ajuste `button_icons` (Controles > Iconos de botones: Automático, Teclado, Xbox, PlayStation, Nintendo);
+     Automático sigue al último dispositivo usado (tecla, botón o giro del ratón, o botón / stick del mando) y la
+     hoja se vuelve a subir al cambiar (`glyphs_generation`). `SAVAGEWIND_GLYPH_DUMP=1` guarda cada hoja subida en
+     `build/glyph_sheet_<n>.pgm`.
+     Pendiente (2026-10-22, visto por el usuario jugando con teclado y ratón): el aviso de acción del HUD (el rombo
+     de cuatro botones con "A Take" al recoger un objeto) sigue mostrando los botones de Switch. Ese rombo no sale de
+     `External_00.bffnt`: lo más probable es que sea una imagen del layout del HUD (bflim), que `glyphs.c` no cubre.
    - Ritmo de frames (2026-10-16): `nvnQueuePresentTexture` espera el turno de cada frame según el intervalo de la
      ventana (vsyncs por frame) y nunca presenta más rápido que el tope (`SAVAGEWIND_FPS_CAP`, 60 por defecto; 0 sin
      tope). BOTW pide intervalo 2 (30 FPS, como en la consola; 3 en algunas cargas): el menú, que iba a 130 FPS con
@@ -376,6 +443,79 @@ Pendiente:
        la lista se llena en esa primera sesión. Lo que queda: contenido nunca visto (en una corrida apareció algo
        nuevo hacia el frame 3050: ~100 pipelines que el driver tampoco tenía, 50 ms cada uno, 8 frames de más de
        150 ms) y, en la carga del mundo, 80-175 ms del propio juego en sus primeros frames.
+     - Precompilación de todos los shaders (2026-10-22): lo que el precalentamiento no cubre es lo nunca visto. La
+       primera vez que el juego dibuja con un shader hay que traducirlo, pasarlo a SPIR-V y que el driver lo compile
+       (40-100 ms por pipeline); en el paseo con la caché del driver vacía eran 25 s de compilaciones en el hilo de
+       render. Ahora, si se quiere, se precompila todo de una vez:
+       - Dónde: al instalar, la casilla "Precompilar todos los shaders" (activada por defecto; se hace tras preparar
+         los ficheros del juego) y, cuando se quiera, Savage Wind Configuration > archivos del juego > Shaders >
+         "Precompilar shaders" (dice "Hecho", "Volver a hacer" o "Sin hacer", con el número de shaders y la fecha de
+         la última vez). Una barra con el paso (leer los archivos, traducir y compilar, pipelines) y la cuenta; Esc o
+         B la para y lo hecho se queda. `savagewind --precompile-shaders` hace lo mismo sin el menú (ventana oculta
+         con `SAVAGEWIND_HIDDEN=1`); `savagewind --scan-shaders` solo cuenta lo que encuentra y cuántos de los shaders
+         del registro de claves (abajo) están entre ellos (`SAVAGEWIND_SCAN_LIST=1`: shaders por archivo).
+       - De dónde salen (`runtime/nvn/shader_archive.c`): de la RomFS del propio usuario (`romfs.bin`), en los
+         archivos desde los que el juego sube sus shaders a NVN: FSHA con ficheros BNSH de nn::gfx (materiales,
+         terreno, hierba: `*.sbfsha`, `*.bfsha` dentro de `*.ssarc`), SHARCB de agl/gsys (`*.sharcb`: postproceso,
+         sombras, luces), los efectos VFXB (`*.sesetlist`, también dentro de `*.pack` y `*.sbeventpack`) y el de las
+         capas (`Layout/Common.sblarc: bgsh/__ArchiveShader.bnsh`), abriendo Yaz0 y SARC por el camino; y dos BNSH
+         en los datos del ejecutable (`exefs/main`). 13.997 shaders distintos (6.569 de vértices, 7.356 de
+         fragmentos, 72 de cómputo) en 1.005 archivos; leer los ~2 GB candidatos tarda menos de 2 s. Todos los
+         shaders que dibuja el paseo están entre ellos (306 de vértices, 352 de fragmentos, 9 de cómputo; sin el
+         ejecutable faltaban 7 y 13). Los formatos (registro de SHARCB, sección de control con magic `0x98761234`:
+         +0x700 cbuf, +0x704 bytes de código, +0x748 grupo local, +0x754 memoria compartida) están en los
+         comentarios del fichero. 24 no se traducen (el registro dice cuáles y por qué): 20 de cómputo de
+         `agl_technique_pfx.sharcb` con instrucciones de superficie que el traductor no conoce y 4 de fragmentos de
+         `agl_common.sharcb` (`tlds info 6`); el paseo no usa ninguno.
+       - Qué variante: una traducción depende del binario y de una clave de estado (`ShaderKey`). La clave ahora se
+         reduce a lo que el traductor lee de verdad (`vk_key_normalize`, con las máscaras del SPH): el tipo de cada
+         atributo solo para los que el shader de vértices lee, las salidas de vértices solo las que lee el de
+         fragmentos, el tipo de cada target solo para los que escribe, y en los de fragmentos nada del estado de
+         vértices; un mismo shader ya no se traduce dos veces por restos de estado. Cada clave nueva queda en
+         `cache/vk_shader_keys.list`, y la precompilación saca de ahí cómo dibuja el juego (en BOTW: `flip_y` 0,
+         `depth_minus_one` 1, targets float, atributos float salvo el 6 de `uking_mat` (uint) y el 2 de
+         `uking_grass` (uint → float), que también van en una tabla fija para la primera vez sin registro). Cada
+         shader se traduce con la clave predicha y con las del registro que sean suyas; las predichas coincidieron
+         con todas las registradas.
+       - Traducciones y SPIR-V: en todos los hilos (la traducción ya es reentrante), a `cache/xlate/` y
+         `cache/spirv/` comprimidos con zlib (SPIR-V 1,8 GB → 448 MB; traducciones 137 MB), en carpetas con el id de
+         quien los hizo: `TRANSLATOR_ID` (hash de `translate.c` y `shader.h`) y `SPIRV_ID` (hash de `spirv.c`, el
+         paso GLSL → SPIR-V, que sale de `shaders.c`), los dos del Makefile. Un traductor nuevo usa carpetas nuevas y
+         un hilo borra las de otros ids (`SAVAGEWIND_CACHE_KEEP=1` las deja); las cabeceras de las cachés de
+         pipelines llevan los dos ids. Una build sin el Makefile toma su fecha de compilación como id.
+       - Pipelines: con `VK_EXT_graphics_pipeline_library` y enlace rápido (sí en la RTX 3060) cada shader de
+         vértices y de fragmentos se compila una vez en una librería propia, sin el estado fijo, y un pipeline se
+         enlaza de esas dos y de dos librerías solo de estado (entrada de vértices; salida: targets, blending,
+         máscaras). Otro blending, otros formatos de target u otra disposición de vértices cuestan un enlace y no
+         media compilación (con los mismos shaders y pipelines enteros: otro blend 5,4 ms, otro formato 3,5, otra
+         máscara 4,6, el primero ~30 ms), y la precompilación compila todos los shaders sin saber con qué estado se
+         dibujarán. Los layouts van con sets independientes, uno por etapa. Los pipelines con feedback loop se hacen
+         enteros, como antes, y también cuando un enlace falla. `SAVAGEWIND_VK_NO_GPL=1`: pipelines enteros para
+         todo. Enlazados así no cuestan más GPU: paseo con cachés calientes, dos corridas de cada, 701-709 ms de GPU
+         por cada 2 s con librerías y 702-703 con pipelines enteros (traducción en CPU 561-571 y 577-578 ms), los
+         mismos tirones y sin diferencias a la vista en las capturas. Sin esa extensión (otros drivers) se
+         precompilan traducciones y SPIR-V; con `SAVAGEWIND_PRECOMPILE_PIPELINES=1`, también un pipeline entero por
+         programa con el estado más común (~0,85 GB de caché y poca ayuda: 12,7 → 8,4 s en el paseo, porque otro
+         estado vuelve a costar casi una compilación).
+       - Las librerías precompiladas van a `cache/vk_precompiled.bin` (~0,85 GB; misma cabecera y comprobaciones que
+         `vk_pipelines.bin`), que mientras se juega solo se lee: una librería se busca ahí sin compilar
+         (`VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT`) y, si no está, se hace en la caché de pipelines
+         de siempre, que sigue guardándose en ~16 ms y no en 2,6 s. Con un driver nuevo el fichero no vale y
+         Configuración pide volver a hacerla. La caché de disco del propio driver no basta: con las librerías
+         compiladas solo en cachés temporales, el paseo tuvo 1,8 s de compilaciones y 50 frames de más de 40 ms.
+       - Coste: la primera vez ~3 min (172 s: traducciones 46 s, librerías 125 s; 12 hilos, Ryzen 5 5600X, RTX
+         3060); otra vez con todo hecho, ~5 s (el fichero no se reescribe si no hay nada nuevo). Disco: ~1,45 GB
+         (librerías 834 MB, SPIR-V 448 MB, traducciones 137 MB, caché de pipelines 17 MB). Memoria: con
+         `vk_precompiled.bin` cargado el proceso usa ~0,9 GB más (en el mundo: 5,5 GB de working set frente a 4,6).
+       Paseo con guion (el de arriba, del primer frame del mundo al final), con `SAVAGEWIND_VK_SPIRV_SALT=<n>`, que
+       cambia una palabra de la cabecera de cada SPIR-V para que la caché del driver no acierte nada (lo nunca visto
+       sin borrar esa caché): sin precompilar, 24,3 s de compilaciones en el hilo de render, 68 frames de más de
+       40 ms, 29 de más de 150 ms y un máximo de 4,7 s; con la precompilación, 0,81 s, 10, 1 y 523 ms (ese en la
+       carga del mundo; pasada la carga, 5 frames de más de 40 ms y un máximo de 55 ms). Primer frame del mundo a los
+       20 s en los dos. Antes de las librerías de pipeline,
+       solo con traducciones y SPIR-V precompilados, eran 12,7 s de compilaciones y 51 frames de más de 40 ms. Lo que
+       queda: los enlaces y el precalentamiento al cargar el mundo (~500 en los primeros 2 s) y algún enlace suelto
+       de 30-70 ms.
      Medición: `SAVAGEWIND_VK_PROF=1 SAVAGEWIND_HITCH_MS=1` registra cada frame con su desglose (traducción, esperas a
      la GPU, compilaciones, presentación, pausa del ritmo); `SAVAGEWIND_MAX_INTERVAL=2` impide que el juego pase a 20
      FPS, así su paso por frame es fijo y un recorrido con guion sigue siempre el mismo camino (comparaciones A/B);
@@ -474,10 +614,68 @@ Pendiente:
        vídeo (`movie.c`: decodificador de vídeo arrancado): las cinemáticas prerrenderizadas (`Movie/Demo*.webm`)
        son de 30 FPS.
      - La lógica 2↔3 del juego queda con máximo 2 (`SAVAGEWIND_MAX_INTERVAL` vale 2 por defecto).
-     - Vsync: la cadena de presentación sigue en MAILBOX, sin tearing; cada refresco muestra la imagen más nueva.
-       Una frecuencia que divide la del monitor (60 en 60/120/240 Hz) es la más fluida; una que no (60 o 90 en
-       144 Hz) alterna 2 y 3 refrescos por imagen; por encima de la del monitor las imágenes de más no se ven. La
-       descripción de la opción muestra los Hz de la pantalla (`winsize_refresh_rate`).
+     - Vsync: Vídeo > Sincronización vertical (ver "VSync y VRR" abajo). Por defecto Rápida (MAILBOX), sin tearing;
+       cada refresco muestra la imagen más nueva. Una frecuencia que divide la del monitor (60 en 60/120/240 Hz) es
+       la más fluida; una que no (60 o 90 en 144 Hz) alterna 2 y 3 refrescos por imagen; por encima de la del
+       monitor las imágenes de más no se ven. La descripción de la opción muestra los Hz de la pantalla
+       (`winsize_refresh_rate`).
+   - VSync y VRR (2026-10-22, rama `vrr`): Vídeo > Sincronización vertical (ajuste `vsync`: `on`, `fast`, `adaptive`,
+     `off`; en el menú F1 también, con la explicación larga). Elige el modo de presentación
+     (`runtime/nvn/vulkan/device.c`): Sí FIFO, Rápida MAILBOX (por defecto, lo de antes), Adaptativa FIFO_RELAXED, No
+     IMMEDIATE; si la superficie no tiene el modo pedido, Adaptativa cae en Sí, No en Rápida y Rápida en Sí. Cambiarlo
+     rehace la cadena de presentación en el momento. El log dice el modo, los que tiene la superficie, si la ventana
+     es ventana, pantalla completa sin bordes (el modo del escritorio) o exclusiva (otro modo de la pantalla) y los
+     Hz: `[vk] swapchain 2560x1440, 3 images, present mode fifo (...; surface has fifo, fifo relaxed, mailbox,
+     immediate, other), borderless fullscreen (the desktop's mode), display 239.77 Hz`. La RTX 3060 (driver 617) da
+     FIFO, FIFO_RELAXED, MAILBOX, IMMEDIATE y FIFO_LATEST_READY, y `VK_KHR_present_wait`,
+     `VK_EXT_full_screen_exclusive` y `VK_EXT_swapchain_maintenance1`.
+     - Con G-SYNC / FreeSync la pantalla espera a la imagen, no al revés, solo si la presentación espera a la
+       pantalla: Sí (FIFO). Con Sí y Adaptativa los FPS quedan un poco bajo el refresco (`framepace.c` `vsync_cap`:
+       refresco - refresco² / 3600, el tope de NVIDIA Reflex: 59 a 60 Hz, 138 a 144, ~224 a 239,77): a la frecuencia
+       del monitor FIFO agrega hasta un refresco de espera y el monitor sale de su rango variable. Sin límite con Sí
+       es ese tope. Rápida y No no esperan a la pantalla: sin tope (300 como antes).
+     - El ritmo no pelea con la pantalla: una frecuencia a menos del 1 % de un divisor del refresco toma
+       exactamente ese divisor (`on_refresh`: 60 en 239,77 Hz es 59,94, una imagen cada 4 refrescos; 30 es 29,97;
+       90 queda en 90). Sin eso, en un monitor sin VRR las imágenes se corren contra los refrescos y cada pocos
+       segundos una espera un refresco menos o más. Con VRR no cambia nada visible; con No no se aplica.
+     - Qué poner en el driver de NVIDIA para G-SYNC (Panel de control de NVIDIA):
+       1. Pantalla > Configurar G-SYNC: activar G-SYNC (o G-SYNC Compatible) "para modo de ventana y de pantalla
+          completa". Savage Wind en pantalla completa usa el tamaño del escritorio sin bordes (exclusiva solo con
+          otro tamaño de la lista), y para el driver eso es una ventana.
+       2. Administrar la configuración 3D (para `savagewind.exe` o global): "Método de presentación de
+          Vulkan/OpenGL" = "Preferir en capas en la cadena de intercambio DXGI" (lo que deja a G-SYNC, a la
+          presentación independiente y al HDR automático ver una ventana Vulkan); "Sincronización vertical" = "Usar
+          la configuración de la aplicación 3D"; "Tecnología de monitor" = G-SYNC (Compatible); "Modo de baja
+          latencia" en Desactivado o Activado (Ultra también limita los FPS); "Velocidad de fotogramas máxima" no
+          hace falta (Savage Wind ya limita).
+       3. En Savage Wind: Sincronización vertical = Sí, y la frecuencia que se quiera (sin límite: ~224 a 240 Hz).
+       Con AMD: Software Radeon > Pantalla > AMD FreeSync activado, y Sí en el juego. Para comprobarlo: el
+       indicador de G-SYNC del panel de NVIDIA (Pantalla > Indicador de G-SYNC) o los Hz del menú del monitor, que
+       siguen a los FPS (60 a 60 FPS).
+     - Medición (`SAVAGEWIND_LOG_PRESENT=<n>`: cada n presentaciones una línea `[present]` con cada cuánto se
+       presentó y, con `VK_KHR_present_wait`, se mostró cada imagen, su desviación, el p99 de lo lejos que queda de
+       la mediana, la parte a 2 ms o más, y de presentar a mostrar; `SAVAGEWIND_PRESENT_CSV=<archivo>` escribe cada
+       presentación; `SAVAGEWIND_VK_PRESENT=fifo|mailbox|relaxed|immediate` fuerza un modo). Corridas ocultas a
+       1280x720 (RTX 3060; Continuar en la Meseta, caminar, esprintar, saltar; parte de ellas con los juegos de otras
+       sesiones en la misma GPU), sin los 200 primeros frames:
+
+       | VSync, FPS | entregadas: mediana, desv. sin tirones | mostradas: mediana, desv., dentro de 1 ms | entregar a mostrar |
+       |---|---|---|---|
+       | Sí, 60 | 16,64 ms, 0,80 | 16,59 ms, 1,02, 84 % | 2,2 ms (desv. 1,7) |
+       | Rápida, 60 | 16,65 ms, 0,72 | 16,61 ms, 0,97, 83 % | 2,0 ms (1,2) |
+       | Adaptativa, 60 | 16,66 ms, 0,57 | 16,61 ms, 0,75, 90 % | 2,1 ms (1,5) |
+       | No, 60 | 16,65 ms, 0,55 | 16,62 ms, 0,78, 87 % | 1,9 ms (1,3) |
+       | Sí, 120 | 11,80 ms, 1,41 | 11,81 ms, 1,63, 55 % | 4,3 ms (1,0) |
+       | Sí, sin límite | 11,76 ms, 2,74 | 11,80 ms, 2,81, 54 % | 4,1 ms (1,1) |
+       | Rápida, sin límite | 11,62 ms, 3,68 | 11,55 ms, 3,74, 49 % | 3,5 ms (1,2) |
+
+       Cuando el juego llega a la frecuencia, las imágenes salen cada 16,6-16,7 ms con menos de 1 ms de desviación
+       en los cuatro modos; un tramo sin tirones dio 16,67 ms (desv. 0,21) entregadas y (0,42) mostradas. Los tirones
+       (2-3 % de los frames) son del juego (traducción en la CPU). A 120 o sin límite el juego no pasa de ~85 FPS en
+       ese sitio y el ritmo sigue a sus tiempos de frame. Con una ventana oculta el driver da la hora de mostrar,
+       pero no la de un monitor de verdad: lo que G-SYNC cambia en pantalla (sin cortes ni saltos de refresco a FPS
+       variables) hay que verlo en pantalla completa. El reloj del juego no cambia: con Sí a 60 (59,94) y sin límite
+       (tope 224), 30,0 frames de consola y 1,00 minuto de juego por segundo, Link a 5,5 m/s, saltos de 0,68 m.
      Medición (corridas ocultas con guion a 1280x720, RTX 3060; Continue en la Meseta, caminar, esprintar hasta
      agotar la estamina, dos saltos; sonda cada 20 ms): con el ritmo propio del juego y a 30, 60, 90, 120 y sin
      límite, el juego avanza 29,97-30,02 frames de consola por segundo (el juego sin cambios 29,5: pierde tiempo en
@@ -590,6 +788,42 @@ Pendiente:
      presentación (ms, frame, frecuencia objetivo), `=2` además una `[fsplit]` con cuándo pasó cada paso (ligera);
      `SAVAGEWIND_SAMPLE` también muestrea el hilo de la cola (handle 0xf000); `SAVAGEWIND_LOG_CORES=1` el núcleo y la
      máscara que el juego da a cada hilo.
+   - Hacia frames de 8 ms (2026-10-22, rama `frame-8ms`). Un recorrido más parecido a jugar que el paseo: desde la
+     partida 0, 60 s corriendo con giros largos de cámara a ambos lados, golpes con la rama, saltos, esprint y fijar
+     objetivo (Link corre en curvas por pasto, bosque y rocas, trepa una roca y un árbol): 3500-4900 draws por frame
+     (el paseo llega a ~3500). A 2560x1440 con SMAA la GPU hace ~9 ms de trabajo por frame: a 120 FPS el límite es
+     ella (el hilo principal espera a la GPU ~27 % del tiempo).
+     - Herencia de prioridad en los mutex del juego, como en Horizon: quien tiene un mutex corre con la mejor
+       prioridad de los que lo esperan (y eso sigue por una cadena de esperas); al soltarlo, o con
+       `SetThreadPriority`, vuelve a la suya. Una vez por segundo el hilo principal (prioridad 44) esperaba un mutex de
+       un hilo de trabajos de prioridad 48, que esperaba su núcleo detrás de hilos peores que el principal. A 60 FPS
+       en el recorrido: frames de más de 25 ms por minuto 20-35 → 0-6, p99 23,6-25,0 → 19,0-19,6 ms.
+       `SAVAGEWIND_NO_PRIO_INHERIT=1` la quita.
+     - Uniform buffers dinámicos en los programas de draws: los constant buffers del juego (c3 en adelante, primero los
+       del vertex shader, hasta el límite del layout: 15 en NVIDIA) llevan el offset de su copia en
+       `vkCmdBindDescriptorSets` y no en el set; como las copias cambian de sitio casi en cada draw (constantes por
+       objeto), los sets eran distintos en cada draw (~4000 nuevos por frame). Ahora los comparten los draws con las
+       mismas texturas y tamaños de copia: ~500 000 → ~100 000 sets nuevos cada 2 s; a 120, traducción por frame
+       8,9 → 7,9 ms. Cambian los layouts de los pipelines (se rehacen una vez). `SAVAGEWIND_VK_NO_UBO_DYNAMIC=1`.
+     - El programa y el pipeline del draw anterior se reutilizan mientras no llegue un comando que cambie lo que
+       leen sus claves (programa, blend, máscaras, multisample, polígono, atributos y streams de vértices, targets,
+       depth clamp) ni empiece un pase: ~1,4 KB de claves menos por draw (~1,5 % de la traducción).
+       `SAVAGEWIND_VK_NO_KEY_GEN=1`. El memo del hash de fragment shaders usaba solo 32 de sus 512 entradas (código
+       alineado a 256 bytes).
+     - `ICommonStateGetter` 50, que BOTW pide cada frame, se registra una vez (escribir la línea era ~1 % del hilo
+       principal).
+     Todo junto contra `main` (recorrido, 2560x1440 con SMAA, dos corridas de cada uno, alternadas): a 60, p99
+     25,1-25,8 → 18,6-19,1 ms y frames de más de 20 ms por minuto 70-81 → 22-30; a 120, 71,7-71,9 → 78,8-80,0 FPS,
+     p99 30,8-31,7 → 19,3-19,6 ms, traducción por frame 8,9 → 7,5 ms; sin límite, 71,0-72,0 → 74,5-76,7 FPS. A
+     1280x720: a 120, 82,5 → 86,7-89,0 FPS, p99 28-32 → 16-17 ms. Velocidad del juego y física iguales a 60 y a 120
+     y a las de `main` (30,00 frames de consola por segundo, hora 1,000 min/s, caminar 5,54 m/s, esprintar 8,02 m/s,
+     estamina -300/+300 por segundo, saltos de 0,68 m).
+     Lo que queda, medido (cola a 120 tras estos cambios): `draw_` ~60 % del hilo (descriptor sets 19 %, llamadas al
+     driver 13 %, el propio `draw_` 12 %, inicio de pases 6 %, texturas 5 %); el primer acceso a cada registro de
+     comando ~3 % (los escribió otro núcleo). El hilo principal: ~45 % código del juego (~6 ms por frame, repartido:
+     ninguna función pasa del 1 %; `rt_dispatch` 4 %), el resto esperas. `SAVAGEWIND_VK_LIST_STATS=1` (medir) mostró
+     que un frame no se parte en listas independientes: ~2800 `CallCommands` por frame, ~1 draw cada una, todas usan
+     estado puesto antes. Bajar la traducción a 4-5 ms pide traducir en paralelo (notas de la sesión).
    - Sombras del sol con depth clamp (2026-10-20): `nvnCommandBufferSetDepthClamp` no hacía nada. BOTW lo activa para
      sus tres cascadas de sombra del sol (un array D16 de 896x896x3, ~650-750 draws por frame) y para la consulta de
      oclusión del sol: lo que está más cerca de la luz que el plano cercano de una cascada se aplasta contra él en vez
@@ -601,11 +835,90 @@ Pendiente:
      árboles aparecían, se cortaban y se movían. Ahora el comando se graba (`CMD_SET_DEPTH_CLAMP`) y el pipeline lleva
      `depthClampEnable` (`PipeState.depth_clamp`, en lo que era relleno: las listas de pipelines anteriores lo leen
      apagado). `SAVAGEWIND_NO_DEPTH_CLAMP=1` lo ignora (A/B). Metal (`renderer.m`): `setDepthClipMode`, sin compilar.
-     Lo que sigue igual: `SAMPLES_PASSED` (tipo 1 de `ReportCounter`, la consulta del sol) devuelve siempre 0
-     muestras, y `ResetCounter`, `ReportValue`, `SetRenderEnableConditional` y `SetRasterizerDiscard` no hacen nada.
      La paleta de entorno (`fcb4` del shader de la máscara de sombras) pasa de la de interior a la de exterior en 60 s
+     al salir del santuario y al cargar una partida afuera, y no vuelve a la de interior al regresar (ver abajo).
+   - Fallos gráficos que quedaban en la Alpha 2 (2026-10-22):
+     - Consulta de oclusión del sol: `ReportCounter` con `SAMPLES_PASSED` (tipo 1) devolvía siempre 0 muestras y
+       `ResetCounter` no hacía nada. BOTW dibuja una vez por frame el disco del sol con prueba de profundidad y sin
+       escribir color (main 0x7000ea74a8, tres ranuras de resultado por turno, leídas dos frames después) y con eso
+       decide su resplandor: con 0 el sol contaba siempre como tapado. Ahora cada draw entre `ResetCounter` y
+       `ReportCounter` va dentro de una consulta de oclusión de Vulkan y, cuando termina su envío, {muestras, marca de
+       tiempo} va a la memoria del juego, en píxeles del juego (dividido por la escala del render target). Mirando al
+       sol desde el acantilado del santuario: 276 muestras. `SAVAGEWIND_NO_OCCLUSION_QUERY=1`: 0, como antes;
+       `SAVAGEWIND_LOG_OCCLUSION=<n>` registra los n primeros resultados. `ReportValue`,
+       `SetRenderEnableConditional` y `SetRasterizerDiscard` siguen sin hacer nada (se registran la primera vez).
+     - Miniatura negra al abrir otra vez el diálogo de guardar: la primera vez el juego copia la imagen final a una
+       textura de 256x144 (1920x1080, 854x480, 256x144; la lee con `CopyTextureToBuffer` para el JPEG); al cerrar el
+       diálogo la textura se finaliza, y al abrirlo otra vez la hace de nuevo en la misma memoria y la muestra sin
+       volver a copiar: en la consola los texeles siguen en esa memoria. Aquí la imagen de Vulkan se liberaba a los 4
+       frames sin uso, y la nueva empezaba en negro. Ahora una imagen que dibujó la GPU (sin copia en la memoria del
+       juego) se guarda después de esos 4 frames, con una suma de la memoria del juego que cubre, hasta 192 MB (las
+       más viejas se van primero; ninguna de más de 16 MB); una textura hecha otra vez ahí la recupera si esa memoria
+       no cambió (si cambió, la CPU la reusó: imagen nueva). `SAVAGEWIND_NO_KEEP_IMAGES=1`: como antes;
+       `SAVAGEWIND_LOG_KEPT=1` registra las recuperadas. También vuelven así los paneles de la interfaz que el juego
+       dibuja una vez en su propio render target (170x40, 85x20...).
+     - Con "Shaders asíncronos" (ajuste `async_shaders`, el del usuario), un draw cuyo programa o pipeline se estaba
+       construyendo se salteaba hasta el frame siguiente. Dos consecuencias:
+       - La imagen "posterizada" tras Continue (cielo y pasto planos, frames 650-900): faltaban el pasto denso y capas
+         de nubes mientras sus shaders se construían. Pasaba también con las cachés calientes: un programa nuevo
+         esperaba su turno en el hilo traductor aunque su traducción estuviera en memoria y sus módulos y pipeline ya
+         hechos (el precalentamiento): ~7.400 draws saltados en los 2 s en que aparece el mundo. Ahora, si la traducción
+         está en memoria (`vk_translate_peek`) y el programa y el pipeline están hechos, quedan listos en el acto: 19
+         saltados. Con las cachés frías (después de cada actualización, que cambia la versión del traductor) se siguen
+         construyendo en otros hilos.
+       - El fondo del menú de pausa negro: el juego difumina una captura de la escena una sola vez al abrir el menú, y
+         si esos draws se salteaban el fondo quedaba negro (también la primera pausa de cada sesión, no solo tras
+         "Salir a la pantalla de inicio"). Ahora un draw a render targets en los que ningún pase
+         dibujó el frame anterior (capturas, la miniatura, targets nuevos) espera a sus shaders, como en modo síncrono.
+         Con cachés frías eso concentra la construcción en el primer frame del mundo (2,2 s en una prueba, detrás de la
+         carga) y deja ~2.700 draws saltados en los 4 s siguientes en lugar de ~29.000.
+     - La paleta de 60 s: los valores de luz y niebla de la paleta (`fcb4` del shader 8c42c9bc921ed716, luz 4 / 3,6 /
+       3,4 y niebla cálida en el santuario; 7,5 / 6,86 / 4,70 y niebla verde azulada afuera) van de una a otra en línea
+       recta en 60 s de tiempo real (1/1800 por frame a 30 FPS, 1/3600 a 60): el paso sigue al reloj del juego. Los
+       copia al uniform main 0x7000e90688 (llamado desde 0x7000e8e3bc) desde una tabla de entradas de 0x5c bytes;
+       quién la llena no se ha encontrado. Los relojes que usa el juego (`CNTPCT` a 19,2 MHz, delta de `ksys::VFR`)
+       andan bien, así que no se ve una causa en la emulación; que en la consola tarde lo mismo no está comprobado.
      (1/1800 por frame) al salir del santuario y al cargar una partida afuera, y no vuelve a la de interior al
      regresar: no se sabe aún si es el comportamiento del juego.
+   - Filtrado anisotrópico y enfoque (2026-10-22): Vídeo > Filtrado anisotrópico (No, 2x, 4x, 8x, 16x; ajuste
+     `anisotropy = game|2x|..|16x`) fija la anisotropía máxima de los samplers de texturas del juego
+     (`vulkan/textures.c` `sampler_aniso`): solo los que filtran lineal entre niveles de mip (suelo, paredes, caminos);
+     no los de filtro de punto, los sin mipmaps (la interfaz, targets releídos), los fijados a un nivel (las cadenas
+     de bloom y desenfoque) ni los de comparación de profundidad (sombras). Con No queda la del juego (BOTW usa 1, y 2 en
+     unos pocos). Un VkSampler por ajuste distinto, compartido entre entradas de pool (`SAVAGEWIND_LOG_SAMPLERS=1`
+     lista cada uno). Vídeo > Enfoque (AMD CAS) (No, 10-100 %; `sharpening = 0..100`): AMD FidelityFX CAS (MIT) sobre
+     la imagen 3D en la composición de la escena (`exec.c` `scene_post`), después de EASU+RCAS con FSR 1 o sobre la
+     escena a la resolución de la ventana con el escalador en No, antes de que el juego dibuje el HUD encima. Pruebas:
+     `SAVAGEWIND_FILTER_AT=<frame>:<anisotropía 0-4>/<enfoque 0-10>,...` (A/B de la misma vista),
+     `SAVAGEWIND_SCENE_CAS=0`. Sin filas en macOS (Metal no tiene ninguno de los dos).
+     El draw toma la copia procesada con el swizzle de la textura del juego (`vk_sample_swizzle`): el menú rápido de
+     armas (cruz derecha) compone su captura desenfocada de la escena (1280x720 RGBA8, un target de escena) con
+     un shader de interfaz que fuerza el alfa a 1 (swizzle R,G,B,1) y mezcla por alfa. La copia con swizzle identidad
+     daba alfa 0 y el fondo quedaba negro con el enfoque encendido (2026-10-22).
+   - Resolución de sombras (2026-10-22): Video > Shadow resolution (ajuste `shadow_resolution` = `console` | `high`
+     | `ultra` | `extreme`) crea las cascadas del sol a 2048, 4096 u 8192 por lado en vez de 896 (nunca más que el
+     `maxImageDimension2D` de la GPU). `textures.c`: grupo de escala
+     `RS_SHADOW` para las texturas de profundidad cuadradas de 512 o más que son render targets (el 192x192 de
+     profundidad que BOTW también usa no es un mapa de sombras); su escala es el tamaño elegido / el ancho del juego,
+     nunca menos de 1 (`output_scale.c` `shadow_map_size`, aplicado en cada presentación: cambiarlo rehace el mapa).
+     Viewports, scissors, copias y el `rscale` de los shaders ya siguen la escala de cada textura, como con los
+     targets de la escena. El filtro: los tres pases diferidos de la máscara de sombra del sol hacen un PCF de 4
+     muestras a ±0,5 texel con el tamaño de texel que el juego pasa en un constant buffer (`c[4]` palabras 212-213 =
+     1/896); sin tocarlo, las muestras quedan a un texel de consola (2,3 o 4,6 texels del mapa grande) y la penumbra
+     se ve en escalones. En los draws que muestrean un mapa agrandado, `cbuf_info` lo cambia por 1/2048, 1/4096 u 1/8192 en
+     una copia del buffer del fragment shader (`sdw_patch`: busca el par exacto; ~10 por frame). El depth bias no se
+     escala: la parte por pendiente ya depende del tamaño del píxel del mapa, y la constante (y el -0,002 que restan
+     los shaders) es la de consola, que solo puede sobrar. Depth clamp sin cambios.
+     Lo demás que lee las cascadas: un downsample a 448x448x3 (`textureGather`, sin escalar: toma 2x2 texels del mapa
+     grande) y shaders de un solo tap sin offsets. Hay shaders con offsets fijos de ±1/4096 (sin constant buffer) para
+     otro mapa de sombras que no aparece en la meseta: si es de 2048, en Ultra quedaría con escalones (sin verificar).
+     Pruebas: `SAVAGEWIND_SHADOW_AT=<frame presentado>:<console|high|ultra|extreme|ancho>,...` (A/B en una corrida),
+     `SAVAGEWIND_NO_SHADOW_TEXEL_FIX=<frame presentado>` (el tamaño de texel del juego desde ese frame).
+     Costo (RTX 3060, ventana oculta de 1920x1080, meseta, mediana de 10 frames con `SAVAGEWIND_GPUPROF_AT`): los
+     pases de las cascadas 0,78 ms en Console, 0,96 en High (+0,18) y 1,48 en Ultra (+0,70); el resto del frame no
+     cambia de forma medible. Memoria de video de las cascadas: 4,8 MB, 25 MB, 100 MB y, con Extreme (8192, 2026-10-23), 384 MB. Extreme mide 3,3 ms en los pases de las cascadas (Console 0,77, High 0,93, Ultra 1,41 en la misma corrida),
+     sin acné ni sombras despegadas en la meseta ni en el Santuario de la Resurrección. Los perfiles de GPU dan ahora
+     el tamaño del depth de cada pase (`pass: ... depth 896x896`).
    - Overlay de rendimiento (F10: off, FPS, full; ajuste `perf_overlay`): FPS y ms del juego con gráfico, CPU (total
      y del juego), RAM, GPU (uso, temperatura, potencia, reloj, VRAM) por NVML, que trae el driver de NVIDIA
      (cargado en tiempo de ejecución), y en Linux amdgpu por sysfs. Temperatura de CPU: hwmon en Linux; en Windows
@@ -620,6 +933,22 @@ Pendiente:
      diálogos `Stream_*/…bfstm`, 6441 archivos con inglés), parcheando solo la tabla de archivos en la copia que ya
      usa el overlay de mods. Ambos se leen al arrancar el juego: en juego, "Restart now" (reinicio en el sitio)
      los aplica.
+     Tailandés (2026-10-22): la 1.9.0 lo trae (`Pack/Bootup_THth.pack`, `Font/Font_TH.sbfarc` y cuatro fuentes
+     `.sbfotf`) y lo elige cuando `GetDesiredLanguage` responde `th` (la 1.9.0 compara el código con "th"; la 1.8.2
+     no). Es la última entrada de `g_text_languages` (región `THth`); `language_text_count` / `language_text_index`
+     solo lo ofrecen si `extracted/romfs/Pack/Bootup_THth.pack` existe, y con archivos 1.8.2 un ajuste en tailandés
+     se guarda pero vale como Auto. No hay voces en tailandés: con "Igual que el texto" el juego toma las inglesas
+     (`Voice/USen`).
+     - Tamaños de recurso (2026-10-22, issue #2): el juego reserva la memoria de cada recurso según la entrada de su
+       ruta en `System/Resource/ResourceSizeTable.product.srsizetable` (RSTB: el tamaño del archivo más lo que arma
+       con él, ~850 bytes en un banco de voz). Un banco redirigido más grande que el de la ruta se queda sin memoria:
+       el objeto de 0xa8 bytes que lo parsea (tras comprobar `BARS`) recibe NULL y el juego escribe en él
+       ("accessing 0x10"). Con texto pt-BR y voces JPja pasaba siempre en la pantalla de título, que carga los
+       `Demo*.bars` (`Demo131_0`: 3064 bytes en JPja, 2616 en USes); con en-US no se vio en el título, Continuar,
+       Kakariko ni el prólogo. `rstb_patch` (`fs.c`) sirve desde memoria, como `Version.txt`, una copia de la RSTB
+       en la que las entradas de los archivos redirigidos que crecieron crecen lo mismo (redondeado a 32, más 32):
+       3428 archivos más grandes con JPja, 242 de ellos con entrada (los diálogos `.bfstm` no tienen). La copia va
+       en Yaz0 de solo literales (~593 KB por 467 KB). Si el overlay de mods trae su propia RSTB, se deja la suya.
    - Menús traducidos (2026-10-16): la pantalla de inicio y el menú del juego siguen al idioma de texto (Auto: el
      del sistema). `tr("texto en inglés")` (`runtime/ui/i18n.mm`) busca el texto en la tabla del idioma,
      `runtime/ui/i18n/<idioma>.inc` (`T("English", "...")`; `""` deja el inglés). Los widgets de
@@ -629,9 +958,14 @@ Pendiente:
      textos (`ui_merge_fallback_font`), y cada contexto rehace sus fuentes al cambiar el idioma.
      `tools/i18n_check.py` lista los textos que le faltan a cada tabla (`--missing <idioma>` los imprime como
      líneas `T(...)`); `SAVAGEWIND_MENU_LANG=<código>` (p. ej. `ja`) fuerza el idioma de los menús para probar.
-     Las once tablas están completas (es, fr, de, it, nl, ru, pt, ja, ko, zh-Hans, zh-Hant). ImGui 1.91.9 solo
+     Las doce tablas están completas (es, fr, de, it, nl, ru, pt, ja, ko, zh-Hans, zh-Hant, th). ImGui 1.91.9 solo
      corta líneas en espacios: `third_party/imgui/imgui_draw.cpp` (`ImFont::CalcWordWrapPositionA`) lleva un
-     parche local que también corta entre caracteres CJK, respetando la puntuación.
+     parche local que también corta entre caracteres CJK, respetando la puntuación. El tailandés no separa
+     palabras con espacios: sus textos llevan espacios entre frases, que es donde se cortan las líneas. Su fuente
+     es Noto Sans Thai Medium (OFL, `third_party/fonts/NotoSansThai`, empaquetada como Fira Sans), y si falta, la
+     del sistema (Leelawadee UI, Tahoma). ImGui no posiciona marcas combinantes con GPOS: las vocales y tonos de
+     Noto Sans Thai tienen avance 0 y caen sobre la letra anterior, que se lee bien en los tamaños del menú.
+     Dentro del juego, las páginas de Opciones se dibujan con la fuente tailandesa del propio juego.
    - Ajustes dentro del juego (2026-10-18): la pantalla Ajustes del propio juego (pausa > Sistema > Ajustes, u
      Opciones en el menú del título) lleva las páginas de Savage Wind y sustituye al overlay en el juego (F1, Esc y el
      botón Home ya no lo abren; `SAVAGEWIND_OVERLAY=1` lo devuelve; Esc suelta el cursor). La primera página es una
@@ -647,6 +981,18 @@ Pendiente:
      (pantalla 0x39, tipo 7, textos propios): escritorio o pantalla de inicio de Savage Wind; la respuesta queda en
      0x7001c4b308 (botón de arriba 0, de abajo 1) y B cierra sin respuesta. Textos nuevos solo en inglés y español
      por ahora (`tools/i18n_check.py`).
+   - Sin "Contenido descargable" en el menú del título (2026-10-22, issue #19): su botón de la eShop abría el applet
+     de la tienda, que no existe (ILibraryAppletCreator es un stub), y el juego esperaba para siempre. Hasta que haya
+     DLC, el botón (id 0x6d, panel Pa_SaveFile_04, el último del menú) sale con los medios del propio juego, como
+     cuando el juego deja fuera botones (sin partida no hay Continuar): (1) el menú habilita al empezar los botones
+     de una de sus listas estáticas {u32 cuenta, ids} (una por variante, en la .bss de main, llenas por un
+     constructor estático); las que tienen 0x6d lo tienen al final, así que su cuenta baja en uno justo después de
+     los constructores (`rt_title_menu_prepare`, llamado desde `runtime/main.c`; las listas se encuentran por su
+     contenido, ids 0x69..0x6f ascendentes), y el cursor ya no llega a él; (2) lo que se ve lo decide el cuadro de la
+     animación `Title_00_BtnNum`, cuyas curvas de visibilidad muestran Salir y Contenido descargable siempre juntos:
+     en sus datos (en el archivo de layout cargado) las claves de visibilidad de Pa_SaveFile_04 pasan a ocultas en
+     cada update del menú (`title_hide_dlc`; el manejador de la animación está en el campo `title_options_state`
+     - 0x24, en 1.8.2 y 1.9.0). Era el último botón: no queda hueco.
    - setjmp / longjmp (2026-10-16): libjpeg y libpng de `nn::image` salen de sus errores con `longjmp`, que vuelve
      a la mitad de la función que llamó a `setjmp`; el código recompilado no puede retomar ahí ("no function at
      70023f1b14", al codificar la miniatura del guardado). `tools/gen.py` envuelve cada `bl` a `setjmp` (el
@@ -660,7 +1006,11 @@ Pendiente:
      esa memoria de la GPU. Ahora el draw espera la compilación (un tirón la primera vez que aparece un efecto; el
      caché de SPIR-V y de pipelines lo evita en las siguientes sesiones). Ajuste "Asynchronous shaders"
      (`async_shaders`) para volver a no esperar; `SAVAGEWIND_SYNC_SHADERS` / `SAVAGEWIND_ASYNC_SHADERS` mandan
-     sobre el ajuste.
+     sobre el ajuste. Aun en asíncrono, los draws en texturas array, 3D o cubo que no siguen la escala de salida
+     esperan su pipeline (2026-10-22, `draw_must_happen` en `exec.c`): BOTW copia cada tile de terreno que carga una
+     sola vez a su capa de los arrays de altura, normales y materiales, y una copia descartada dejaba el material 0
+     (hierba) para siempre: bandas verdes en la arena fuera de la Ciudad Gerudo en ~3 de 4 corridas. Las esperas
+     son de la carga; la línea `[vk] t=` las cuenta como `build waits N`.
    - Herramientas de diagnóstico:
      - `SAVAGEWIND_THREAD_DUMP_AT=<s>,<s>`: estado, núcleo y cadena de llamadas de cada hilo; para los que
        esperan un mutex, también su palabra (el handle del dueño).
@@ -668,7 +1018,9 @@ Pendiente:
        dispositivo, pico), `SAVAGEWIND_AUDIO_WAV=<archivo>` (graba la salida), `SAVAGEWIND_AUDIO_DFC=0` (vuelve
        al HLE de `audren:u`).
      - `SAVAGEWIND_WATCH=<dir>:<largo>` (con `_DEREF`, `_TRAP`, `_STEP`, `_FOLLOW`, `_WRITES`): trampa de
-       escritura por página con paso a paso (Windows), y quién escribió (`módulo+offset`).
+       escritura por página con paso a paso (Windows), y quién escribió (`módulo+offset`), con el lr y la cadena de
+       registros de marco del hilo del juego (quién llamó al `memcpy` que escribió; `swgame.dll+offset` se traduce a
+       `f_<dirección>` con `nm` sobre la base 0x180000000).
      - `SAVAGEWIND_FNPROF=0:999999` con `SAVAGEWIND_FNPROF_ARGS=<dir>,...`: x0-x5 y el llamador en cada
        entrada de esas funciones; `SAVAGEWIND_FNPROF_DEREF=<reg>:<n>` vuelca lo apuntado (y muestra textos).
      - `SAVAGEWIND_NVN_LOG=1`: funciones NVN que el juego busca y enteros del dispositivo que lee.
@@ -721,7 +1073,12 @@ Pendiente:
        `clamp` y cada `ReportCounter` que no es de tiempo sale como `[counter]` (tipo, destino, draw y shader).
      - `SAVAGEWIND_DEBUG_PICK=<x>,<y>[;<x>,<y>...]` (hasta 4 puntos en coordenadas de 1600x900, con F9): después
        de cada draw copia esos píxeles de su primer target; al terminar el frame, `[pick]` lista por punto los
-       draws que los cambiaron (el último es el que se ve) con su shader y hash.
+       draws que los cambiaron (el último es el que se ve) con su shader y hash. Con `SAVAGEWIND_DEBUG_FRAME=<frame>`
+       no hace falta F9. `SAVAGEWIND_DEBUG_PICK_RT=<i>` mira el target i de cada pase en vez del primero (el albedo
+       del G-buffer es el 1); los pases sin ese target no cuentan.
+     - `SAVAGEWIND_LOG_DRAW_INTO=<dirección hex>`: en todos los frames, cada draw en la textura de esa dirección
+       (`[into]`): capa, viewport, scissor, shader y, por textura que muestrea, su objeto, si tiene imagen y un hash
+       de su memoria en ese momento (así salió la copia de tiles de terreno al array de materiales).
      - Memoria que comparten la CPU y la GPU: `SAVAGEWIND_LOG_COPIES=1` (copias buffer/textura y
        `nvnTextureWriteTexels`), `SAVAGEWIND_LOG_RENDER_TEX=<an>x<al>` (pases que dibujan en texturas de ese tamaño, con
        nivel y capa), `SAVAGEWIND_DUMP_LINEAR=1` (lo que vuelve de los render targets lineales, crudo, en
@@ -730,6 +1087,18 @@ Pendiente:
        `SAVAGEWIND_NO_LINEAR_READBACK=1` (A/B sin la copia de vuelta) y `SAVAGEWIND_LOG_CMD_COUNTS=1` (cuenta de
        comandos NVN en cada intervalo de estadísticas). Las funciones de `nvnCommandBuffer` sin implementar se
        loguean la primera vez que el juego las llama.
+     - Ir a otras regiones sin jugar (sólo pruebas, nunca para el jugador; `runtime/services/test_warp.c`):
+       `SAVAGEWIND_TEST_WARP=<lugar>` o `<x>,<y>,<z>[,<tipo de mapa>/<mapa>]` reescribe la posición guardada en
+       `game_data.sav` mientras el juego lo lee (el archivo no cambia) y le da el planeador a Link, así que
+       "Continuar" carga allí. Lugares: plateau, kakariko, stable, hateno, castle, castle_in, desert, gerudo, hebra,
+       zora, goron, rito, ruta y rudania (dentro de las bestias divinas; en Rudania Link arde sin protección
+       contra el fuego). `SAVAGEWIND_TEST_TIME=<hora>` fija la hora del día escribiendo la de TimeMgr en cada
+       frame (al continuar, el juego no toma la hora de la partida). `SAVAGEWIND_TEST_WEATHER=<n>` (0 despejado,
+       1 nublado, 2 lluvia, 3 lluvia fuerte, 4 nieve, 6 tormenta) cambia los pronósticos guardados, pero el clima al
+       cargar no los sigue. `SAVAGEWIND_TEST_FLAGS=<flag>=<valor>,...` cambia otros datos (p. ej.
+       `MaxHartValue=120,CurrentHart=120`, 30 corazones). Usar con una copia de la partida
+       (`SAVAGEWIND_SAVE_DIR`): al guardar, el juego escribe esos valores. Continuar con
+       `SAVAGEWIND_INPUT="155:A:4,187:A:4,213:A:4"`.
      - En Git Bash, `VAR=1 timeout 60 ./build/savagewind.exe` no le pasa la variable al programa: usar
        `timeout 60 env VAR=1 ./build/savagewind.exe`. Con `/c/msys64/usr/bin` primero en el PATH, `env` es el de
        MSYS2 y tampoco ve las variables exportadas desde Git Bash: pasarlas como argumentos de `env`.
@@ -752,8 +1121,9 @@ Ambos límites están en `runtime/rt.h` y en `tools/layout.py`.
 - `make gen` (`gen.py all`) escribe `generated/layout.txt` y `generated/layout.c` y genera cada módulo en
   `generated/<módulo>/`. `gen.py <módulo> <nso> <layout.txt> <salida>` genera uno solo con esas
   direcciones y se niega si el NSO no es el del layout (build id).
-- `layout.c` se compila dentro de la biblioteca del juego (`runtime/gamelib.h`, `GAMELIB_ABI` 2): por
-  cada módulo, nombre, dirección, tamaño, build id y tabla de funciones. `runtime/loader.c` carga cada
+- `layout.c` se compila dentro de la biblioteca del juego (`runtime/gamelib.h`, `GAMELIB_ABI` 3): por
+  cada módulo, nombre, dirección, tamaño, build id y tabla de funciones; además la versión del juego y sus
+  sitios (ver "Versiones del juego"). `runtime/loader.c` carga cada
   módulo donde dice la biblioteca y se detiene si un NSO tiene otro build id o si hay un `subsdk*` que
   la biblioteca no tiene (hay que volver a generar).
 - La pantalla de setup (`runtime/gamebuild.c`) corre `gen layout` y después un generador por módulo.
@@ -774,6 +1144,114 @@ Ambos límites están en `runtime/rt.h` y en `tools/layout.py`.
 Con el exefs de 1.8.2: `main` en 0x70_0000_0000 (29.2 MiB), `subsdk0` (multimedia) en 0x70_01d3_7000
 (6.4 MiB), `sdk` en 0x70_023a_3000 (12.3 MiB). El loader carga los tres ahí, con 488, 10110 y 23039
 símbolos; ningún import queda sin resolver salvo los `glslc*` débiles de `main`.
+
+## Versiones del juego
+
+Política (2026-10-22): la 1.9.0 es la principal; el entorno de desarrollo (`extracted/`, `generated/`) y las pruebas
+usan la 1.9.0. La 1.8.2 queda en `extracted-1.8.2/` y se sigue aceptando en la instalación, sin soporte.
+
+Savage Wind arma el juego con los archivos de cada jugador, así que puede servir a más de una versión a la vez. Lo
+que depende de la versión son las direcciones del `main` que tocan los parches y las que lee el runtime; el resto
+(la recompilación entera, el HLE del `sdk` por nombre de símbolo, NVN) sale de los archivos mismos.
+
+- Listas de versiones: `runtime/game_versions.h` (la pantalla de configuración) y `VERSIONS` en
+  `tools/game_sites.py` (el generador), con nombre, build id del `main` (los primeros 8 bytes) y si está
+  soportada. `tools/test_game_sites.py` comprueba que coincidan. Hoy: 1.8.2 (`de0b6ac4efc1dda7`, 41056 ficheros de
+  romfs) y 1.9.0 (`cd57b23fa4bbad65`, 41062: los 6 de más son el tailandés, `Pack/Bootup_THth.pack` y sus fuentes).
+- La configuración acepta una versión soportada. Una conocida pero apagada se rechaza con su propio mensaje
+  ("La versión %s aún no es compatible": Savage Wind juega la 1.8.2 por ahora). Cualquier otra se rechaza como
+  antes. Los textos que nombran versiones llevan `%s`: la lista sale de `game_versions.h` ("1.8.2", luego
+  "1.8.2 / 1.9.0"), sin traducir de nuevo.
+- `gen.py layout` / `all` se niega con un `main` de una versión no soportada, salvo con `--any-version`
+  (`make gen GENARGS=--any-version`): para levantar una versión nueva. `--no-sites` genera sin sitios ni parches
+  (los módulos inventados de `tools/test_layout.py`).
+- Sitios (`SITES` en `tools/game_sites.py`): 38 lugares del `main`, cada uno con nombre, tipo y patrón.
+  - Parches de `tools/patches.py` (17): la pantalla Opciones (filas, valores, textos, A, B, actualización), el
+    diálogo de dos botones, el menú del título, la espera de vsync del bucle de frames y `ksys::VFR`.
+  - Funciones a las que llaman esos parches (7): abrir y cerrar pantallas, el tipo de flag, el texto de un
+    mensaje, redibujar una fila.
+  - Datos que usa el runtime (12, `runtime/game_sites.h`): la tabla de opciones, el ScreenMgr, la respuesta del
+    diálogo, el archivo de mensajes del título, "Ver.%s", el estado de pausa, el manager de eventos, el paso de los
+    mandos, la dirección de retorno del bucle de frames al fijar el intervalo, PlayerInfo y world::Manager (solo
+    pruebas), y dónde empiezan `.data` y termina `main`.
+  - Campos de objetos del juego que la 1.9.0 movió (2, tipo `imm`: el inmediato de la instrucción): el número de
+    filas de la pantalla Opciones (+8: las filas; 1.8.2 +0x3698, 1.9.0 +0x36b0) y el botón activo del menú del
+    título (1.8.2 +0x363c, 1.9.0 +0x3654).
+- Cada patrón son unas 8 palabras de instrucciones dentro de una misma función, con los campos que se mueven
+  enmascarados: offsets de `b` / `bl` / `b.cond` / `cbz` / `tbz`, la página de un `adrp` y los 12 bits bajos que le
+  suma un `add` / `ldr` / `str`. El sitio es esa instrucción (`code`), la función a la que salta (`call`), la
+  dirección que forma con su `adrp` (`ref`), el puntero guardado ahí (`got`, una entrada de la GOT) o su inmediato
+  (`imm`). Un sitio puede llevar una lista de patrones si una versión cambió su código: gana el primero que
+  encuentra un solo lugar. Mejor aún, un patrón común: `game_sites.py common <main A> <dirección> <main B>
+  <dirección> [tipo]` guarda solo los bits que las dos versiones comparten (el resto queda enmascarado) y comprueba
+  que encuentre un solo lugar en cada una. Así quedaron los 9 sitios que la 1.9.0 cambió.
+- `KNOWN['1.8.2']` y `KNOWN['1.9.0']` tienen la dirección de cada sitio: en esa versión el patrón tiene que encontrar exactamente
+  esa (autocomprobación; otra dirección es un error), y si no encuentra ninguna o varias se usa la de la tabla con
+  un aviso. Una versión sin tabla necesita que todos los patrones encuentren un solo lugar.
+- `gen.py layout` resuelve los sitios y los escribe en `layout.c` (`game_version`, `game_sites[]`);
+  `gen.py main` los resuelve de nuevo para los parches (`patches.table()`). El runtime los toma al cargar la
+  biblioteca (`gamelib_load` llena `g_site`; falta uno: no carga). Los 38 se resuelven en ~4 s.
+- Lo que los sitios no cubren, a revisar a mano en cada versión: offsets de estructuras (campos de `ksys::VFR`,
+  la fila de Opciones y su entrada de 0x30 bytes, ScreenMgr +0x28 / +0x30, el evento activo en +0x1d2b8,
+  PlayerInfo +0x88 / +0xa4, TimeMgr +0xb8, la respuesta del diálogo), ids de pantallas (0x34 Opciones, 0x39
+  diálogo, 1 título), botones del título (0x69..0x6f, 0x6c amiibo), la vtable del diálogo (+0x4e0) y el número de
+  opciones del juego (14). Cada parche además comprueba la palabra de instrucción que espera y para la generación
+  si no la ve. El modo FP (`FPCR.FZ` en `MXCSR`, `runtime/simd.h`) no tiene direcciones.
+
+Pasos para una versión nueva (así se hizo la 1.9.0):
+
+1. Extraer su exefs y romfs (romfs con la actualización fusionada) y correr
+   `tools/venv/Scripts/python tools/sw_probe.py <exefs>`: build id del `main` y layout.
+2. Agregar la versión, apagada, con su build id a `runtime/game_versions.h` y a `VERSIONS`
+   (`tools/test_game_sites.py` comprueba que coincidan). En `game_versions.h` va también cuántos ficheros tiene su
+   romfs con la actualización fusionada (`find romfs -type f | wc -l`): la preparación lo comprueba.
+3. `cd tools && ../tools/venv/Scripts/python game_sites.py find <exefs>/main`: cada sitio con su dirección o
+   cuántos lugares encuentra su patrón. Para uno que no encuentra exactamente uno: buscar en el `main` nuevo la
+   misma función que en 1.8.2 (la dirección de `KNOWN['1.8.2']`, por sus llamadas, cadenas o código vecino) y
+   `game_sites.py common <main viejo> <dirección> <main nuevo> <dirección> <tipo>` da un patrón que encuentra
+   solo esos dos (o `pattern` uno para la versión nueva sola, y el sitio lleva los dos en una lista). Un offset de
+   un objeto del juego que cambió y que el runtime usa pasa a ser un sitio `imm`.
+4. Copiar la tabla que imprime `find` a `KNOWN['<versión>']` y revisar los offsets y ids de la lista de arriba
+   contra el código nuevo.
+5. `make gen GENARGS=--any-version` y `make` en un checkout con los archivos de esa versión en `extracted/`.
+   Probar oculto: título, Continuar, mundo abierto, las páginas de Opciones (con Salir) y la frecuencia de frames
+   (`SAVAGEWIND_CLOCK_PROBE` a 30 / 60 / 120: el reloj del juego igual).
+6. Marcarla soportada en las dos listas. `python tools/game_sites.py find` debe salir sin errores para cada
+   versión, y `tools/test_game_sites.py` y `tools/test_layout.py` pasar.
+
+Con 1.8.2 el C generado es el mismo que antes de los sitios salvo `layout.c` (gana la versión y la tabla de
+sitios).
+
+La 1.9.0 (2026-10-22, rama `game-1.9.0`; archivos del usuario en `extracted-1.9.0/`, verificados): `main` 18,8 MB
+(1.8.2: 17,8), `sdk` del SDK 21.4.1, layout `main` 0x70_0000_0000-0x70_01e9_8000 (30,6 MiB), `subsdk0` y `sdk` detrás.
+- `game_sites.py find` encontró 29 de los 36 sitios de entonces tal cual. Los otros 7 (la actualización de Opciones,
+  abrir una pantalla, el estado de Opciones de la pausa, los textos y el B del diálogo, la actualización del menú
+  del título y "Ver.%s") no: las pantallas de UI de la 1.9.0 tienen 0x18 bytes más desde antes de +0x290 (la base
+  abre con `strb wzr, [x0, #0x2a8]` en vez de #0x290; Opciones: filas en +0x36b0 / +0x36b8 en vez de +0x3698 /
+  +0x36a0; menú del título: +0x3654 en vez de +0x363c; diálogo: +0x33c8 en vez de +0x33b0), y esos offsets estaban
+  en los patrones. Se ubicaron votando ventanas cortas de la función de 1.8.2 contra la 1.9.0 y comparando lado a
+  lado, y ahora tienen patrones comunes (`game_sites.py common`). Los dos campos que lee el runtime pasaron a ser
+  sitios `imm` (`opt_screen_rows`, `title_options_state`), y el parche del B del diálogo toma su offset de la
+  instrucción misma.
+- Los 38 encuentran un solo lugar en cada versión, y cada uno coincide con el lugar que da un voto independiente
+  (ventanas de la función de 1.8.2 buscadas en la 1.9.0) o con una comprobación a mano (`opt_create_rows` lee la
+  tabla de opciones +0x10; la GOT que lee la pausa apunta a `screen_mgr`; "Ver.%s" está en 0x70_015c_d092).
+- Iguales en la 1.9.0, mirados uno por uno en el código: `ksys::VFR` (+0x28 .. +0x150), el bucle de frames
+  (+0x228 FC, +0x234 = FC +0xc, +0x250), ScreenMgr +0x28 / +0x30, la fila de Opciones (+0x50 .. +0x68) y su
+  entrada de 0x30 bytes, 14 opciones del juego, la entrada de la pantalla (+0x38, bit 1 de +0x38), pantallas 0x34
+  y 0x39, botones 0x6a y 0x6c, la vtable del diálogo (+0x4e0), el evento activo (+0x1d2b8), la respuesta del
+  diálogo (0xd), PlayerInfo +0x88. El único símbolo HLE (`longjmp`) sigue en el `sdk` 21.4.1.
+- La RomFS 1.9.0 tiene 6 ficheros más, el tailandés: `Pack/Bootup_THth.pack`, `Font/Font_TH.sbfarc` y cuatro
+  fuentes `.sbfotf`. Savage Wind todavía no ofrece el tailandés como idioma del texto.
+- Pruebas (ocultas; datos en `build/run190/extracted` con `exefs` y `romfs` enlazados a `extracted-1.9.0` y su
+  `romfs.bin` hecho con `--build-romfs`; copia de `save/` del usuario): biblioteca generada sin que falle ningún
+  parche (125144 funciones en `main`), título con "Savage Wind 0.2", Opciones desde el título (Vídeo, Fotogramas
+  por segundo), Continuar al mundo abierto (la misma posición de Link que con 1.8.2), menú de pausa > Sistema >
+  Opciones > Audio con la misma repetición (0,266 s y luego 0,200 s), Salir y B (las mismas pantallas que 1.8.2), y
+  a 60 FPS 30,02 frames de consola y 1,00 minuto de juego por segundo, caminar 5,5 m/s, esprintar 8,1 m/s, estamina
+  ~300 por segundo (como 1.8.2: 30,02 / 1,00 / 5,7 / 8,2 / 305). Las mismas llamadas sin implementar que con 1.8.2.
+  La preparación acepta la carpeta 1.9.0 (versión "1.9.0", 39008+ ficheros) y rechaza `exefs` 1.9.0 con `romfs`
+  1.8.2 y al revés.
 
 ## Audio
 

@@ -40,6 +40,8 @@ llvm-strip --strip-debug "$APPDIR/usr/bin/savagewind"  # (symbols stay: crash ba
 cp docs/icon/icon_1024.png "$APPDIR/usr/bin/icon.png"
 cp third_party/fonts/FiraSans/FiraSans-SemiBold.ttf third_party/fonts/FiraSans/FiraSans-Medium.ttf "$APPDIR/usr/bin/"  # (menus, OFL)
 cp third_party/fonts/FiraSans/OFL.txt "$APPDIR/usr/bin/FiraSans-OFL.txt"
+cp third_party/fonts/NotoSansThai/NotoSansThai-Medium.ttf "$APPDIR/usr/bin/"  # (Thai menus, OFL)
+cp third_party/fonts/NotoSansThai/OFL.txt "$APPDIR/usr/bin/NotoSansThai-OFL.txt"
 cp README.md LICENSE "$APPDIR/usr/bin/"  # (licenses and source links of the bundled components: README "License")
 [ -d "$L/helper/swgen" ] || { echo "no game code generator helper: tools/linux/gen_helper.sh $ARCH first"; exit 1; }
 cp -R "$L/helper/swgen" build/zig "$APPDIR/usr/bin/"

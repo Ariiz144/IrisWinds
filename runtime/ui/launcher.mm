@@ -1,7 +1,7 @@
 // Start screen, shown before the game boots, in two modes (runtime/main.c picks):
 // - setup: a plain start whose game files aren't set up yet (or whose game code was built for another version of
 //   Savage Wind). Only the game files page: nothing of the game ships with Savage Wind, so the user picks the folder
-//   with their own extracted game files (exefs/ and romfs/), we check the main module is an NSO of version 1.8.2,
+//   with their own extracted game files (exefs/ and romfs/), we check the main module is an NSO of a supported version,
 //   copy the files, build the game's data image and recompile the game code - then the game starts.
 // - configuration ("Savage Wind Configuration", --config): PLAY, SETTINGS, GAME FILES (set up, set up again,
 //   delete), QUIT, the game-files status at the lower left.
@@ -46,9 +46,13 @@ extern "C" {
 #include "paths.h"
 #include "gamebuild.h"
 #include "gamelib.h"
+#include "game_versions.h"
 #include "romfs_build.h"
 #include "settings.h"
 #include "input_bind.h"
+#ifndef __APPLE__
+#include "nvn/precompile.h"
+#endif
 void controls_bindings_draw(float scale);  // ui/controls_ui.mm
 void ui_window_init(void);
 SDL_Window *ui_window(void);
@@ -122,13 +126,93 @@ static bool nso_build_id(const std::string &main_path, std::string *hex) {
     return true;
 }
 
-// The game version this build is made for: BOTW 1.8.2, told by its main module's build id (the first 8 bytes;
-// tools/sw_probe.py prints it). Other versions would need their own recompilation work.
-static const char *const SUPPORTED_MAIN[] = {"de0b6ac4efc1dda7"};
+// The game versions this build sets up (runtime/game_versions.h), told by the main module's build id (its first 8
+// bytes; tools/sw_probe.py prints it). A known version that isn't supported yet is refused with its own message. The
+// RomFS that goes with it is checked before the setup copies anything: its System/Version.txt and about how many files
+// it has with the update applied over the base game (check_romfs).
+struct GameVersion {
+    const char *name, *id;
+    bool supported;
+    unsigned romfs_files;  // (0: not counted)
+};
+static const GameVersion VERSIONS[] = {
+#define GAME_VERSION_ENTRY(v, id, ok, files) {v, id, ok, files},
+    GAME_VERSIONS(GAME_VERSION_ENTRY)
+#undef GAME_VERSION_ENTRY
+};
+static const GameVersion *main_version(const std::string &id) {
+    for (const GameVersion &v : VERSIONS)
+        if (*v.id && id == v.id) return &v;
+    return nullptr;
+}
 static bool supported_main(const std::string &id) {
-    for (const char *s : SUPPORTED_MAIN)
-        if (id == s) return true;
-    return false;
+    const GameVersion *v = main_version(id);
+    return v && v->supported;
+}
+
+// The texts that name versions have a %s: NOT_SUPPORTED_YET's is the game files' version, the others' the supported
+// ones ("1.8.2", "1.8.2 / 1.9.0"). trv: tr with that filled in.
+static const char *const NOT_SUPPORTED = "Game files aren't version %s";
+static const char *const NOT_SUPPORTED_YET = "Version %s isn't supported yet";
+static std::string g_files_version;  // (a known version not supported yet: the game files')
+static std::string supported_versions() {
+    std::string s;
+    for (const GameVersion &v : VERSIONS)
+        if (v.supported) s += (s.empty() ? "" : " / ") + std::string(v.name);
+    return s;
+}
+static std::string trv(const std::string &key) {
+    std::string s = tr(key.c_str()), arg = key == NOT_SUPPORTED_YET ? g_files_version : supported_versions();
+    for (size_t at = s.find("%s"); at != std::string::npos; at = s.find("%s", at + arg.size())) s.replace(at, 2, arg);
+    return s;
+}
+
+static const float ROMFS_FILES_MARGIN = 0.95f;  // (a few files short still passes: some tools skip empty ones)
+
+// Files under dir; the count stops at `enough` (a whole RomFS has tens of thousands: no need to walk them all)
+static unsigned count_files(const std::string &dir, unsigned enough, unsigned n = 0) {
+    DIR *d = opendir(dir.c_str());
+    if (!d) return n;
+    while (n < enough) {
+        struct dirent *e = readdir(d);
+        if (!e) break;
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+        std::string p = dir + "/" + e->d_name;
+        if (is_dir(p)) n = count_files(p, enough, n);
+        else n++;
+    }
+    closedir(d);
+    return n;
+}
+
+// The RomFS of version v, update applied? "" = yes, else what was found, said to the player (in the menu language).
+// A common mistake used to pass this far and the game then failed with no explanation: the update's ExeFS with the
+// cartridge's RomFS, which says its own older version, or with the update's RomFS alone, which has far fewer files.
+static std::string check_romfs(const std::string &romfs, const GameVersion &v) {
+    char found[64] = "";
+    if (FILE *f = fopen((romfs + "/System/Version.txt").c_str(), "rb")) {
+        size_t n = fread(found, 1, sizeof found - 1, f);
+        fclose(f);
+        found[n] = 0;
+        char *a = found, *b = found + n;  // (trimmed: a byte order mark, spaces, line ends)
+        if (!strncmp(a, "\xEF\xBB\xBF", 3)) a += 3;
+        while (a < b && isspace((unsigned char)*a)) a++;
+        while (b > a && isspace((unsigned char)b[-1])) *--b = 0;
+        memmove(found, a, strlen(a) + 1);
+    }
+    unsigned want = (unsigned)(v.romfs_files * ROMFS_FILES_MARGIN);
+    unsigned files = strcmp(found, v.name) || !want ? 0 : count_files(romfs, want);  // (only for the right version)
+    fprintf(stderr, "[launcher] romfs: version \"%s\", %u%s files (%s wants \"%s\", %u)\n", found, files,
+            want && files >= want ? "+" : "", v.id, v.name, v.romfs_files);
+    char msg[400] = "";
+    if (!*found) snprintf(msg, sizeof msg, "%s", tr("It has no System/Version.txt."));
+    else if (strcmp(found, v.name)) {
+        for (char *c = found; *c; c++)  // (shown as text: printable, and no % - trv fills those in)
+            if ((unsigned char)*c < 0x20 || (unsigned char)*c > 0x7e || *c == '%') *c = '?';
+        snprintf(msg, sizeof msg, tr("Its System/Version.txt says %s."), found);
+    } else if (files < want) snprintf(msg, sizeof msg, tr("It has %u files; with the update applied it has %u."), files,
+                                      v.romfs_files);
+    return msg;
 }
 
 // The copied game files alone ("" = there), without the game code built from them.
@@ -136,7 +220,11 @@ static std::string check_copied_files(const std::string &root) {
     if (!file_exists(root + "/exefs/main")) return "No game files";
     std::string id;
     if (!nso_build_id(root + "/exefs/main", &id)) return "Game files unreadable (exefs/main is not an NSO)";
-    if (!supported_main(id)) return "Game files aren't version 1.8.2";
+    if (!supported_main(id)) {
+        const GameVersion *v = main_version(id);
+        if (v) g_files_version = v->name;
+        return v ? NOT_SUPPORTED_YET : NOT_SUPPORTED;
+    }
     if (!is_dir(root + "/romfs") || !file_exists(root + "/romfs.bin")) return "Game data missing";
     return "";
 }
@@ -178,12 +266,16 @@ static void set_job(const std::string &s, bool failed = false, const std::string
     pthread_mutex_unlock(&g_lock);
 }
 
-// Setup failures: a short headline and what to do next (also SAVAGEWIND_LAUNCHER_SHOT=<f>:fail<1-7>, screenshots)
-enum { FAIL_NOT_FOUND = 1, FAIL_UNUSABLE, FAIL_COPY, FAIL_VERSION, FAIL_MISSING, FAIL_BUILD, FAIL_NOT_182 };
+// Setup failures: a short headline and what to do next (also SAVAGEWIND_LAUNCHER_SHOT=<f>:fail<1-9>, screenshots)
+enum {
+    FAIL_NOT_FOUND = 1, FAIL_UNUSABLE, FAIL_COPY, FAIL_VERSION, FAIL_MISSING, FAIL_BUILD, FAIL_NOT_SUPPORTED,
+    FAIL_NOT_YET, FAIL_ROMFS
+};
+static void set_romfs_failure(const GameVersion &v, const std::string &found);
 static void set_failure(int k) {
     static const char *const head[] = {"", "No game files found in that folder", "Those files can't be used",
                                        "Setup didn't finish", "The game's main module can't be read", "Game files incomplete",
-                                       "The game code didn't build", "Not version 1.8.2"};
+                                       "The game code didn't build", "Not version %s", NOT_SUPPORTED_YET};
     static const char *const hint[] = {
         "",
         "Choose the folder that holds the extracted game files (exefs and romfs).",
@@ -192,9 +284,30 @@ static void set_failure(int k) {
         "exefs/main must be the decrypted, extracted main module (an NSO file).",
         "Some files are missing. Choose the folder again; if it happens again, extract the game again.",
         "Make sure there's enough free space and try again. The log has the details.",
-        "Savage Wind needs the game updated to version 1.8.2: the 1.8.2 ExeFS and the RomFS with the update merged "
-        "in. Update the game on your console, extract it again and choose that folder."};
-    if (k >= 1 && k <= 7) set_job(head[k], true, hint[k]);
+        "Savage Wind needs the game updated to version %s: the %s ExeFS and the RomFS with the update merged "
+        "in. Update the game on your console, extract it again and choose that folder.",
+        "Savage Wind plays version %s for now. If you kept a copy of the game at that version, choose its folder."};
+    if (k >= 1 && k <= 8) set_job(head[k], true, hint[k]);
+    if (k == FAIL_ROMFS) {  // (screenshots: a cartridge's RomFS)
+        char found[200];
+        snprintf(found, sizeof found, tr("Its System/Version.txt says %s."), "1.0.0");
+        set_romfs_failure(VERSIONS[0], found);
+    }
+}
+
+// The chosen RomFS isn't the one for the ExeFS's version: what was found, and to extract it again with the update
+// applied. (Already in the menu language: the version goes into the texts.)
+static void set_romfs_failure(const GameVersion &v, const std::string &found) {
+    char head[200], hint[700];
+    snprintf(head, sizeof head, tr("The RomFS isn't version %s with the update applied"), v.name);
+    snprintf(hint, sizeof hint, tr("Savage Wind needs the RomFS of version %s with the update applied over the base "
+                                   "game. Extract the RomFS again that way and choose that folder."), v.name);
+    set_job(head, true, found + " " + hint);
+}
+
+// A status that names the game files' version: its failure
+static int version_failure(const std::string &st) {
+    return st == NOT_SUPPORTED ? FAIL_NOT_SUPPORTED : st == NOT_SUPPORTED_YET ? FAIL_NOT_YET : 0;
 }
 
 // What keeps the game from starting, said on the game files page as a setup failure is (nothing when there are simply
@@ -209,7 +322,7 @@ static void explain_status(const std::string &st) {
         set_job("The game code isn't built yet", true,
                 "Choose Set up game files to build it from your copy of the game. This takes a few minutes.");
     else set_failure(st.find("NSO") != std::string::npos ? FAIL_VERSION
-                     : st.find("1.8.2") != std::string::npos ? FAIL_NOT_182 : FAIL_MISSING);
+                     : version_failure(st) ? version_failure(st) : FAIL_MISSING);
 }
 
 // exefs: the folder with main and main.npdm; romfs: a folder named romfs (the game's data root). Found in the picked
@@ -272,6 +385,63 @@ static bool build_game_code(void) {
     return ok;
 }
 
+// ------------------------------------------------------------------ shader precompilation (runtime/nvn/precompile.h)
+// After a setup when its option is on (the setup page's PRECOMPILE ALL SHADERS, settings.precompile_shaders), or on
+// its own from the game files page of the configuration screen. The progress overlay shows it; Esc / B stops it
+// (what is done stays in the caches).
+#ifndef __APPLE__
+static ShaderPrecompile g_pc;
+static std::atomic<bool> g_precompiling{false}, g_pc_only{false};
+
+static void run_precompile(void) {
+    atomic_store(&g_pc.state, SP_IDLE);
+    atomic_store(&g_pc.done, 0);
+    atomic_store(&g_pc.total, 0);
+    atomic_store(&g_pc.cancel, false);
+    g_precompiling = true;
+    set_job("Precompiling shaders...");
+    bool ok = shader_precompile_run(&g_pc, (g_root + "/romfs.bin").c_str());
+    g_precompiling = false;
+    if (ok) set_job("Shaders precompiled.");
+    else if (atomic_load(&g_pc.state) == SP_CANCELLED) set_job("Shader precompilation stopped.");
+    else {
+        fprintf(stderr, "[launcher] shader precompilation: %s\n", g_pc.why);
+        set_job("The shaders couldn't be precompiled", true, "The game runs all the same: shaders then compile the first "
+                "time they are drawn. The log has the details.");
+    }
+}
+
+static void *precompile_thread(void *) {
+    run_precompile();
+    pthread_mutex_lock(&g_lock);
+    g_busy = false;
+    pthread_mutex_unlock(&g_lock);
+    return NULL;
+}
+
+// The overlay's step line while precompiling: the step and its count
+static std::string precompile_line(void) {
+    int st = atomic_load(&g_pc.state), d = atomic_load(&g_pc.done), t = atomic_load(&g_pc.total);
+    const char *what = st == SP_READING ? "Reading the shader archives..." : st == SP_COMPILING ? "Translating and compiling shaders..."
+                     : st == SP_PIPELINES ? "Building pipelines..." : "Precompiling shaders...";
+    std::string line = tr(what);
+    if ((st == SP_COMPILING || st == SP_PIPELINES) && t > 0) {
+        char n[64];
+        snprintf(n, sizeof n, "  %d / %d", d, t);
+        line += n;
+    }
+    return line;
+}
+#endif
+
+static bool pc_only_finished(void) {  // (a precompilation alone just finished: the game files page stays)
+#ifndef __APPLE__
+    return g_pc_only.exchange(false);
+#else
+    return false;
+#endif
+}
+
 static void *extract_thread(void *) {
     std::string src;
     pthread_mutex_lock(&g_lock);
@@ -292,7 +462,16 @@ static void *extract_thread(void *) {
         std::string id;
         if (!nso_build_id(exefs + "/main", &id)) { set_failure(FAIL_VERSION); goto done; }
         fprintf(stderr, "[launcher] main build id %s\n", id.c_str());
-        if (!supported_main(id)) { set_failure(FAIL_NOT_182); goto done; }  // (before copying 15 GB)
+        if (!supported_main(id)) {  // (before copying 15 GB)
+            const GameVersion *v = main_version(id);
+            if (v) g_files_version = v->name;
+            set_failure(v ? FAIL_NOT_YET : FAIL_NOT_SUPPORTED);
+            goto done;
+        }
+        set_job("Checking the game files...");
+        const GameVersion *v = main_version(id);
+        std::string found = check_romfs(romfs, *v);  // (the RomFS that goes with that ExeFS)
+        if (!found.empty()) { set_romfs_failure(*v, found); goto done; }
     }
     {
         // (the picked folder can't be Savage Wind's own copy: setting up again deletes that first)
@@ -326,9 +505,12 @@ static void *extract_thread(void *) {
 check:
     {
         std::string why = check_game_files(g_root);
+#ifndef __APPLE__
+        if (why.empty() && g_settings.precompile_shaders && shader_precompile_available()) run_precompile();
+#endif
         if (why.empty()) set_job("Game files ready.");
         else set_failure(why.find("NSO") != std::string::npos ? FAIL_VERSION
-                         : why.find("1.8.2") != std::string::npos ? FAIL_NOT_182 : FAIL_MISSING);
+                         : version_failure(why) ? version_failure(why) : FAIL_MISSING);
     }
 done:
     pthread_mutex_lock(&g_lock);
@@ -804,7 +986,11 @@ extern "C" void launcher_run(const char *root, int mode) {
         const char *pg = strchr(getenv("SAVAGEWIND_LAUNCHER_SHOT"), ':');
         if (pg && (!strncmp(pg + 1, "settings", 8) || !strcmp(pg + 1, "askdelete"))) page = SETTINGS, menu_tabs_focus(true);
         if (pg && !strcmp(pg + 1, "setup")) page = SETUP;
-        if (pg && !strncmp(pg + 1, "fail", 4)) page = SETUP, set_failure(atoi(pg + 5));  // (the failure messages)
+        if (pg && !strncmp(pg + 1, "fail", 4)) {  // (the failure messages; FAIL_NOT_YET: a version not supported yet)
+            for (const GameVersion &v : VERSIONS)
+                if (!v.supported && g_files_version.empty()) g_files_version = v.name;
+            page = SETUP, set_failure(atoi(pg + 5));
+        }
         if (pg && !strncmp(pg + 1, "settings", 8) && pg[9] == ':') g_tab_request_ext = atoi(pg + 10);  // settings:<tab>
         if (pg && !strcmp(pg + 1, "delete")) page = SETUP, g_confirm_delete = true;
         if (pg && !strcmp(pg + 1, "tip")) g_settings.menu_tip_seen = false, g_tip_test = true;
@@ -859,7 +1045,7 @@ extern "C" void launcher_run(const char *root, int mode) {
             if (status.empty() && g_setup_only) {  // set up: on into the game (after the first-start note)
                 if (g_settings.menu_tip_seen) play = true;
                 else tip_then_play = true;
-            } else if (status.empty()) page = MAIN;
+            } else if (status.empty() && !pc_only_finished()) page = MAIN;
         }
         was_busy = busy;
 
@@ -1039,7 +1225,7 @@ extern "C" void launcher_run(const char *root, int mode) {
                 // SETUP: the game files, in a window like Settings (option rows: runtime/ui/option_rows.h) - choose the
                 // folder with the game files, set up; once set up, delete or set up again. Each row's explanation on
                 // the right. A card on the left: the background shows beside it. The first start's is the welcome.
-                float sc = ds.y / 1080.0f, w = fminf(ds.x * 0.66f, 1320 * sc), h = fminf(ds.y - 2 * 18 * sc, 640 * sc);
+                float sc = ds.y / 1080.0f, w = fminf(ds.x * 0.66f, 1320 * sc), h = fminf(ds.y - 2 * 18 * sc, 780 * sc);
                 ImGui::GetWindowDrawList()->AddRectFilled(ImGui::GetWindowPos(), ImVec2(ImGui::GetWindowPos().x + ds.x,
                                                           ImGui::GetWindowPos().y + ds.y), IM_COL32(0, 0, 0, 50));
                 ImVec2 wp = ImGui::GetWindowPos();
@@ -1075,8 +1261,9 @@ extern "C" void launcher_run(const char *root, int mode) {
                 if (welcome && !busy) {  // what this is about, the first time
                     ImGui::PushTextWrapPos(0);
                     ImGui::TextColored(ImVec4(0.86f, 0.85f, 0.80f, 1), "%s",
-                                       tr("Savage Wind needs your own copy of the game, version 1.8.2. Choose the folder "
-                                          "with its extracted files and set them up: the game starts when it's done."));
+                                       trv("Savage Wind needs your own copy of the game, version %s. Choose the folder "
+                                           "with its extracted files and set them up: the game starts when it's done.")
+                                           .c_str());
                     ImGui::PopTextWrapPos();
                     ImGui::Dummy(ImVec2(0, 10 * sc));
                 }
@@ -1100,15 +1287,15 @@ extern "C" void launcher_run(const char *root, int mode) {
                     dl->AddLine(ImVec2(x, cy), ImVec2(x + u * 0.35f, cy + u * 0.35f), g, fs * 0.11f);
                     dl->AddLine(ImVec2(x + u * 0.35f, cy + u * 0.35f), ImVec2(x + u, cy - u * 0.4f), g, fs * 0.11f);
                 };
-                std::string src_d = tr("The folder with your own extracted game files: exefs (main, main.npdm, sdk...) and "
-                                       "romfs, version 1.8.2 with the update merged in. The game isn't included with Savage Wind.");
+                std::string src_d = trv("The folder with your own extracted game files: exefs (main, main.npdm, sdk...) and "
+                                        "romfs, version %s with the update merged in. The game isn't included with Savage Wind.");
                 if (!src.empty()) src_d += std::string("\n\n") + tr("Chosen:") + " " + src;
                 // the step that's running / its result, under the rows and in the Set up row's explanation
                 const std::string &job_line = job;
                 std::string ex_d = tr("Copies the game files Savage Wind needs and recompiles the game from them. This only "
                                       "needs to be done once and may take a while. Your own files aren't changed.");
                 if (!job.empty())
-                    ex_d += std::string("\n\n") + tr(job.c_str()) + (job_hint.empty() ? "" : std::string(".\n") + tr(job_hint.c_str()));
+                    ex_d += std::string("\n\n") + trv(job) + (job_hint.empty() ? "" : std::string(".\n") + trv(job_hint));
                 std::string again_d = tr("Sets the game files up again from the folder chosen above, in place of Savage Wind's "
                                          "copy. With no folder chosen, builds the game code again from Savage Wind's copy. "
                                          "Saves and settings are kept.");
@@ -1145,6 +1332,33 @@ extern "C" void launcher_run(const char *root, int mode) {
                         }
                         if (opt_action("Cancel", "", "Keeps the game files.", true)) g_confirm_delete = false;
                     }
+#ifndef __APPLE__
+                    if (!g_confirm_delete && shader_precompile_available()) {  // all the shaders, now (or again)
+                        char date[32] = "";
+                        int nsh = 0, pst = shader_precompile_status(&nsh, date, sizeof date);
+                        std::string pd = tr("Translates and compiles every shader of the game now, so that none stutters the "
+                                            "first time it is drawn, also in places never visited. Takes a few minutes and "
+                                            "about 1.5 GB of disk.");
+                        if (pst) {
+                            char sum[200];
+                            snprintf(sum, sizeof sum, tr("%d shaders, %s"), nsh, date);
+                            pd += std::string("\n\n") + tr("Last time:") + " " + sum;
+                        }
+                        if (pst == 2) pd += std::string("\n") + tr("Savage Wind's shader translator or the graphics driver has changed "
+                                                                       "since: run it again.");
+                        opt_section("Shaders");
+                        if (opt_action("Precompile shaders", tr(pst == 1 ? "Done" : pst == 2 ? "Run again" : "Not done"), pd.c_str(),
+                                       true)) {
+                            pthread_mutex_lock(&g_lock);
+                            g_busy = true;
+                            pthread_mutex_unlock(&g_lock);
+                            g_pc_only = true;
+                            pthread_t t;
+                            pthread_create(&t, NULL, precompile_thread, NULL);
+                            pthread_detach(t);
+                        }
+                    }
+#endif
                 }
                 if (!ready || !g_confirm_delete) {  // choose the folder, set up (again: from it, or the game code alone)
                     opt_section(!ready ? "Your copy of the game" : "Set up again");
@@ -1156,6 +1370,17 @@ extern "C" void launcher_run(const char *root, int mode) {
                         first_row();
                         opt_section("Set up");
                     }
+#ifndef __APPLE__
+                    if (shader_precompile_available()) {
+                        if (busy) opt_disable_next();
+                        if (opt_toggle("Precompile all shaders", &g_settings.precompile_shaders, true,
+                                       "After the setup, translates and compiles every shader of the game, so that none "
+                                       "stutters the first time it is drawn, also in places never visited. A few more "
+                                       "minutes and about 1.5 GB of disk. It can be done later too, from the game "
+                                       "files page of Savage Wind Configuration."))
+                            settings_save();
+                    }
+#endif
                     if (busy || (src.empty() && !check_copied_files(g_root).empty())) opt_disable_next();
                     if (opt_action("Set up game files", busy ? tr("Working...") : "", ready ? again_d.c_str() : ex_d.c_str(),
                                    true)) {
@@ -1172,9 +1397,9 @@ extern "C" void launcher_run(const char *root, int mode) {
                     ImGui::Dummy(ImVec2(0, 14 * sc));
                     ImGui::PushTextWrapPos(0);
                     ImGui::TextColored(failed ? ImVec4(1, 0.5f, 0.4f, 1) : busy ? ImVec4(0.93f, 0.76f, 0.33f, 1)
-                                              : ImVec4(0.45f, 0.95f, 0.55f, 1), "%s", tr(job_line.c_str()));
+                                              : ImVec4(0.45f, 0.95f, 0.55f, 1), "%s", trv(job_line).c_str());
                     if (failed && !job_hint.empty())  // (what to do next, in the rows' own text colour)
-                        ImGui::TextColored(ImVec4(0.86f, 0.85f, 0.80f, 1), "%s", tr(job_hint.c_str()));
+                        ImGui::TextColored(ImVec4(0.86f, 0.85f, 0.80f, 1), "%s", trv(job_hint).c_str());
                     ImGui::PopTextWrapPos();
                 }
                 if (g_setup_only && !busy) {  // where the rest is, later
@@ -1213,8 +1438,19 @@ extern "C" void launcher_run(const char *root, int mode) {
                     // (while the game code is built: what's happening, on whose files - runtime/gamebuild.c)
                     bool recompiling = g_build_frac >= 0;
                     const char *title = tr(recompiling ? "Recompiling the game" : "Setting up the game files");
-                    const char *const notes[] = {tr("This only needs to be done once and may take a while.")};
+                    const char *const notes[] = {tr("This only needs to be done once and may take a while."),
+                                                 tr("Esc or B stops it: what is done is kept.")};
                     int nnotes = recompiling ? 1 : 0;
+#ifndef __APPLE__
+                    bool shaders = g_precompiling;
+                    if (shaders) {
+                        f = shader_precompile_progress(&g_pc);
+                        title = tr("Precompiling shaders");
+                        nnotes = 2;
+                        if (ImGui::IsKeyPressed(ImGuiKey_Escape, false) || ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false))
+                            atomic_store(&g_pc.cancel, true);
+                    }
+#endif
                     float tfs = g_font_menu->FontSize * 0.75f, sfs = g_font_small->FontSize * 0.85f;
                     ImVec2 ts = g_font_menu->CalcTextSizeA(tfs, FLT_MAX, 0, title);
                     float line_h = g_font_small->CalcTextSizeA(sfs, FLT_MAX, 0, "A").y;
@@ -1231,8 +1467,12 @@ extern "C" void launcher_run(const char *root, int mode) {
                     fg->AddRectFilled(ba, bb, IM_COL32(255, 255, 255, 25), 12 * sc);
                     if (f > 0) fg->AddRectFilled(ba, ImVec2(ba.x + (bb.x - ba.x) * f, bb.y), IM_COL32(236, 194, 84, 255), 12 * sc);
                     char line[200];
-                    snprintf(line, sizeof line, "%s   %d%%", tr(test_busy ? "Setting up the game files..." : job.c_str()),
-                             (int)(f * 100));
+#ifndef __APPLE__
+                    std::string step = shaders ? precompile_line() : tr(test_busy ? "Setting up the game files..." : job.c_str());
+#else
+                    std::string step = tr(test_busy ? "Setting up the game files..." : job.c_str());
+#endif
+                    snprintf(line, sizeof line, "%s   %d%%", step.c_str(), (int)(f * 100));
                     ImVec2 ls = g_font_small->CalcTextSizeA(sfs, FLT_MAX, 0, line);
                     fg->AddText(g_font_small, sfs, ImVec2((a.x + b.x - ls.x) * 0.5f, bb.y + 26 * sc), IM_COL32(220, 216, 205, 255), line);
                     for (int i = 0; i < nnotes; i++) {
@@ -1270,7 +1510,7 @@ extern "C" void launcher_run(const char *root, int mode) {
                 if (main_id.empty() && !nso_build_id(g_root + "/exefs/main", &main_id)) main_id = "?";
                 ImGui::TextColored(ImVec4(0.66f, 0.76f, 0.98f, 1), tr("main build id %s"), main_id.c_str());
             } else {
-                ImGui::TextColored(ImVec4(1, 0.72f, 0.4f, 1), "!  %s", tr(busy ? "Setting up the game files..." : status.c_str()));
+                ImGui::TextColored(ImVec4(1, 0.72f, 0.4f, 1), "!  %s", trv(busy ? "Setting up the game files..." : status).c_str());
                 ImGui::SetCursorPosX(x0);
                 ImGui::TextDisabled("%s", tr("Set up the game files to play."));
             }

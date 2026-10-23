@@ -13,7 +13,9 @@
 // The window size itself is Video > Window size (runtime/window_size.c).
 // Test overrides: SAVAGEWIND_SCALE=<f> (render height = 1080 x f), SAVAGEWIND_WIDE_TEST=<f> (forced shape).
 #include <math.h>
+#include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "../hle.h"
 #include "../settings.h"
@@ -93,4 +95,29 @@ void output_scale_screen(double sw, double sh, int iw, int ih, OutScale *o) {
     double k = fmin(sw / iw, sh / ih), ox = (sw - iw * k) / 2, oy = (sh - ih * k) / 2;
     o->vx = ox + o->vx * k; o->vy = oy + o->vy * k;
     o->vw *= k; o->vh *= k;
+}
+
+// Console: the game's own size (BOTW: 896 x 896 per cascade); High 2048, Ultra 4096, Extreme 8192. Test override:
+// SAVAGEWIND_SHADOW_AT=<frame>:<console|high|ultra|extreme|width>,... from that presented frame on (same-view A/B in one
+// run).
+unsigned shadow_map_size(unsigned long long frame) {
+    static const unsigned size[SHADOW_COUNT] = {0, 2048, 4096, 8192};
+    static int n = -1;
+    static unsigned long long at[8];
+    static unsigned w[8];
+    if (n < 0) {
+        n = 0;
+        for (const char *e = getenv("SAVAGEWIND_SHADOW_AT"); e && *e && n < 8;) {
+            char name[16] = "";
+            if (sscanf(e, "%llu:%15[^,]", &at[n], name) != 2) break;
+            w[n++] = !strcmp(name, "console") ? 0 : !strcmp(name, "high") ? 2048 : !strcmp(name, "ultra") ? 4096
+                   : !strcmp(name, "extreme") ? 8192 : (unsigned)atoi(name);
+            e = strchr(e, ',');
+            if (e) e++;
+        }
+    }
+    unsigned r = g_settings.shadow_res >= 0 && g_settings.shadow_res < SHADOW_COUNT ? size[g_settings.shadow_res] : 0;
+    for (int i = 0; i < n; i++)
+        if (frame >= at[i]) r = w[i];
+    return r > 8192 ? 8192 : r;
 }

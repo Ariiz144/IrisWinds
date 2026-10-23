@@ -23,10 +23,11 @@ from collections import Counter
 
 import capstone
 
+import game_sites
 import layout
 from gen import Module, discover
 from lifter import Unsupported
-from nso import Nso
+from nso import Nso, header
 
 TOOLS = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(TOOLS)
@@ -160,6 +161,11 @@ def main():
     layout.show(mods)
     why = layout.problems(mods)
     print(f'  {"CANNOT LOAD: " + "; ".join(why) if why else "loads"}')
+    version = None
+    if 'main' in bases:  # (tools/game_sites.py VERSIONS)
+        version = game_sites.supported_version(header(os.path.join(args.exefs, 'main'))['build_id'])
+        print('  game version: ' + (f'{version.name}' + ('' if version.supported else ' (not supported yet)')
+                                    if version else 'not one Savage Wind knows'))
     other = [f for f in present if f not in bases and f != 'rtld']
     if other:
         print(f'  NOTE: files that are not modules the runtime loads: {other}')
@@ -187,7 +193,8 @@ def main():
         print(f'  top imports: {list(r["import_groups"].items())[:10]}')
 
     report = {'modules': reps, 'layout': [{'module': n, 'base': hex(b), 'end': hex(b + s), 'build_id': i}
-                                          for n, b, s, i in mods], 'layout_problems': why}
+                                          for n, b, s, i in mods], 'layout_problems': why,
+              'game_version': version.name if version else None}
 
     impl, stubs = nvn_implemented()
     wanted = set().union(*(set(r['nvn_requested']) for r in reps.values())) if reps else set()

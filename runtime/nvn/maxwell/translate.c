@@ -559,8 +559,8 @@ static void write_tex_result(Ctx *c, int slot, const char *call, uint32_t mask, 
 
 // Integer texel coordinates in guest units -> the (possibly larger) allocation of texture slot `slot`.
 static const char *RSC2(Ctx *c, int slot, const char *fmt, ...) {
-    static char bufs[4][1024];
-    static int bi;
+    static __thread char bufs[4][1024];  // (per thread: translations run in parallel, runtime/nvn/vulkan/precompile.c)
+    static __thread int bi;
     char *o = bufs[bi++ & 3];
     char inner[700];
     va_list ap;
@@ -584,8 +584,8 @@ static const char *alayer(Ctx *c, const char *r, int slot, char *buf) {
 // Texel offsets are in guest texels: a scaled allocation (render-target scaling) has 1 / scale as many per guest
 // texel, so an offset moves the coordinates by offset * scale / allocated size (rscale[1 + slot]).
 static const char *off_scale(Ctx *c, int slot, int comps) {
-    static char bufs[4][48];
-    static int bi;
+    static __thread char bufs[4][48];
+    static __thread int bi;
     char *o = bufs[bi++ & 3];
     c->uses_rscale = true;
     snprintf(o, 48, " * rscale[%d].%s", slot + 1, comps == 1 ? "x" : "xy");
@@ -2197,8 +2197,13 @@ size_t maxwell_binary_size(const uint8_t *blob, size_t max_size, int stage) {
     return head + code_end(blob + head, (max_size - head) / 8) * 8;
 }
 
-// (the cache of translations, runtime/nvn/vulkan/shaders.c, starts over whenever this file is built again)
-const char *maxwell_translator_id(void) { return __DATE__ " " __TIME__; }
+// What the translations are made from: a hash of this file and shader.h (TRANSLATOR_ID, from the Makefile). The caches
+// of translated shaders (runtime/nvn/vulkan/shaders.c) are kept while it stays the same. Built some other way (the
+// test tools), the build time: those caches then start over with every build.
+#ifndef TRANSLATOR_ID
+#define TRANSLATOR_ID __DATE__ " " __TIME__
+#endif
+const char *maxwell_translator_id(void) { return TRANSLATOR_ID; }
 
 // Whether a translation depends on more than the binary and the key (debugging switches): not to be cached.
 bool maxwell_translation_uncacheable(void) {

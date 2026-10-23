@@ -80,8 +80,9 @@ def read(path):
     return out
 
 
-def c_source(layout):
-    """layout.c: the layout inside the game code library, with each module's function table (runtime/gamelib.h)."""
+def c_source(layout, game=None):
+    """layout.c: the layout inside the game code library, with each module's function table, and the game version
+    with its main module's sites (game: (version, {name: address}), tools/game_sites.py) (runtime/gamelib.h)."""
     lines = ['// Module layout of this game code (tools/layout.py). Generated.\n#include "gamelib.h"\n\n']
     for n, *_ in layout:
         lines.append(f'extern const uint64_t {n}_fn_addrs[], {n}_fn_count;\nextern const GuestFn {n}_fn_ptrs[];\n')
@@ -89,6 +90,10 @@ def c_source(layout):
     for n, b, s, i in layout:
         lines.append(f'    {{"{n}", {b:#x}ull, {s:#x}ull, "{i}", {n}_fn_addrs, {n}_fn_ptrs, &{n}_fn_count}},\n')
     lines.append(f'}};\nconst uint32_t game_module_count = {len(layout)};\n')
+    version, sites = game or ('', {})
+    lines.append(f'\nconst char game_version[] = "{version}";\nconst GameLibSite game_sites[] = {{\n')
+    lines += [f'    {{"{n}", {a:#x}ull}},\n' for n, a in sorted(sites.items())] or ['    {0, 0},\n']
+    lines.append(f'}};\nconst uint32_t game_site_count = {len(sites)};\n')
     return ''.join(lines)
 
 
@@ -103,10 +108,10 @@ def write_if_changed(path, s):  # (an unchanged file keeps its date: make doesn'
         f.write(s)
 
 
-def write(layout, outdir):
+def write(layout, outdir, game=None):
     os.makedirs(outdir, exist_ok=True)
     write_if_changed(os.path.join(outdir, 'layout.txt'), text(layout))
-    write_if_changed(os.path.join(outdir, 'layout.c'), c_source(layout))
+    write_if_changed(os.path.join(outdir, 'layout.c'), c_source(layout, game))
 
 
 def show(layout):

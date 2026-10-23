@@ -17,6 +17,7 @@
 #include "../renderer.h"
 #include "../../settings.h"
 
+static uint64_t stat_build_waits;  // draws that waited for their pipeline (draw_must_happen)
 static uint64_t stat_draws, stat_skipped, stat_passes, stat_dispatches, stat_wait_ns, stat_flushes, stat_feedback_copies;
 static uint64_t stat_gw_waits, stat_gw_holds;  // draws / dispatches that waited for a storing shader; lists held (gw_check)
 static uint64_t stat_uub, stat_uub_same, stat_gcopy_hit, stat_gcopy_miss, stat_gcopy_bytes;  // UpdateUniformBuffer; guest_copy cache
@@ -58,6 +59,7 @@ static struct {
     VkPipeline pipe;
     VkPipelineLayout layout;
     VkDescriptorSet sets[2];
+    uint32_t ndyn, dyn[32];  // dynamic uniform-buffer offsets bound with them
     uint32_t dt, dw, dop, sten, cull, front, topo, restart, bias_on;
     uint32_t sten_face[2][8];  // fail, pass, depth fail, compare, compare mask, write mask, reference
     float blend[4], bias[3], line_w;
@@ -70,6 +72,10 @@ static struct {
     VkDeviceSize voff[17];
 } dc;
 void vk_dyn_forget(void) { dyn_epoch++; }
+// Bumped by every command that changes what goes into the program and pipeline keys (exec_list) and by passes
+// (begin_pass): while it stays, a draw takes the last draw's program and pipeline without building and comparing the
+// keys (~1.4 KB a draw). SAVAGEWIND_VK_NO_KEY_GEN=1: keys every draw.
+static uint64_t key_gen = 1;
 static uint64_t setc_gen;  // bumped to drop the shared descriptor sets (set_finish) of the submission in progress
 static void dyn_check(void) {  // (after vk_cmd) a new command buffer or foreign state: nothing known
     if (dc.epoch == dyn_epoch) return;
@@ -359,9 +365,10 @@ VkDescriptorSet vk_alloc_set(VkDescriptorSetLayout layout) {
             if (s->npools == 64) FATAL("descriptor pools exhausted\n");
             VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 32768}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 16384},
                                             {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 32768},
-                                            {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 4096}, {VK_DESCRIPTOR_TYPE_SAMPLER, 4096}};
+                                            {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 4096}, {VK_DESCRIPTOR_TYPE_SAMPLER, 4096},
+                                            {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 32768}};
             VkDescriptorPoolCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 8192,
-                                             .poolSizeCount = 5, .pPoolSizes = sizes};
+                                             .poolSizeCount = 6, .pPoolSizes = sizes};
             VK_CHECK(vkCreateDescriptorPool(g_vk.dev, &ci, NULL, &s->pools[s->npools++]));
         }
         VkDescriptorSetAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
@@ -557,8 +564,9 @@ static bool sync_shaders(void) {
     return env == 2 ? !g_settings.async_shaders : env;
 }
 
-// Shader translation: one dedicated thread (the translator isn't re-entrant - translate.c's RSC2 string ring - and
-// translating on the game thread cost up to ~90 ms per frame on entering an area). Compiles go on to the workers.
+// Shader translation: one dedicated thread (the translator's debugging switches are globals, set per translation -
+// the translation itself is re-entrant - and translating on the game thread cost up to ~90 ms per frame on entering
+// an area). Compiles go on to the workers.
 static pthread_mutex_t translate_lock = PTHREAD_MUTEX_INITIALIZER;  // (compute shaders translate on the game thread)
 static Job *tjobs_head, *tjobs_tail;
 static pthread_mutex_t tjobs_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -707,6 +715,9 @@ const char *renderer_stats(void) {
         snprintf(stats_text + n, sizeof stats_text - n, ", uub %llu (%llu same), gcopy %llu hit %llu miss (%.1f MB)",
                  (unsigned long long)stat_uub, (unsigned long long)stat_uub_same, (unsigned long long)stat_gcopy_hit,
                  (unsigned long long)stat_gcopy_miss, stat_gcopy_bytes / 1048576.0);
+        n = strlen(stats_text);
+        if (stat_build_waits) snprintf(stats_text + n, sizeof stats_text - n, ", build waits %llu", (unsigned long long)stat_build_waits);
+        stat_build_waits = 0;
         stat_uub = stat_uub_same = stat_gcopy_hit = stat_gcopy_miss = stat_gcopy_bytes = 0;
         stat_gw_waits = stat_gw_holds = 0;
         stat_sets = stat_sets_reused = 0;
@@ -870,8 +881,63 @@ static bool linear_target_behind(NvnTexture *t) {
     return behind;
 }
 
+// ---- SAMPLES_PASSED (ResetCounter / ReportCounter type 1). Every draw between a reset and a report runs inside a
+// Vulkan occlusion query; once the submission has completed (readbacks_apply), the report's {samples, timestamp} goes
+// to guest memory, as the GPU writes it (nothing before then). Samples are counted in guest pixels (divided by the
+// draw's render-target scale). BOTW draws its sun disc that way once a frame (main 0x7000ea74a8: depth tested and
+// clamped, no color writes, three result slots in turn) for its sun glare / lens flare. They reported 0 samples: the
+// sun counted as hidden. SAVAGEWIND_NO_OCCLUSION_QUERY=1: 0 at once, as before.
+#define OQ_SLOTS 1024
+#define OQ_RUN 64
+static VkQueryPool oq_pool;
+static uint32_t oq_next;           // ring position in oq_pool
+static uint64_t oq_seq[OQ_SLOTS];  // submission that last used each query
+static float oq_scale[OQ_SLOTS];   // render-target scale of its draw (samples per guest pixel)
+static bool oq_counting;           // a SAMPLES_PASSED reset is in effect
+static uint32_t oq_run[OQ_RUN];    // the queries since that reset
+static int oq_nrun;
+typedef struct { uint64_t addr, seq, ts; int nq; uint32_t q[OQ_RUN]; } OqReport;
+static OqReport oq_reports[32];
+static int oq_nreports;
+
+static bool oq_on(void) {
+    static int on = -1;
+    if (on < 0) on = getenv("SAVAGEWIND_NO_OCCLUSION_QUERY") == NULL;
+    if (on && !oq_pool) {
+        VkQueryPoolCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_OCCLUSION,
+                                    .queryCount = OQ_SLOTS};
+        if (vkCreateQueryPool(g_vk.dev, &qi, NULL, &oq_pool) != VK_SUCCESS) on = 0;
+    }
+    return on;
+}
+
+static void oq_apply(void) {  // (readback_lock held) reports whose submission completed: their counts to guest memory
+    if (!oq_nreports) return;
+    uint64_t done = vk_completed_seq();
+    int k = 0;
+    for (int i = 0; i < oq_nreports; i++) {
+        OqReport *p = &oq_reports[i];
+        if (p->seq > done) { oq_reports[k++] = *p; continue; }
+        double sum = 0;
+        for (int j = 0; j < p->nq; j++) {
+            uint64_t v = 0;
+            if (vkGetQueryPoolResults(g_vk.dev, oq_pool, p->q[j], 1, sizeof v, &v, sizeof v, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS)
+                sum += v / (double)oq_scale[p->q[j]];
+        }
+        static int nlog, logon = -1;
+        if (logon < 0) logon = getenv("SAVAGEWIND_LOG_OCCLUSION") ? atoi(getenv("SAVAGEWIND_LOG_OCCLUSION")) : 0;
+        if (nlog < logon) { nlog++; LOG("[oq] %d queries: %.0f samples -> %llx\n", p->nq, sum, (unsigned long long)p->addr); }
+        kernel_watch_write("ReportCounter", p->addr, 16);
+        uint64_t *out = (uint64_t *)(uintptr_t)p->addr;
+        out[0] = (uint64_t)(sum + 0.5);
+        out[1] = p->ts;
+    }
+    oq_nreports = k;
+}
+
 static void readbacks_apply(void) {
     pthread_mutex_lock(&readback_lock);
+    oq_apply();
     if (nreadbacks) {
         uint64_t done = vk_completed_seq();
         int k = 0;
@@ -1039,8 +1105,9 @@ static void begin_pass(void) {
     }
     if (g_gpuprof_frame) {
         NvnTexture *t0 = st.rt.ncolor ? st.rt.color[0] : NULL;
-        gp_mark(cb, "pass: %d color %ux%u fmt %#x, depth %s", st.rt.ncolor, t0 ? t0->width : 0, t0 ? t0->height : 0,
-                t0 ? t0->format : 0, st.rt.depth ? "yes" : "no");
+        NvnTexture *d = st.rt.depth;
+        gp_mark(cb, "pass: %d color %ux%u fmt %#x, depth %ux%u", st.rt.ncolor, t0 ? t0->width : 0, t0 ? t0->height : 0,
+                t0 ? t0->format : 0, d ? d->width : 0, d ? d->height : 0);
     }
     {   // one scale for the pass: attachments the size of a scaled one are scaled too (BOTW's G-buffer mixes
         // targets the scaling heuristic takes and ones it does not; the unscaled ones got only part of the pass)
@@ -1090,6 +1157,7 @@ static void begin_pass(void) {
         renderer_mark_gpu_owned(t);
         VkImageView v = vk_view(t, &st.rt.cview[i], st.rt.has_cview[i], true, TEXTYPE_2D);
         TexBackend *b = t->backend;
+        if (b && b->drawn_frame != renderer_present_count()) { b->prev_drawn = b->drawn_frame; b->drawn_frame = renderer_present_count(); }
         if (!v) continue;
         ca[i].imageView = v;
         ca[i].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
@@ -1121,6 +1189,7 @@ static void begin_pass(void) {
         renderer_mark_gpu_owned(st.rt.depth);
         VkImageView v = vk_view(st.rt.depth, &st.rt.dview, st.rt.has_dview, true, TEXTYPE_2D);
         TexBackend *b = st.rt.depth->backend;
+        if (b && b->drawn_frame != renderer_present_count()) { b->prev_drawn = b->drawn_frame; b->drawn_frame = renderer_present_count(); }
         if (v && renderer_format_is_depth(st.rt.depth->format)) {
             VkRenderingAttachmentInfo a = {.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = v,
                                            .imageLayout = VK_IMAGE_LAYOUT_GENERAL, .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD,
@@ -1142,6 +1211,7 @@ static void begin_pass(void) {
                           .pDepthAttachment = has_d ? &da : NULL, .pStencilAttachment = has_s ? &sa : NULL};
     vkCmdBeginRendering(cb, &ri);
     in_pass = true;
+    key_gen++;  // (the pass's formats are in the pipeline key)
     vp_sx = pass_sx; vp_sy = pass_sy; vp_ox = 0; vp_oy = 0;
     stat_passes++;
 }
@@ -1356,6 +1426,7 @@ typedef struct {
     int nbinds;
     VkDescriptorSetLayout set_layout[2];
     VkPipelineLayout layout;
+    struct StageBuildRef { void *v, *f; } stages;  // (the ProgBuild's StageBuilds: graphics pipeline libraries)
     bool vs_uses_vid;
     _Atomic int state;  // 0 building, 1 ready, 2 failed
 } Prog;
@@ -1383,12 +1454,24 @@ static void save_glsl(const char *src, uint64_t addr, const char *suffix) {
 // One stage's SPIR-V module and bindings, per translated shader: programs share their vertex and fragment shaders
 // (the same ShaderInfo, vk_translate_cached), so a stage seen in another program costs no SPIR-V load, reflection or
 // module creation again.
-typedef struct { const ShaderInfo *si; VkShaderModule m; int nbinds; VkBindingInfo binds[MAX_BIND]; } StageBuild;
+typedef struct {
+    const ShaderInfo *si;
+    VkShaderModule m;
+    int nbinds;
+    VkBindingInfo binds[MAX_BIND];
+    // graphics pipeline libraries (g_vk.gpl): the stage's descriptor set layout (set 0 vertex, 1 fragment), a pipeline
+    // layout of it alone, and the stage's libraries by variant (gpl_stage_lib)
+    VkDescriptorSetLayout set_layout;
+    VkPipelineLayout lib_layout;
+    _Atomic uint64_t lib[8];
+} StageBuild;
 #define STAGE_TAB 8192
 static StageBuild *stage_tab[STAGE_TAB];
 static pthread_mutex_t stage_lock = PTHREAD_MUTEX_INITIALIZER;
 
-static const StageBuild *stage_build(const ShaderInfo *si, int stage, const char *name) {
+static void stage_layouts(StageBuild *b, int stage);
+
+static StageBuild *stage_build(const ShaderInfo *si, int stage, const char *name) {
     uint32_t slot = (uint32_t)(((uintptr_t)si >> 4) * 0x9E3779B1u) & (STAGE_TAB - 1);
     pthread_mutex_lock(&stage_lock);
     for (int probe = 0; probe < STAGE_TAB && stage_tab[slot]; probe++, slot = (slot + 1) & (STAGE_TAB - 1))
@@ -1403,12 +1486,15 @@ static const StageBuild *stage_build(const ShaderInfo *si, int stage, const char
     b->m = vk_module(spv, n);
     free(spv);
     if (!b->m) { free(b); return NULL; }
+    if (g_vk.gpl) stage_layouts(b, stage);
     pthread_mutex_lock(&stage_lock);
     for (int probe = 0; probe < STAGE_TAB; probe++, slot = (slot + 1) & (STAGE_TAB - 1)) {
         if (stage_tab[slot] && stage_tab[slot]->si == si) {  // (another thread built it meanwhile)
             StageBuild *o = stage_tab[slot];
             pthread_mutex_unlock(&stage_lock);
             vkDestroyShaderModule(g_vk.dev, b->m, NULL);
+            if (b->lib_layout) vkDestroyPipelineLayout(g_vk.dev, b->lib_layout, NULL);
+            if (b->set_layout) vkDestroyDescriptorSetLayout(g_vk.dev, b->set_layout, NULL);
             free(b);
             return o;
         }
@@ -1423,6 +1509,7 @@ static const StageBuild *stage_build(const ShaderInfo *si, int stage, const char
 // made for one fit the others (same layout object).
 typedef struct ProgBuild {
     const ShaderInfo *vi, *fi;
+    StageBuild *v, *f;
     VkShaderModule vs, fs;
     int nbinds;
     VkBindingInfo binds[MAX_BIND];
@@ -1439,6 +1526,53 @@ static uint32_t pair_slot(const void *a, const void *b) {
     return (uint32_t)(h ^ (h >> 29));
 }
 
+// The game's constant buffers (c3 on) of a draw program are dynamic uniform buffers: the copy's offset goes with
+// vkCmdBindDescriptorSets instead of into the set. A draw's copies sit at new offsets almost every draw (per-object
+// constants), which made its sets differ every draw (~4000 allocated and written a frame in the open world); now draws
+// with the same textures and copy sizes share them. Vertex stage first, up to the device's limit for a layout
+// (NVIDIA: 15). SAVAGEWIND_VK_NO_UBO_DYNAMIC=1: off.
+static bool ubo_dynamic_on(void) {
+    static int on = -1;
+    if (on < 0) on = getenv("SAVAGEWIND_VK_NO_UBO_DYNAMIC") == NULL;
+    return on;
+}
+static void ubo_dynamic_mark(VkBindingInfo *b, int n) {
+    if (!ubo_dynamic_on()) return;
+    uint32_t lim = g_vk.props.limits.maxDescriptorSetUniformBuffersDynamic, k = 0;
+    if (lim > 32) lim = 32;
+    for (int i = 0; i < n; i++) k += b[i].type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;  // (picked by a stage already)
+    for (uint32_t set = 0; set < 2; set++)
+        for (int i = 0; i < n && k < lim; i++)
+            if (b[i].set == set && b[i].type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER && b[i].binding >= 3 && b[i].binding < 17) {
+                b[i].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
+                k++;
+            }
+}
+
+// The same for one stage's own set (graphics pipeline libraries: a stage's set layout is made before the stage it pairs
+// with is known, so each set gets a fixed share of the layout's limit: the vertex set half, rounded up, the fragment set
+// the rest).
+static void ubo_dynamic_mark_stage(VkBindingInfo *b, int n, uint32_t set) {
+    if (!ubo_dynamic_on()) return;
+    uint32_t lim = g_vk.props.limits.maxDescriptorSetUniformBuffersDynamic, k = 0;
+    if (lim > 32) lim = 32;
+    uint32_t share = set == 0 ? (lim + 1) / 2 : lim / 2;
+    for (int i = 0; i < n && k < share; i++)
+        if (b[i].set == set && b[i].type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER && b[i].binding >= 3 && b[i].binding < 17) {
+            b[i].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
+            k++;
+        }
+}
+
+static const ProgBuild *prog_build_peek(const ShaderInfo *vi, const ShaderInfo *fi) {  // (built already, or NULL)
+    uint32_t slot = pair_slot(vi, fi) & (PB_TAB - 1);
+    pthread_mutex_lock(&pb_lock);
+    ProgBuild *b = pb_tab[slot];
+    while (b && !(b->vi == vi && b->fi == fi)) b = b->next;
+    pthread_mutex_unlock(&pb_lock);
+    return b;
+}
+
 // NULL when a stage does not compile. *made: built by this call (else found).
 static const ProgBuild *prog_build(const ShaderInfo *vi, const ShaderInfo *fi, bool *made) {
     *made = false;
@@ -1448,12 +1582,14 @@ static const ProgBuild *prog_build(const ShaderInfo *vi, const ShaderInfo *fi, b
     while (b && !(b->vi == vi && b->fi == fi)) b = b->next;
     pthread_mutex_unlock(&pb_lock);
     if (b) return b;
-    const StageBuild *v = stage_build(vi, STAGE_VERTEX, "vs");
-    const StageBuild *f = v ? stage_build(fi, STAGE_FRAGMENT, "fs") : NULL;
+    StageBuild *v = stage_build(vi, STAGE_VERTEX, "vs");
+    StageBuild *f = v ? stage_build(fi, STAGE_FRAGMENT, "fs") : NULL;
     if (!v || !f) return NULL;
     b = calloc(1, sizeof *b);
     b->vi = vi;
     b->fi = fi;
+    b->v = v;
+    b->f = f;
     b->nbinds = v->nbinds;
     memcpy(b->binds, v->binds, sizeof v->binds[0] * (size_t)v->nbinds);
     int nf = f->nbinds < MAX_BIND - b->nbinds ? f->nbinds : MAX_BIND - b->nbinds;
@@ -1461,7 +1597,17 @@ static const ProgBuild *prog_build(const ShaderInfo *vi, const ShaderInfo *fi, b
     b->nbinds += nf;
     b->vs = v->m;
     b->fs = f->m;
-    b->layout = make_layout(b->binds, b->nbinds, b->set_layout, 2, VK_SHADER_STAGE_VERTEX_BIT, VK_SHADER_STAGE_FRAGMENT_BIT);
+    if (g_vk.gpl && v->set_layout && f->set_layout) {  // (the libraries' sets: "identically defined" by being the same;
+        b->set_layout[0] = v->set_layout;               //  their dynamic uniform buffers were picked per stage, stage_layouts)
+        b->set_layout[1] = f->set_layout;
+        VkPipelineLayoutCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+                                         .flags = VK_PIPELINE_LAYOUT_CREATE_INDEPENDENT_SETS_BIT_EXT, .setLayoutCount = 2,
+                                         .pSetLayouts = b->set_layout};
+        VK_CHECK(vkCreatePipelineLayout(g_vk.dev, &ci, NULL, &b->layout));
+    } else {
+        ubo_dynamic_mark(b->binds, b->nbinds);
+        b->layout = make_layout(b->binds, b->nbinds, b->set_layout, 2, VK_SHADER_STAGE_VERTEX_BIT, VK_SHADER_STAGE_FRAGMENT_BIT);
+    }
     pthread_mutex_lock(&pb_lock);
     ProgBuild *o = pb_tab[slot];
     while (o && !(o->vi == vi && o->fi == fi)) o = o->next;
@@ -1469,7 +1615,8 @@ static const ProgBuild *prog_build(const ShaderInfo *vi, const ShaderInfo *fi, b
     pthread_mutex_unlock(&pb_lock);
     if (o) {  // (another thread built it meanwhile)
         vkDestroyPipelineLayout(g_vk.dev, b->layout, NULL);
-        for (int i = 0; i < 2; i++) vkDestroyDescriptorSetLayout(g_vk.dev, b->set_layout[i], NULL);
+        if (b->set_layout[0] != v->set_layout)
+            for (int i = 0; i < 2; i++) vkDestroyDescriptorSetLayout(g_vk.dev, b->set_layout[i], NULL);
         free(b);
         return o;
     }
@@ -1490,6 +1637,8 @@ static void compile_program(void *arg) {
     p->set_layout[0] = b->set_layout[0];
     p->set_layout[1] = b->set_layout[1];
     p->layout = b->layout;
+    p->stages.v = b->v;
+    p->stages.f = b->f;
     if (made) {
         atomic_fetch_add(&stat_compiles, 1);
         atomic_fetch_add(&prof_c_prog, SDL_GetTicksNS() - pt0); atomic_fetch_add(&prof_c_nprog, 1);
@@ -1562,12 +1711,22 @@ static void translate_program(void *arg) {
         maxwell_dbg_pc = dbg_pc;
         maxwell_dbg_reg = dbg_reg;
     }
-    p->vi = vk_translate_cached((const uint8_t *)(uintptr_t)p->code[0], p->cmax[0], STAGE_VERTEX, &p->vkey);
+    const uint8_t *vcode = (const uint8_t *)(uintptr_t)p->code[0], *fcode = (const uint8_t *)(uintptr_t)p->code[1];
+    vk_key_normalize(vcode, STAGE_VERTEX, &p->vkey);
+    p->vi = vk_translate_cached(vcode, p->cmax[0], STAGE_VERTEX, &p->vkey);
     if (p->vi->msl) {
         p->fkey.vs_out_mask = p->vi->out_mask;
-        p->fi = vk_translate_cached((const uint8_t *)(uintptr_t)p->code[1], p->cmax[1], STAGE_FRAGMENT, &p->fkey);
+        vk_key_normalize(fcode, STAGE_FRAGMENT, &p->fkey);
+        p->fi = vk_translate_cached(fcode, p->cmax[1], STAGE_FRAGMENT, &p->fkey);
     }
     pthread_mutex_unlock(&translate_lock);
+    {   // the normalized keys rest on the SPH naming every input the code reads (vk_key_normalize)
+        static int told;
+        uint32_t vin = vk_sph_inputs(vcode, STAGE_VERTEX), fin = vk_sph_inputs(fcode, STAGE_FRAGMENT);
+        if (((p->vi->msl && (p->vi->attr_mask & ~vin)) || (p->fi && p->fi->msl && (p->fi->attr_mask & ~fin))) && told++ < 10)
+            LOG("[shader] inputs read outside the SPH's: vs %#x of %#x, fs %#x of %#x (code %llx %llx)\n", p->vi->attr_mask, vin,
+                p->fi ? p->fi->attr_mask : 0, fin, (unsigned long long)p->code[0], (unsigned long long)p->code[1]);
+    }
     atomic_fetch_add(&prof_c_tr, SDL_GetTicksNS() - pt0); atomic_fetch_add(&prof_c_ntr, 1);
     if (!p->vi->msl) {
         LOG("[shader] VS translate failed: %s (code %llx)\n", p->vi->error, (unsigned long long)p->code[0]);
@@ -1585,6 +1744,28 @@ static void translate_program(void *arg) {
     save_glsl(p->vi->msl, p->code[0], "vs");
     save_glsl(p->fi->msl, p->code[1], "fs");
     run_job(compile_program, p);
+}
+
+// Asynchronous shaders: a program whose translations are in memory and whose modules are built (the pre-warm made
+// them, or another program shares the stages) is ready at once. Queued like any other, its draws were skipped until
+// the translator thread got to it: ~4500 draws in the 2 s after Continue, warm caches and all (the dense grass and
+// cloud layers missing for a moment, the scene looked flat). Only real translations and compiles wait on the threads.
+static bool program_ready_now(Prog *p) {
+    static int dbg = -1;  // (SAVAGEWIND_DBG_FS changes translations: always through the translator thread)
+    if (dbg < 0) dbg = getenv("SAVAGEWIND_DBG_FS") != NULL;
+    if (dbg) return false;
+    ShaderInfo *vi = vk_translate_peek((const uint8_t *)(uintptr_t)p->code[0], p->cmax[0], STAGE_VERTEX, &p->vkey);
+    if (!vi || !vi->msl) return false;
+    ShaderKey fk = p->fkey;
+    fk.vs_out_mask = vi->out_mask;
+    ShaderInfo *fi = vk_translate_peek((const uint8_t *)(uintptr_t)p->code[1], p->cmax[1], STAGE_FRAGMENT, &fk);
+    if (!fi || !fi->msl || !prog_build_peek(vi, fi)) return false;
+    p->fkey = fk;
+    p->vi = vi;
+    p->fi = fi;
+    p->vs_uses_vid = strstr(vi->msl, "gl_VertexIndex") != NULL;
+    compile_program(p);  // (finds the built modules: no compile)
+    return true;
 }
 
 #define PROG_TAB 4096
@@ -1627,6 +1808,7 @@ static Prog *get_program_(NvnProgram *np, ShaderKey *vkey, ShaderKey *fkey) {
     }
     p->vkey = *vkey;
     p->fkey = *fkey;
+    if (!sync_shaders() && program_ready_now(p)) return p;
     run_translate(translate_program, p);
     return p;
 }
@@ -1894,7 +2076,14 @@ static void cache_feedback(const VkPipelineCreationFeedback *fb) {
     vk_pipeline_cache_note(hit);
 }
 
+static VkResult create_pipeline_in(const PipeState *k, VkShaderModule vsm, VkShaderModule fsm, VkPipelineLayout layout,
+                                   VkPipelineCache cache, VkPipeline *out);
 static VkResult create_pipeline(const PipeState *k, VkShaderModule vsm, VkShaderModule fsm, VkPipelineLayout layout, VkPipeline *out) {
+    return create_pipeline_in(k, vsm, fsm, layout, g_vk.pcache, out);
+}
+
+static VkResult create_pipeline_in(const PipeState *k, VkShaderModule vsm, VkShaderModule fsm, VkPipelineLayout layout,
+                                   VkPipelineCache cache, VkPipeline *out) {
     VkPipelineShaderStageCreateInfo stages[2] = {
         {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = vsm, .pName = "main"},
         {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = fsm, .pName = "main"}};
@@ -1954,14 +2143,254 @@ static VkResult create_pipeline(const PipeState *k, VkShaderModule vsm, VkShader
                                        .pColorBlendState = &cb, .pDynamicState = &dy, .layout = layout,
                                        .flags = k->feedback ? VK_PIPELINE_CREATE_COLOR_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT : 0};
     *out = VK_NULL_HANDLE;
-    VkResult r = vkCreateGraphicsPipelines(g_vk.dev, g_vk.pcache, 1, &pi, NULL, out);
+    VkResult r = vkCreateGraphicsPipelines(g_vk.dev, cache, 1, &pi, NULL, out);
     if (r != VK_SUCCESS) {
         static int n;
         if (n++ < 10) LOG("[vk] pipeline creation failed: %d\n", r);
-    } else {
+    } else if (cache == g_vk.pcache) {
         cache_feedback(&fb);
     }
     return r;
+}
+
+// ---- graphics pipeline libraries (VK_EXT_graphics_pipeline_library, g_vk.gpl). Each vertex shader and each fragment
+// shader is compiled once into a library of its own, apart from the fixed state; a pipeline is linked from those two
+// and two libraries of state only (vertex input; fragment output: targets, blending, write masks) - fast linking, no
+// shader compile. A draw with other blending, targets or vertex layout then costs a link instead of most of a
+// compile (4-50 ms when the driver has the shaders of another state; measured), and the precompilation (precompile.c)
+// can compile every shader of the game into the pipeline cache without knowing the states it will be drawn with.
+// Pipelines whose fragment shader reads a target it writes (feedback loops) are made whole, as before. The
+// precompiled shaders' libraries are in a cache of their own (g_vk.pcache_pre, device.c), only read while playing:
+// a shader's library is looked up there first, failing instead of compiling, then made into the pipeline cache.
+// SAVAGEWIND_VK_NO_GPL=1: whole pipelines for all (device.c).
+static const VkDynamicState DYN_VI[] = {VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY, VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE};
+static const VkDynamicState DYN_PRE[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_DEPTH_BIAS,
+                                         VK_DYNAMIC_STATE_DEPTH_BIAS_ENABLE, VK_DYNAMIC_STATE_CULL_MODE, VK_DYNAMIC_STATE_FRONT_FACE,
+                                         VK_DYNAMIC_STATE_LINE_WIDTH};
+static const VkDynamicState DYN_FS[] = {VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE, VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE,
+                                        VK_DYNAMIC_STATE_DEPTH_COMPARE_OP, VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE,
+                                        VK_DYNAMIC_STATE_STENCIL_OP, VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK,
+                                        VK_DYNAMIC_STATE_STENCIL_WRITE_MASK, VK_DYNAMIC_STATE_STENCIL_REFERENCE};
+static const VkDynamicState DYN_OUT[] = {VK_DYNAMIC_STATE_BLEND_CONSTANTS};
+
+static VkResult gpl_create(VkGraphicsPipelineCreateInfo *pi, VkGraphicsPipelineLibraryFlagsEXT what, VkPipelineCache cache,
+                           VkPipeline *out) {
+    VkGraphicsPipelineLibraryCreateInfoEXT li = {.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT,
+                                                 .pNext = pi->pNext, .flags = what};
+    VkPipelineCreationFeedback fb = {0};
+    VkPipelineCreationFeedbackCreateInfo fci = {.sType = VK_STRUCTURE_TYPE_PIPELINE_CREATION_FEEDBACK_CREATE_INFO, .pNext = &li,
+                                                .pPipelineCreationFeedback = &fb};
+    pi->sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    pi->pNext = &fci;
+    pi->flags |= VK_PIPELINE_CREATE_LIBRARY_BIT_KHR;
+    *out = VK_NULL_HANDLE;
+    VkResult r = vkCreateGraphicsPipelines(g_vk.dev, cache, 1, pi, NULL, out);
+    if (r == VK_PIPELINE_COMPILE_REQUIRED) {
+        *out = VK_NULL_HANDLE;  // (lookup only: not in that cache)
+    } else if (r != VK_SUCCESS) {
+        static int n;
+        if (n++ < 10) LOG("[vk] pipeline library %#x failed: %d\n", what, r);
+    } else if (cache == g_vk.pcache) {
+        cache_feedback(&fb);
+    } else if (cache && cache == g_vk.pcache_pre) {
+        extern void vk_precompiled_cache_note(bool hit);
+        vk_precompiled_cache_note((fb.flags & VK_PIPELINE_CREATION_FEEDBACK_VALID_BIT) &&
+                                  (fb.flags & VK_PIPELINE_CREATION_FEEDBACK_APPLICATION_PIPELINE_CACHE_HIT_BIT));
+    }
+    return r;
+}
+
+// The descriptor set layout of a stage's own set, and a pipeline layout of it alone (stage_build)
+static void stage_layouts(StageBuild *b, int stage) {
+    uint32_t set = stage == STAGE_VERTEX ? 0 : 1;
+    ubo_dynamic_mark_stage(b->binds, b->nbinds, set);
+    b->set_layout = vk_set_layout(b->binds, b->nbinds, set, stage == STAGE_VERTEX ? VK_SHADER_STAGE_VERTEX_BIT : VK_SHADER_STAGE_FRAGMENT_BIT);
+    VkDescriptorSetLayout sl[2] = {stage == STAGE_VERTEX ? b->set_layout : VK_NULL_HANDLE, b->set_layout};
+    VkPipelineLayoutCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+                                     .flags = VK_PIPELINE_LAYOUT_CREATE_INDEPENDENT_SETS_BIT_EXT, .setLayoutCount = set + 1,
+                                     .pSetLayouts = sl};
+    VK_CHECK(vkCreatePipelineLayout(g_vk.dev, &ci, NULL, &b->lib_layout));
+}
+
+// A vertex shader's pre-rasterization library (depth clamp, polygon mode) or a fragment shader's library (samples,
+// alpha to coverage), into cache; lookup: only if cache has it (no compile)
+static VkPipeline gpl_shader_lib(VkShaderModule m, int stage, VkPipelineLayout layout, int variant, VkPipelineCache cache,
+                                 bool lookup) {
+    VkPipelineShaderStageCreateInfo st = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                                          .stage = stage == STAGE_VERTEX ? VK_SHADER_STAGE_VERTEX_BIT : VK_SHADER_STAGE_FRAGMENT_BIT,
+                                          .module = m, .pName = "main"};
+    VkPipelineRenderingCreateInfo ri = {.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+    VkGraphicsPipelineCreateInfo pi = {.pNext = &ri, .stageCount = 1, .pStages = &st, .layout = layout,
+                                       .flags = lookup ? VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT : 0};
+    VkPipeline p;
+    if (stage == STAGE_VERTEX) {
+        VkPipelineViewportStateCreateInfo vs = {.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, .viewportCount = 1,
+                                                .scissorCount = 1};
+        VkPipelineRasterizationStateCreateInfo rs = {.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+                                                     .depthClampEnable = (variant & 1) && g_vk.depth_clamp,
+                                                     .polygonMode = (variant & 2) ? VK_POLYGON_MODE_FILL : VK_POLYGON_MODE_LINE,
+                                                     .lineWidth = 1};
+        VkPipelineDynamicStateCreateInfo dy = {.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+                                               .dynamicStateCount = sizeof DYN_PRE / sizeof DYN_PRE[0], .pDynamicStates = DYN_PRE};
+        pi.pViewportState = &vs;
+        pi.pRasterizationState = &rs;
+        pi.pDynamicState = &dy;
+        return gpl_create(&pi, VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT, cache, &p) == VK_SUCCESS ? p : VK_NULL_HANDLE;
+    }
+    VkPipelineDepthStencilStateCreateInfo ds = {.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+    VkPipelineMultisampleStateCreateInfo ms = {.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+                                               .rasterizationSamples = (VkSampleCountFlagBits)(1u << (variant >> 1)),
+                                               .alphaToCoverageEnable = variant & 1};
+    VkPipelineDynamicStateCreateInfo dy = {.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+                                           .dynamicStateCount = sizeof DYN_FS / sizeof DYN_FS[0], .pDynamicStates = DYN_FS};
+    pi.pDepthStencilState = &ds;
+    pi.pMultisampleState = &ms;
+    pi.pDynamicState = &dy;
+    return gpl_create(&pi, VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT, cache, &p) == VK_SUCCESS ? p : VK_NULL_HANDLE;
+}
+
+static int samples_log2(uint32_t n) { int l = 0; while ((1u << l) < n && l < 6) l++; return l; }
+
+// A stage's library for this state: made once (the first thread to make it keeps it)
+static VkPipeline gpl_stage_lib(StageBuild *b, int stage, const PipeState *s) {
+    int variant = stage == STAGE_VERTEX ? (s->depth_clamp ? 1 : 0) | (s->poly_fill ? 2 : 0)
+                                        : (samples_log2(s->samples) << 1) | (s->a2c ? 1 : 0);
+    if (variant >= 8 || !b->lib_layout) return VK_NULL_HANDLE;
+    uint64_t have = atomic_load(&b->lib[variant]);
+    if (have) return (VkPipeline)(uintptr_t)have;
+    VkPipeline p = g_vk.pcache_pre ? gpl_shader_lib(b->m, stage, b->lib_layout, variant, g_vk.pcache_pre, true) : VK_NULL_HANDLE;
+    if (!p) p = gpl_shader_lib(b->m, stage, b->lib_layout, variant, g_vk.pcache, false);
+    if (!p) return VK_NULL_HANDLE;
+    uint64_t want = 0;
+    if (!atomic_compare_exchange_strong(&b->lib[variant], &want, (uint64_t)(uintptr_t)p)) {  // (another thread made it)
+        vkDestroyPipeline(g_vk.dev, p, NULL);
+        return (VkPipeline)(uintptr_t)want;
+    }
+    return p;
+}
+
+// The state-only libraries, by the part of the state each takes
+typedef struct GplLib { PipeState key; VkPipeline lib; struct GplLib *next; } GplLib;
+#define GPL_TAB 1024
+static GplLib *gpl_tab[2][GPL_TAB];
+static pthread_mutex_t gpl_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static VkPipeline gpl_state_lib(const PipeState *s, bool output) {
+    PipeState k;
+    memset(&k, 0, sizeof k);
+    if (!output) {
+        memcpy(k.attr_fmt, s->attr_fmt, sizeof k.attr_fmt);
+        memcpy(k.attr_off, s->attr_off, sizeof k.attr_off);
+        memcpy(k.attr_bind, s->attr_bind, sizeof k.attr_bind);
+        k.attr_mask = s->attr_mask;
+        memcpy(k.stride, s->stride, sizeof k.stride);
+        memcpy(k.divisor, s->divisor, sizeof k.divisor);
+        k.used_streams = s->used_streams;
+        k.topo_class = s->topo_class;
+    } else {
+        memcpy(k.color, s->color, sizeof k.color);
+        k.depth = s->depth;
+        k.stencil = s->stencil;
+        k.ncolor = s->ncolor;
+        k.samples = s->samples;
+        memcpy(k.blend, s->blend, sizeof k.blend);
+        k.blend_on = s->blend_on;
+        k.a2c = s->a2c;
+        memcpy(k.write_mask, s->write_mask, sizeof k.write_mask);
+    }
+    uint64_t h = hash_words(output ? 0x5bd1e995u : 0x27d4eb2fu, &k, sizeof k);
+    pthread_mutex_lock(&gpl_lock);
+    GplLib *e = gpl_tab[output][h & (GPL_TAB - 1)];
+    while (e && memcmp(&e->key, &k, sizeof k)) e = e->next;
+    if (e) { pthread_mutex_unlock(&gpl_lock); return e->lib; }
+    VkPipeline p = VK_NULL_HANDLE;
+    VkGraphicsPipelineCreateInfo pi = {0};
+    if (!output) {
+        VkVertexInputAttributeDescription va[32];
+        VkVertexInputBindingDescription vb[17];
+        VkVertexInputBindingDivisorDescriptionEXT vd[17];
+        uint32_t na = 0, nb = 0, nd = 0;
+        for (int i = 0; i < 32; i++)
+            if (k.attr_mask & (1u << i)) va[na++] = (VkVertexInputAttributeDescription){(uint32_t)i, k.attr_bind[i], k.attr_fmt[i], k.attr_off[i]};
+        for (uint32_t st = 0; st < 17; st++) {
+            if (!(k.used_streams & (1u << st))) continue;
+            bool inst = k.divisor[st] != 0;
+            vb[nb++] = (VkVertexInputBindingDescription){st, k.stride[st], inst ? VK_VERTEX_INPUT_RATE_INSTANCE : VK_VERTEX_INPUT_RATE_VERTEX};
+            if (inst && k.divisor[st] > 1 && g_vk.divisor) vd[nd++] = (VkVertexInputBindingDivisorDescriptionEXT){st, k.divisor[st]};
+        }
+        VkPipelineVertexInputDivisorStateCreateInfoEXT dvi = {.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_DIVISOR_STATE_CREATE_INFO_EXT,
+                                                              .vertexBindingDivisorCount = nd, .pVertexBindingDivisors = vd};
+        VkPipelineVertexInputStateCreateInfo vi = {.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+                                                   .pNext = nd ? &dvi : NULL, .vertexBindingDescriptionCount = nb,
+                                                   .pVertexBindingDescriptions = vb, .vertexAttributeDescriptionCount = na,
+                                                   .pVertexAttributeDescriptions = va};
+        VkPipelineInputAssemblyStateCreateInfo ia = {.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+                                                     .topology = topo_class_base(k.topo_class)};
+        VkPipelineDynamicStateCreateInfo dy = {.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+                                               .dynamicStateCount = sizeof DYN_VI / sizeof DYN_VI[0], .pDynamicStates = DYN_VI};
+        pi.pVertexInputState = &vi;
+        pi.pInputAssemblyState = &ia;
+        pi.pDynamicState = &dy;
+        gpl_create(&pi, VK_GRAPHICS_PIPELINE_LIBRARY_VERTEX_INPUT_INTERFACE_BIT_EXT, VK_NULL_HANDLE, &p);
+    } else {
+        VkPipelineColorBlendAttachmentState cba[8] = {0};
+        for (uint32_t i = 0; i < k.ncolor && i < 8; i++) {
+            cba[i].colorWriteMask = k.write_mask[i];
+            if ((k.blend_on >> i) & 1) {
+                const uint8_t *b = k.blend[i];
+                cba[i].blendEnable = VK_TRUE;
+                cba[i].srcColorBlendFactor = blend_factor(b[1]);
+                cba[i].dstColorBlendFactor = blend_factor(b[2]);
+                cba[i].srcAlphaBlendFactor = blend_factor(b[3]);
+                cba[i].dstAlphaBlendFactor = blend_factor(b[4]);
+                cba[i].colorBlendOp = blend_op(b[5]);
+                cba[i].alphaBlendOp = blend_op(b[6]);
+            }
+        }
+        VkPipelineColorBlendStateCreateInfo cb = {.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+                                                  .attachmentCount = k.ncolor, .pAttachments = cba};
+        VkPipelineMultisampleStateCreateInfo ms = {.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+                                                   .rasterizationSamples = (VkSampleCountFlagBits)k.samples, .alphaToCoverageEnable = k.a2c};
+        VkPipelineDynamicStateCreateInfo dy = {.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+                                               .dynamicStateCount = sizeof DYN_OUT / sizeof DYN_OUT[0], .pDynamicStates = DYN_OUT};
+        VkPipelineRenderingCreateInfo ri = {.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, .colorAttachmentCount = k.ncolor,
+                                            .pColorAttachmentFormats = k.color, .depthAttachmentFormat = k.depth,
+                                            .stencilAttachmentFormat = k.stencil};
+        pi.pNext = &ri;
+        pi.pColorBlendState = &cb;
+        pi.pMultisampleState = &ms;
+        pi.pDynamicState = &dy;
+        gpl_create(&pi, VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_OUTPUT_INTERFACE_BIT_EXT, VK_NULL_HANDLE, &p);
+    }
+    if (p) {
+        e = calloc(1, sizeof *e);
+        e->key = k;
+        e->lib = p;
+        e->next = gpl_tab[output][h & (GPL_TAB - 1)];
+        gpl_tab[output][h & (GPL_TAB - 1)] = e;
+    }
+    pthread_mutex_unlock(&gpl_lock);
+    return p;
+}
+
+// A graphics pipeline: linked from libraries (g_vk.gpl), else whole
+static VkResult make_graphics(const PipeState *s, StageBuild *v, StageBuild *f, VkShaderModule vsm, VkShaderModule fsm,
+                              VkPipelineLayout layout, VkPipeline *out) {
+    if (g_vk.gpl && v && f && !s->feedback) {
+        VkPipeline libs[4] = {gpl_state_lib(s, false), gpl_stage_lib(v, STAGE_VERTEX, s), gpl_stage_lib(f, STAGE_FRAGMENT, s),
+                              gpl_state_lib(s, true)};
+        if (libs[0] && libs[1] && libs[2] && libs[3]) {
+            VkPipelineLibraryCreateInfoKHR li = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR, .libraryCount = 4,
+                                                 .pLibraries = libs};
+            VkGraphicsPipelineCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = &li, .layout = layout};
+            *out = VK_NULL_HANDLE;
+            VkResult r = vkCreateGraphicsPipelines(g_vk.dev, VK_NULL_HANDLE, 1, &pi, NULL, out);
+            if (r == VK_SUCCESS) return r;
+            static int n;
+            if (n++ < 10) LOG("[vk] pipeline link failed: %d (made whole)\n", r);
+        }
+    }
+    return create_pipeline(s, vsm, fsm, layout, out);
 }
 
 // Graphics pipelines by stages and fixed state, whoever made them first: a draw (build_pipeline, for its Prog's
@@ -2004,6 +2433,17 @@ static bool warm_get(const ShaderInfo *vi, const ShaderInfo *fi, const PipeState
     return false;
 }
 
+// The pipeline, if one with these stages and state is built already (asynchronous shaders: no job, no skipped draw).
+static VkPipeline warm_ready(const ShaderInfo *vi, const ShaderInfo *fi, const PipeState *s) {
+    uint64_t h = hash_words((uint64_t)pair_slot(vi, fi) * 0x9E3779B97F4A7C15ull, s, sizeof *s);
+    pthread_mutex_lock(&warm_lock);
+    WarmPipe *w = warm_tab[h & (WARM_TAB - 1)];
+    while (w && !(w->hash == h && w->vi == vi && w->fi == fi && !memcmp(&w->s, s, sizeof *s))) w = w->next;
+    VkPipeline p = w && atomic_load(&w->state) == 2 ? w->pipe : VK_NULL_HANDLE;
+    pthread_mutex_unlock(&warm_lock);
+    return p;
+}
+
 static void warm_done(WarmPipe *w, VkPipeline p, VkResult r) {
     pthread_mutex_lock(&warm_lock);
     w->pipe = p;
@@ -2021,7 +2461,7 @@ static void build_pipeline(void *arg) {
     WarmPipe *w;
     if (warm_get(k->prog->vi, k->prog->fi, &k->s, &w)) {
         VkPipeline p;
-        VkResult r = create_pipeline(&k->s, k->prog->vs, k->prog->fs, k->prog->layout, &p);
+        VkResult r = make_graphics(&k->s, k->prog->stages.v, k->prog->stages.f, k->prog->vs, k->prog->fs, k->prog->layout, &p);
         warm_done(w, p, r);
         if (r == VK_SUCCESS) pso_record(1, vk_translate_id(k->prog->vi), vk_translate_id(k->prog->fi), &k->s, sizeof k->s);
         atomic_fetch_add(&stat_compiles, 1);
@@ -2383,6 +2823,49 @@ static VkDescriptorBufferInfo ubo_span(VkSpan s, uint64_t size) {
 
 static bool gw_ubo_direct(uint64_t addr, uint64_t size, VkDescriptorBufferInfo *out);
 
+// Shadow maps made bigger than the game's (Video > Shadow resolution, textures.c RS_SHADOW): the shaders that filter
+// them offset their taps by a texel size the game passes in a constant buffer (BOTW's deferred sun shadow passes:
+// c[4] words 212-213 = 1/896, four taps at +-0.5 texel). Left as is, the taps stay a console texel apart, several
+// texels of the bigger map: the penumbra breaks into steps. In draws that sample such a map, that pair in the
+// fragment stage's constant buffers becomes the map's own texel size (1/2048, 1/4096): the same filter, finer.
+static struct { uint32_t gw, gh; float s; } sdw_fix;  // (the draw in progress; s 0: it samples no bigger shadow map)
+
+static bool sdw_patch(uint64_t addr, uint64_t size, VkDescriptorBufferInfo *out) {
+    static struct { uint64_t addr, size, gen, serial, seq; uint32_t gw, gh; float s; bool found; VkDescriptorBufferInfo d; } memo[8];
+    __typeof__(memo[0]) *m = &memo[(addr >> 8) & 7];
+    uint64_t gen = __atomic_load_n(&gcopy_gen, __ATOMIC_RELAXED), seq = vk_pending_seq();
+    if (m->addr == addr && m->size == size && m->gen == gen && m->serial == uub_serial && m->seq == seq &&
+        m->gw == sdw_fix.gw && m->gh == sdw_fix.gh && m->s == sdw_fix.s) {
+        if (m->found) *out = m->d;
+        return m->found;
+    }
+    *m = (__typeof__(*m)){.addr = addr, .size = size, .gen = gen, .serial = uub_serial, .seq = seq, .gw = sdw_fix.gw,
+                          .gh = sdw_fix.gh, .s = sdw_fix.s};
+    static long long off = -1;  // SAVAGEWIND_NO_SHADOW_TEXEL_FIX=<presented frame>: the game's value from then on (A/B)
+    if (off < 0) off = getenv("SAVAGEWIND_NO_SHADOW_TEXEL_FIX") ? atoll(getenv("SAVAGEWIND_NO_SHADOW_TEXEL_FIX")) : 0;
+    if (off && renderer_present_count() + 1 >= (uint64_t)off) return false;
+    const float *g = (const float *)(uintptr_t)addr;
+    float tx = 1.0f / (float)sdw_fix.gw, ty = 1.0f / (float)sdw_fix.gh;
+    static float buf[0x10000 / 4];
+    static int nlog;
+    uint64_t nw = size / 4;
+    for (uint64_t i = 0; i + 1 < nw; i += 2) {  // (a vec2: 8-byte aligned)
+        if (fabsf(g[i] - tx) > tx * 1e-5f || fabsf(g[i + 1] - ty) > ty * 1e-5f) continue;
+        if (!m->found) memcpy(buf, g, nw * 4);
+        m->found = true;
+        buf[i] = tx / sdw_fix.s;
+        buf[i + 1] = ty / sdw_fix.s;
+        if (nlog < 4) {
+            nlog++;
+            LOG("[shadow] %ux%u map at %ux%u: texel size %g -> %g (constant buffer %llx word %llu)\n", sdw_fix.gw, sdw_fix.gh,
+                (unsigned)lroundf(sdw_fix.gw * sdw_fix.s), (unsigned)lroundf(sdw_fix.gh * sdw_fix.s), tx, buf[i],
+                (unsigned long long)addr, (unsigned long long)i);
+        }
+    }
+    if (m->found) m->d = *out = ubo_span(vk_transient_copy(buf, size, 256), size);
+    return m->found;
+}
+
 // Constant buffer k of a stage (renderer.m bind_cbufs), copied into transient memory.
 static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32_t gx, uint32_t gy, uint32_t gz) {
     static const uint8_t zeros[0x10000];
@@ -2424,6 +2907,7 @@ static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32
     if (size < 16) size = 16;
     VkDescriptorBufferInfo direct;
     if (gw_ubo_direct(r.addr, size, &direct)) return direct;  // (written by a storing shader: read in place, see gw_note)
+    if (stage == 1 && sdw_fix.s > 1 && sdw_patch(r.addr, size, &direct)) return direct;  // (texel size: see sdw_fix)
     // snapshot: later CPU writes must not leak in. Shared by the draws of one submission binding the same range:
     // within a command list nothing writes guest memory (no inline UpdateUniformBuffer: that writes through below
     // and drops the shared copies).
@@ -2628,6 +3112,8 @@ static int g_cs_n;  // (compute program table below)
 // address (the old Prog / Pipe objects are leaked, so pipeline keys holding their pointers can't collide), compute
 // programs, shared copies - and the heap import: its pages are replaced (re-imported on first use).
 void vk_exec_reset(void) {
+    oq_counting = false;
+    oq_nrun = oq_nreports = 0;  // (pending reports pointed at the old boot's memory)
     ngw = 0;
     nuub = 0;
     guest_copy_flush();
@@ -2637,6 +3123,7 @@ void vk_exec_reset(void) {
     memset(pipe_tab, 0, sizeof pipe_tab);
     memset(&prog_memo, 0, sizeof prog_memo);
     memset(&pipe_memo, 0, sizeof pipe_memo);
+    key_gen++;
     g_cs_n = 0;
     gcopy_gen++;
     if (gmem_buf) {
@@ -2649,9 +3136,9 @@ void vk_exec_reset(void) {
     st_defaults();
 }
 
-// The 3D scene upscaled for this draw (scene_upscale): sampled instead of the scene texture, at its scale.
-static struct { NvnTexture *t; VkImageView view; float sx, sy; } scene_up;
-static void scene_upscale(Prog *pr, CmdRec *r);
+// The 3D scene upscaled / sharpened for this draw (scene_post): sampled instead of the scene texture, at its scale.
+static struct { NvnTexture *t; TexBackend *img; float sx, sy; } scene_up;
+static void scene_post(Prog *pr, CmdRec *r);
 
 static void texture_info(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo *out, float sc[2], uint32_t wh[2]) {
     ShaderTexture *st_ = &si->tex[i];
@@ -2685,7 +3172,12 @@ static void texture_info(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo
                 memo[ms].type = (uint8_t)st_->type; memo[ms].has_view = e->has_view; memo[ms].view = view;
             }
             renderer_texture_scale(et, &sc[0], &sc[1]);
-            if (et == scene_up.t && stage == 1) { view = scene_up.view; sc[0] = scene_up.sx; sc[1] = scene_up.sy; }
+            if (et == scene_up.t && stage == 1) {  // (with the texture's own swizzle: BOTW draws its weapon wheel's
+                // blurred capture of the scene, whose alpha is 0, with alpha forced to 1)
+                view = vk_image_view(scene_up.img, VK_IMAGE_VIEW_TYPE_2D, scene_up.img->format, 0, 1, 0, 1,
+                                     vk_sample_swizzle(et, e->has_view ? &e->view : NULL), VK_IMAGE_ASPECT_COLOR_BIT);
+                sc[0] = scene_up.sx; sc[1] = scene_up.sy;
+            }
             wh[0] = et->width; wh[1] = et->height;
             for (int k = 0; k < nfeedback; k++)
                 if (et == feedback_tex[k] && feedback_any_type[k]) view = feedback_view[k];
@@ -2756,8 +3248,12 @@ static VkDescriptorSet set_finish(VkDescriptorSetLayout layout, VkWriteDescripto
 // Writes the descriptor set of one stage. gx..gz: compute group counts (driver constants).
 // pre_ii: texture descriptors already resolved by the caller (draw: fragment textures, needed earlier for the
 // viewport decision), or NULL.
+// dyn / ndyn: the offsets of its dynamic uniform buffers, by binding (ubo_dynamic_mark), appended.
 static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t set, int stage, ShaderInfo *si, const float *rscale_row0,
-                                 const float tint[8], uint32_t gx, uint32_t gy, uint32_t gz, const VkDescriptorImageInfo *pre_ii) {
+                                 const float tint[8], uint32_t gx, uint32_t gy, uint32_t gz, const VkDescriptorImageInfo *pre_ii,
+                                 uint32_t *dyn, int *ndyn) {
+    struct { uint32_t binding, off; } dv[32];
+    int nd = 0;
     VkWriteDescriptorSet w[MAX_BIND];
     VkDescriptorBufferInfo bi[MAX_BIND];
     VkDescriptorImageInfo ii[MAX_BIND];
@@ -2784,6 +3280,14 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
         } else if (b->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER && b->binding < 17) {
             bi[n] = cbuf_info(stage, si, (int)b->binding, gx, gy, gz);
             w[n].pBufferInfo = &bi[n];
+        } else if (b->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC && nd < 32) {
+            bi[n] = cbuf_info(stage, si, (int)b->binding, gx, gy, gz);
+            int k = nd++;  // (by binding: the order vkCmdBindDescriptorSets takes them in)
+            while (k > 0 && dv[k - 1].binding > b->binding) { dv[k] = dv[k - 1]; k--; }
+            dv[k].binding = b->binding;
+            dv[k].off = (uint32_t)bi[n].offset;
+            bi[n].offset = 0;
+            w[n].pBufferInfo = &bi[n];
         } else if (b->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) {
             bi[n] = gmem_info();
             w[n].pBufferInfo = &bi[n];
@@ -2807,6 +3311,7 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
         w[n].pBufferInfo = &bi[n];
         n++;
     }
+    for (int i = 0; i < nd && dyn; i++) dyn[(*ndyn)++] = dv[i].off;
     return set_finish(layout, w, n);
 }
 
@@ -3127,7 +3632,7 @@ static void pso_warm_one(const PsoRec *r) {
         WarmPipe *w;
         if (!warm_get(vi, fi, &r->u.g, &w)) { atomic_fetch_add(&pso_found, 1); return; }
         VkPipeline p;
-        VkResult res = create_pipeline(&r->u.g, b->vs, b->fs, b->layout, &p);
+        VkResult res = make_graphics(&r->u.g, b->v, b->f, b->vs, b->fs, b->layout, &p);
         warm_done(w, p, res);
     } else {
         ShaderInfo *si = vk_translate_load_id(r->id[0], STAGE_COMPUTE);
@@ -3158,7 +3663,158 @@ static void *pso_worker(void *arg) {
     return NULL;
 }
 
+// ---- shader precompilation (precompile.c): one pipeline per program, built and thrown away, so that the driver
+// compiles its shaders and keeps them in its own shader cache. A pipeline with the same shaders and other fixed state
+// costs a few ms afterwards instead of the full compile (~30 ms a program measured; another vertex layout costs
+// nothing, other blending / target formats / write masks 4-5 ms). The color targets, depth, blending and write masks
+// are what the pipeline list met most for fragment shaders writing the same targets, else RGBA8 without blending.
+// Not into the pipeline cache (it would hold every program of the game, ~55 KB each).
+typedef struct { uint32_t omap; PipeState s; int count; } WarmOut;
+static WarmOut *warm_outs;
+static int nwarm_outs;
+static pthread_once_t warm_outs_once = PTHREAD_ONCE_INIT;
+
+static void warm_outs_init(void) {  // (from the pipeline list read at start)
+    for (int i = 0; i < pso_nrecs; i++) {
+        const PsoRec *r = &pso_recs[i];
+        if (r->kind != 1) continue;
+        ShaderInfo *fi = vk_translate_load_id(r->id[1], STAGE_FRAGMENT);
+        if (!fi || !fi->msl) continue;
+        PipeState o;  // (the output part)
+        memset(&o, 0, sizeof o);
+        o.ncolor = r->u.g.ncolor;
+        memcpy(o.color, r->u.g.color, sizeof o.color);
+        o.depth = r->u.g.depth;
+        o.stencil = r->u.g.stencil;
+        o.samples = r->u.g.samples;
+        o.blend_on = r->u.g.blend_on;
+        memcpy(o.blend, r->u.g.blend, sizeof o.blend);
+        memcpy(o.write_mask, r->u.g.write_mask, sizeof o.write_mask);
+        o.a2c = r->u.g.a2c;
+        int j = 0;
+        while (j < nwarm_outs && !(warm_outs[j].omap == fi->out_mask && !memcmp(&warm_outs[j].s, &o, sizeof o))) j++;
+        if (j == nwarm_outs) {
+            warm_outs = realloc(warm_outs, sizeof *warm_outs * (size_t)(nwarm_outs + 1));
+            warm_outs[nwarm_outs++] = (WarmOut){fi->out_mask, o, 0};
+        }
+        warm_outs[j].count++;
+    }
+}
+
+static VkShaderModule warm_module(const ShaderInfo *si, int stage, VkBindingInfo *binds, int *nbinds, int max) {
+    size_t n = 0;
+    uint32_t *spv = vk_glsl_to_spirv(si->msl, stage, "warm", &n);
+    if (!spv) return VK_NULL_HANDLE;
+    *nbinds += vk_reflect(spv, n, binds + *nbinds, max - *nbinds);
+    VkShaderModule m = vk_module(spv, n);
+    free(spv);
+    return m;
+}
+
+// (precompile.c) a vertex or fragment shader's libraries into the precompiled shaders' cache, the usual variants:
+// vertex shaders filled, with and without depth clamp (shadow maps); fragment shaders single-sampled. Nothing kept.
+bool vk_pso_warm_stage(const ShaderInfo *si, int stage) {
+    VkPipelineCache cache = vk_precompiled_cache();
+    if (!cache) return false;
+    StageBuild b;
+    memset(&b, 0, sizeof b);
+    b.m = warm_module(si, stage, b.binds, &b.nbinds, MAX_BIND);
+    if (!b.m) return false;
+    stage_layouts(&b, stage);
+    bool ok = true;
+    static const int vs_variants[] = {2, 3}, fs_variants[] = {0};
+    const int *vv = stage == STAGE_VERTEX ? vs_variants : fs_variants;
+    int nv = stage == STAGE_VERTEX ? (g_vk.depth_clamp ? 2 : 1) : 1;
+    for (int i = 0; i < nv; i++) {
+        VkPipeline p = gpl_shader_lib(b.m, stage, b.lib_layout, vv[i], cache, false);
+        if (p) vkDestroyPipeline(g_vk.dev, p, NULL);
+        else ok = false;
+    }
+    vkDestroyPipelineLayout(g_vk.dev, b.lib_layout, NULL);
+    vkDestroyDescriptorSetLayout(g_vk.dev, b.set_layout, NULL);
+    vkDestroyShaderModule(g_vk.dev, b.m, NULL);
+    return ok;
+}
+
+bool vk_pso_warm_compute(const ShaderInfo *si, const uint32_t local[3]) {
+    VkBindingInfo binds[MAX_BIND];
+    int nb = 0;
+    VkShaderModule m = warm_module(si, STAGE_COMPUTE, binds, &nb, MAX_BIND);
+    if (!m) return false;
+    VkDescriptorSetLayout sl[2] = {0};
+    VkPipelineLayout l = make_layout(binds, nb, sl, 1, VK_SHADER_STAGE_COMPUTE_BIT, 0);
+    VkSpecializationMapEntry me[3] = {{0, 0, 4}, {1, 4, 4}, {2, 8, 4}};
+    VkSpecializationInfo spec = {3, me, 12, local};
+    VkComputePipelineCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+                                      .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                                                .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = m, .pName = "main",
+                                                .pSpecializationInfo = &spec},
+                                      .layout = l};
+    VkPipeline p;
+    bool ok = vkCreateComputePipelines(g_vk.dev, g_vk.pcache, 1, &ci, NULL, &p) == VK_SUCCESS;
+    extern void vk_pipeline_cache_note(bool hit);
+    if (ok) vk_pipeline_cache_note(false);
+    if (ok) vkDestroyPipeline(g_vk.dev, p, NULL);
+    vkDestroyPipelineLayout(g_vk.dev, l, NULL);
+    vkDestroyDescriptorSetLayout(g_vk.dev, sl[0], NULL);
+    vkDestroyShaderModule(g_vk.dev, m, NULL);
+    return ok;
+}
+
+bool vk_pso_warm(const ShaderInfo *vi, const ShaderInfo *fi, const uint8_t attr_kind[32]) {
+    pthread_once(&warm_outs_once, warm_outs_init);
+    VkBindingInfo binds[MAX_BIND * 2];
+    int nb = 0;
+    VkShaderModule v = warm_module(vi, STAGE_VERTEX, binds, &nb, MAX_BIND), f = warm_module(fi, STAGE_FRAGMENT, binds, &nb, MAX_BIND * 2);
+    bool ok = false;
+    if (v && f) {
+        VkDescriptorSetLayout sl[2] = {0};
+        VkPipelineLayout l = make_layout(binds, nb, sl, 2, VK_SHADER_STAGE_VERTEX_BIT, VK_SHADER_STAGE_FRAGMENT_BIT);
+        PipeState s;
+        memset(&s, 0, sizeof s);
+        for (int a = 0; a < 32; a++) {  // (one buffer, 16 bytes an attribute: the layout does not matter)
+            if (!((vi->attr_mask >> a) & 1)) continue;
+            int k = attr_kind[a];
+            s.attr_mask |= 1u << a;
+            s.attr_fmt[a] = k == 0 ? VK_FORMAT_R32G32B32A32_SFLOAT : k == 1 || k == 3 ? VK_FORMAT_R32G32B32A32_SINT
+                                                                                        : VK_FORMAT_R32G32B32A32_UINT;
+            s.attr_off[a] = 16u * (uint32_t)a;
+        }
+        if (s.attr_mask) { s.used_streams = 1; s.stride[0] = 512; }
+        s.topo_class = 2;
+        s.poly_fill = 1;
+        const WarmOut *best = NULL;
+        for (int i = 0; i < nwarm_outs; i++)
+            if (warm_outs[i].omap == fi->out_mask && (!best || warm_outs[i].count > best->count)) best = &warm_outs[i];
+        if (best) {
+            PipeState o = best->s;
+            s.ncolor = o.ncolor; memcpy(s.color, o.color, sizeof s.color);
+            s.depth = o.depth; s.stencil = o.stencil; s.samples = o.samples ? o.samples : 1;
+            s.blend_on = o.blend_on; memcpy(s.blend, o.blend, sizeof s.blend); memcpy(s.write_mask, o.write_mask, sizeof s.write_mask);
+            s.a2c = o.a2c;
+        } else {
+            s.samples = 1;
+            s.depth = VK_FORMAT_D32_SFLOAT;
+            for (int rt = 0; rt < 8; rt++) {
+                if (!((fi->out_mask >> (rt * 4)) & 0xF)) continue;
+                s.ncolor = (uint32_t)rt + 1;
+                s.color[rt] = VK_FORMAT_R8G8B8A8_UNORM;
+                s.write_mask[rt] = 0xF;
+            }
+        }
+        VkPipeline p;
+        ok = create_pipeline_in(&s, v, f, l, g_vk.pcache, &p) == VK_SUCCESS;
+        if (ok) vkDestroyPipeline(g_vk.dev, p, NULL);
+        vkDestroyPipelineLayout(g_vk.dev, l, NULL);
+        for (int i = 0; i < 2; i++) vkDestroyDescriptorSetLayout(g_vk.dev, sl[i], NULL);
+    }
+    if (v) vkDestroyShaderModule(g_vk.dev, v, NULL);
+    if (f) vkDestroyShaderModule(g_vk.dev, f, NULL);
+    return ok;
+}
+
 static void pso_init(void) {
+    vk_cache_cleanup();
     pso_load();
     // (without the translation cache, draws translate anew and never meet what the pre-warm loads)
     if (!pso_nrecs || getenv("SAVAGEWIND_NO_SHADER_WARM") || getenv("SAVAGEWIND_NO_XLATE_CACHE") || maxwell_translation_uncacheable())
@@ -3208,7 +3864,7 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
         LOG("\n");
     }
     nfeedback = 0;
-    VkDescriptorSet ds = stage_set(&cp->p, cp->p.set_layout[0], 0, 5, cp->si, NULL, NULL, gx, gy, gz, NULL);
+    VkDescriptorSet ds = stage_set(&cp->p, cp->p.set_layout[0], 0, 5, cp->si, NULL, NULL, gx, gy, gz, NULL, NULL, NULL);
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, cp->pipe);
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, cp->p.layout, 0, 1, &ds, 0, NULL);
     vkCmdDispatch(cb, gx, gy, gz);
@@ -3231,9 +3887,10 @@ static void debug_draw(Prog *pr, CmdRec *r, bool indexed);
 
 // (debugging) SAVAGEWIND_DEBUG_PICK=<x>,<y>[;<x>,<y>...] (up to 4 points, first-target pixels): in a debug frame each
 // draw copies those pixels of its first target afterwards (its own pass), and vk_pick_report logs, per point, the
-// draws that changed it ("[pick]"): the last one is what the frame shows there.
+// draws that changed it ("[pick]"): the last one is what the frame shows there. SAVAGEWIND_DEBUG_PICK_RT=<i>: target i
+// of each pass instead of the first (a G-buffer's albedo, say), skipping passes that have none.
 typedef struct { uint64_t vs, fs, hash; void *img; uint32_t w, h, fmt, no; } PickRec;
-static struct { VkBuffer buf; VmaAllocation mem; uint8_t *ptr; int n, npt, on; int pt[4][2]; uint32_t draws; PickRec rec[4096]; } pick = {.on = -1};
+static struct { VkBuffer buf; VmaAllocation mem; uint8_t *ptr; int n, npt, on, rt; int pt[4][2]; uint32_t draws; PickRec rec[4096]; } pick = {.on = -1};
 
 static void pick_after_draw(void) {
     if (pick.on < 0) {
@@ -3245,10 +3902,14 @@ static void pick_after_draw(void) {
             if (e) e++;
         }
         pick.on = pick.npt > 0;
+        const char *rt = getenv("SAVAGEWIND_DEBUG_PICK_RT");
+        pick.rt = rt ? atoi(rt) : 0;
+        if (pick.rt < 0 || pick.rt > 7) pick.rt = 0;
     }
     pick.draws++;
-    if (!pick.on || !st.rt.ncolor || !st.rt.color[0] || !st.rt.color[0]->backend || pick.n >= 4096) return;
-    TexBackend *b = st.rt.color[0]->backend;
+    const int t = pick.rt;
+    if (!pick.on || st.rt.ncolor <= t || !st.rt.color[t] || !st.rt.color[t]->backend || pick.n >= 4096) return;
+    TexBackend *b = st.rt.color[t]->backend;
     if ((b->aspect & ~VK_IMAGE_ASPECT_COLOR_BIT) || b->samples > 1 || b->width < 64) return;
     if (!pick.buf) {
         VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = 4096 * 4 * 16, .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT};
@@ -3258,8 +3919,8 @@ static void pick_after_draw(void) {
         VK_CHECK(vmaCreateBuffer(g_vk.vma, &bi, &ai, &pick.buf, &pick.mem, &info));
         pick.ptr = info.pMappedData;
     }
-    uint32_t layer = st.rt.has_cview[0] && (st.rt.cview[0].setmask & 2) ? st.rt.cview[0].min_layer : 0;
-    uint32_t level = st.rt.has_cview[0] && (st.rt.cview[0].setmask & 1) ? st.rt.cview[0].base_level : 0;
+    uint32_t layer = st.rt.has_cview[t] && (st.rt.cview[t].setmask & 2) ? st.rt.cview[t].min_layer : 0;
+    uint32_t level = st.rt.has_cview[t] && (st.rt.cview[t].setmask & 1) ? st.rt.cview[t].base_level : 0;
     if (level >= b->levels || layer >= b->layers) return;
     vk_end_pass();
     VkCommandBuffer cb = vk_cmd();
@@ -3278,7 +3939,7 @@ static void pick_after_draw(void) {
     r->fs = st.program->stages[1].code_addr;
     r->hash = g_cur_fs_hash;
     r->img = (void *)b->image;
-    r->w = b->width; r->h = b->height; r->fmt = st.rt.color[0]->format; r->no = pick.draws;
+    r->w = b->width; r->h = b->height; r->fmt = st.rt.color[t]->format; r->no = pick.draws;
 }
 
 void vk_pick_report(void) {
@@ -3331,6 +3992,22 @@ static bool topology(uint32_t mode, VkPrimitiveTopology *t, uint8_t *cls) {
     }
 }
 
+static int lst_on = -1;  // (SAVAGEWIND_VK_LIST_STATS, see exec_list)
+static void lst_draw(Prog *pr);
+// With "Asynchronous shaders" on, a draw whose program or pipeline is still being built is skipped. That is fine for
+// what the game draws again every frame, not for what it draws once into a texture it keeps: BOTW copies each terrain
+// tile it streams in once into its layer of the height, normal and material arrays, and a skipped copy left material
+// 0 (grass) there for good: green bands on the sand outside Gerudo Town, in ~3 runs of 4. Draws into array, 3D and
+// cube textures that don't follow the output scale (the scene's own targets do) wait for their build instead.
+static bool draw_must_happen(void) {
+    for (int i = 0; i < st.rt.ncolor && i < 8; i++) {
+        const NvnTexture *t = st.rt.color[i];
+        if (!t || (t->target != 2 && t->target != 3 && t->target != 4 && t->target != 8 && t->target != 9)) continue;
+        const TexBackend *b = t->backend;
+        if (!b || !b->scalable) return true;
+    }
+    return false;
+}
 static void draw_(CmdRec *r, bool indexed);
 static void draw(CmdRec *r, bool indexed) {
     PROFD_T0();
@@ -3338,16 +4015,55 @@ static void draw(CmdRec *r, bool indexed) {
     PROFD_ADD(prof_draw);
 }
 static uint64_t prof_tp_;
+// Asynchronous shaders skip a draw whose program or pipeline is still being built: fine for targets drawn every frame
+// (the next frame has it), not for one drawn once and then only sampled. BOTW's pause menu blurs a capture of the
+// scene once when it opens (the background stayed black) and the save dialog's picture is made once. So a draw into
+// targets no pass drew in the previous frame waits for its shaders, as with synchronous shaders.
+static bool one_shot_target(void) {
+    uint64_t now = renderer_present_count();
+    NvnTexture *ts[9];
+    int n = 0;
+    for (int i = 0; i < st.rt.ncolor && i < 8; i++) if (st.rt.color[i]) ts[n++] = st.rt.color[i];
+    if (!n && st.rt.depth) ts[n++] = st.rt.depth;
+    for (int i = 0; i < n; i++) {
+        TexBackend *b = ts[i]->backend;
+        uint64_t last = !b ? 0 : b->drawn_frame == now ? b->prev_drawn : b->drawn_frame;
+        if (last + 1 < now) return true;
+    }
+    return false;
+}
+
+// Draws into one-shot targets (alpha3-glitches) or texture arrays, 3D and cube textures the game fills once (terrain
+// tiles: region-tests) wait for their program or pipeline instead of being skipped while it builds.
+static void wait_built(_Atomic int *state) {  // (0 building: until built or failed, 5 s at most)
+    if (atomic_load(state) != 0 || sync_shaders()) return;
+    uint64_t t0 = SDL_GetTicksNS();
+    while (atomic_load(state) == 0 && SDL_GetTicksNS() - t0 < 5000000000ull) SDL_Delay(1);
+    stat_build_waits++;
+}
+
 static void draw_(CmdRec *r, bool indexed) {
     if (profd) prof_tp_ = SDL_GetTicksNS();
     if (!st.program) { stat_skipped++; return; }
-    ShaderKey vkey = {0}, fkey = {0};
-    vkey.glsl = fkey.glsl = 1;
-    vkey.flip_y = fkey.flip_y = nvn_window_origin() == 0;
-    vkey.depth_minus_one = nvn_depth_mode() == 0;
-    for (int i = 0; i < st.nattrib; i++) vkey.attr_kind[i] = (uint8_t)attr_kind(st.attrib[i] & 0xFF);
-    for (int i = 0; i < st.rt.ncolor; i++) if (st.rt.color[i]) fkey.rt_kind[i] = (uint8_t)rt_kind(st.rt.color[i]->format);
-    Prog *pr = get_program(st.program, &vkey, &fkey);
+    static int no_key_gen = -1;
+    if (no_key_gen < 0) no_key_gen = getenv("SAVAGEWIND_VK_NO_KEY_GEN") != NULL;
+    static struct { uint64_t gen; uint32_t origin, dmode; NvnProgram *np; Prog *pr; } pm;
+    uint32_t origin = nvn_window_origin(), dmode = nvn_depth_mode();
+    Prog *pr;
+    bool vkey_flip = origin == 0;
+    if (!no_key_gen && pm.pr && pm.gen == key_gen && pm.np == st.program && pm.origin == origin && pm.dmode == dmode) {
+        pr = pm.pr;
+    } else {
+        ShaderKey vkey = {0}, fkey = {0};
+        vkey.glsl = fkey.glsl = 1;
+        vkey.flip_y = fkey.flip_y = origin == 0;
+        vkey.depth_minus_one = dmode == 0;
+        for (int i = 0; i < st.nattrib; i++) vkey.attr_kind[i] = (uint8_t)attr_kind(st.attrib[i] & 0xFF);
+        for (int i = 0; i < st.rt.ncolor; i++) if (st.rt.color[i]) fkey.rt_kind[i] = (uint8_t)rt_kind(st.rt.color[i]->format);
+        pr = get_program(st.program, &vkey, &fkey);
+        pm.gen = key_gen; pm.np = st.program; pm.origin = origin; pm.dmode = dmode; pm.pr = pr;
+    }
+    if (pr && atomic_load(&pr->state) == 0 && (one_shot_target() || draw_must_happen())) wait_built(&pr->state);
     if (!pr || atomic_load(&pr->state) != 1) {
         if (st.rt.ncolor && vk_trace_tex(st.rt.color[0]))
             vk_trace_event(st.rt.color[0], 2, NULL, 0, "draw skipped: program %s", pr ? "not compiled yet" : "missing");
@@ -3366,7 +4082,7 @@ static void draw_(CmdRec *r, bool indexed) {
             // (by code address, like the program table: 512 bytes hashed byte by byte at every fragment shader change
             // cost 1% of the translation)
             static struct { uint64_t fs, hash; } memo[512];
-            uint32_t ms = (uint32_t)(fs >> 4) & 511;
+            uint32_t ms = (uint32_t)((fs * 0x9E3779B97F4A7C15ull) >> 55);  // (code addresses are 256-aligned)
             if (fs && memo[ms].fs == fs) last_hash = memo[ms].hash;
             else {
                 last_hash = fs ? hmix(1469598103934665603ull, (const void *)(uintptr_t)(fs + 0x30), 0x200) : 0;
@@ -3437,9 +4153,37 @@ static void draw_(CmdRec *r, bool indexed) {
                                    pr->fi->out_mask, st.channel_mask, buf);
         }
     }
+    {   // (debugging) SAVAGEWIND_LOG_DRAW_INTO=<target address hex>: each draw into that texture, every frame: the layer,
+        // viewport and scissor, and per sampled texture its object, image state and a hash of its game memory now
+        static uint64_t into = ~0ull;
+        if (into == ~0ull) { const char *e = getenv("SAVAGEWIND_LOG_DRAW_INTO"); into = e ? strtoull(e, NULL, 16) : 0; }
+        if (into && st.rt.ncolor && st.rt.color[0] && st.rt.color[0]->addr == into) {
+            char buf[512];
+            int o = 0;
+            for (int sg = 0; sg < 2; sg++) {
+                ShaderInfo *si = sg ? pr->fi : pr->vi;
+                for (int i = 0; i < si->ntex && o < (int)sizeof buf - 120; i++) {
+                    NvnTexture *t = shader_texture_object(sg, &si->tex[i]);
+                    if (!t) continue;
+                    const TexBackend *b = t->backend;
+                    uint64_t mh = t->addr && t->format == 0x25 && t->target == 1 && t->width <= 1024 && t->height <= 1024
+                                      ? vk_hash_bytes((const void *)(uintptr_t)t->addr, (uint64_t)t->width * t->height * 4) : 0;
+                    o += snprintf(buf + o, sizeof buf - o, " | %c%d #%llu %ux%u@%llx%s img %d up %d dyn %d mem %08llx data %08llx",
+                                  sg ? 't' : 'v', i, (unsigned long long)t->debug_id, t->width, t->height, (unsigned long long)t->addr,
+                                  t->finalized ? " FIN" : "", b != NULL, b ? b->uploaded : 0, b ? b->dynamic : 0,
+                                  (unsigned long long)(mh & 0xFFFFFFFF), (unsigned long long)(b ? b->data_hash & 0xFFFFFFFF : 0));
+                }
+            }
+            LOG("[into] frame %llu layer %u vp %.0f %.0f %.0f %.0f sc %d %d %d %d fs %llx%s\n", (unsigned long long)renderer_present_count(),
+                st.rt.has_cview[0] && (st.rt.cview[0].setmask & 2) ? st.rt.cview[0].min_layer : 0, st.viewport[0][0],
+                st.viewport[0][1], st.viewport[0][2], st.viewport[0][3], st.scissor[0][0], st.scissor[0][1], st.scissor[0][2],
+                st.scissor[0][3], (unsigned long long)st.program->stages[1].code_addr, buf);
+        }
+    }
     fb_draws++;
+    if (lst_on > 0) lst_draw(pr);
     resolve_feedback(pr);
-    scene_upscale(pr, r);
+    scene_post(pr, r);
     snap_reason = "draw-depthwrite";
     if (st.rt.depth && st.ds[0] && st.ds[1]) snapshots_invalidate(st.rt.depth);
     snap_reason = "draw-colorwrite";
@@ -3468,6 +4212,13 @@ static void draw_(CmdRec *r, bool indexed) {
     uint64_t prof_tk_ = profd ? SDL_GetTicksNS() : 0;
     if (profd) prof_pre += prof_tk_ - prof_tp_;
     // ---- pipeline
+    static struct { uint64_t gen; Prog *pr; uint8_t cls, fb; } km;
+    Pipe *pp;
+    if (!no_key_gen && pipe_memo.pp && km.gen == key_gen && km.pr == pr && km.cls == cls && km.fb == draw_feedback) {
+        pp = pipe_memo.pp;
+        goto have_pipe;
+    }
+    km.gen = key_gen; km.pr = pr; km.cls = cls; km.fb = draw_feedback;
     PipeKey k;
     memset(&k, 0, sizeof k);
     k.prog = pr;
@@ -3515,7 +4266,7 @@ static void draw_(CmdRec *r, bool indexed) {
     k.s.a2c = st.ms[0xC] != 0;
     k.s.topo_class = cls;
     k.s.poly_fill = st.poly[2] != 1;
-    Pipe *pp = pipe_memo.pp;
+    pp = pipe_memo.pp;
     if (!pp || memcmp(&pipe_memo.k, &k, sizeof k)) {
         uint64_t ph = hash_words(0xcbf29ce484222325ull, &k, sizeof k);
         if (!ph) ph = 1;
@@ -3527,11 +4278,15 @@ static void draw_(CmdRec *r, bool indexed) {
             pp->k = k;
             pipe_tab[pslot].key = ph;
             pipe_tab[pslot].pipe = pp;
-            run_job(build_pipeline, pp);
+            VkPipeline ready = sync_shaders() ? VK_NULL_HANDLE : warm_ready(pr->vi, pr->fi, &k.s);
+            if (ready) { pp->pipe = ready; atomic_store(&pp->state, 1); atomic_fetch_add(&stat_warm, 1); }
+            else run_job(build_pipeline, pp);
         }
         pipe_memo.k = k;
         pipe_memo.pp = pp;
     }
+have_pipe:
+    if (atomic_load(&pp->state) == 0 && (one_shot_target() || draw_must_happen())) wait_built(&pp->state);
     if (atomic_load(&pp->state) != 1) {
         if (st.rt.ncolor && vk_trace_tex(st.rt.color[0]))
             vk_trace_event(st.rt.color[0], 3, NULL, 0, "draw skipped: pipeline %s", pp->state ? "failed" : "compiling");
@@ -3592,7 +4347,7 @@ static void draw_(CmdRec *r, bool indexed) {
     bool ccw = st.poly[1] == 1;
     static int flipw = -1;  // SAVAGEWIND_VK_FLIP_WINDING: invert the front-face mapping (A/B against Metal)
     if (flipw < 0) flipw = getenv("SAVAGEWIND_VK_FLIP_WINDING") != NULL;
-    bool front_ccw = (ccw != vkey.flip_y) != (flipw != 0);
+    bool front_ccw = (ccw != vkey_flip) != (flipw != 0);
     VkFrontFace ff = front_ccw ? VK_FRONT_FACE_COUNTER_CLOCKWISE : VK_FRONT_FACE_CLOCKWISE;
     if (!DYN_SAME(front, (uint32_t)ff)) vkCmdSetFrontFace(cb, ff);
     VkPrimitiveTopology pt = native ? topo : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
@@ -3634,14 +4389,21 @@ static void draw_(CmdRec *r, bool indexed) {
     // build the vertex set now and the fragment set after the decision (stage_set fills tex_sc for stage 1).
     if (profd) prof_dyn += SDL_GetTicksNS() - prof_td_;
     PROFD_T0();
-    VkDescriptorSet vset = stage_set(pr, pr->set_layout[0], 0, 0, pr->vi, NULL, NULL, 0, 0, 0, NULL);
+    uint32_t dyn[64];
+    int ndyn = 0;
+    VkDescriptorSet vset = stage_set(pr, pr->set_layout[0], 0, 0, pr->vi, NULL, NULL, 0, 0, 0, NULL, dyn, &ndyn);
     PROFD_ADD(prof_sets);
     VkDescriptorImageInfo fii[64];
     uint64_t prof_tx_ = profd ? SDL_GetTicksNS() : 0;
+    sdw_fix.s = 0;
     for (int i = 0; i < pr->fi->ntex && i < 64; i++) {
         float sc[2]; uint32_t wh[2];
         texture_info(1, pr->fi, i, &fii[i], sc, wh);
         tex_sc[1][i][0] = sc[0]; tex_sc[1][i][1] = sc[1]; tex_wh[1][i][0] = wh[0]; tex_wh[1][i][1] = wh[1];
+        if (sc[0] > 1 && wh[0] == wh[1] && !sdw_fix.s) {  // a shadow map made bigger (its texel size: cbuf_info)
+            NvnTexture *t = shader_texture_object(1, &pr->fi->tex[i]);
+            if (t && vk_texture_scale_group(t) == RS_SHADOW) { sdw_fix.gw = wh[0]; sdw_fix.gh = wh[1]; sdw_fix.s = sc[0]; }
+        }
     }
     if (profd) prof_tex += SDL_GetTicksNS() - prof_tx_;
     if (fabsf(pass_sx - pass_sy) > 0.01f * pass_sy && st.rt.ncolor && renderer_texture_presented(st.rt.color[0])) {
@@ -3689,12 +4451,17 @@ static void draw_(CmdRec *r, bool indexed) {
     apply_scissor();
     float rs0[4] = {vp_sx, vp_sy, vp_ox, vp_oy};
     uint64_t prof_t1_ = profd ? SDL_GetTicksNS() : 0;
-    VkDescriptorSet fset = stage_set(pr, pr->set_layout[1], 1, 1, pr->fi, rs0, tint, 0, 0, 0, fii);
+    VkDescriptorSet fset = stage_set(pr, pr->set_layout[1], 1, 1, pr->fi, rs0, tint, 0, 0, 0, fii, dyn, &ndyn);
+    sdw_fix.s = 0;
     if (profd) prof_sets += SDL_GetTicksNS() - prof_t1_;
     VkDescriptorSet sets[2] = {vset, fset};
-    if (dc.layout != pr->layout || dc.sets[0] != vset || dc.sets[1] != fset) {
-        vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pr->layout, 0, 2, sets, 0, NULL);
+    if (ndyn > 32) ndyn = 32;
+    if (dc.layout != pr->layout || dc.sets[0] != vset || dc.sets[1] != fset || dc.ndyn != (uint32_t)ndyn ||
+        memcmp(dc.dyn, dyn, (size_t)ndyn * 4)) {
+        vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pr->layout, 0, 2, sets, (uint32_t)ndyn, dyn);
         dc.layout = pr->layout; dc.sets[0] = vset; dc.sets[1] = fset;
+        dc.ndyn = (uint32_t)ndyn;
+        memcpy(dc.dyn, dyn, (size_t)ndyn * 4);
     }
 
     uint64_t prof_t2_ = profd ? SDL_GetTicksNS() : 0;
@@ -3759,7 +4526,7 @@ static void draw_(CmdRec *r, bool indexed) {
 
     // ---- vertex streams: the range this draw can read, copied once per submission
     for (int s = 0; s < 17; s++) {
-        if (!(k.s.used_streams & (1u << s))) continue;
+        if (!(pipe_memo.k.s.used_streams & (1u << s))) continue;
         VkSpan sp;
         if (s == ZERO_BINDING) {
             static const float zero[4] = {0, 0, 0, 1};
@@ -3782,9 +4549,9 @@ static void draw_(CmdRec *r, bool indexed) {
                 if (base_vertex > 0) max_index += (uint32_t)base_vertex;
                 scan_src = NULL;
             }
-            uint64_t stride = k.s.stride[s], need;
+            uint64_t stride = pipe_memo.k.s.stride[s], need;
             if (!stride) need = 256;
-            else if (k.s.divisor[s]) need = ((uint64_t)base_inst + inst + k.s.divisor[s] - 1) / k.s.divisor[s] * stride + 256;
+            else if (pipe_memo.k.s.divisor[s]) need = ((uint64_t)base_inst + inst + pipe_memo.k.s.divisor[s] - 1) / pipe_memo.k.s.divisor[s] * stride + 256;
             else need = (uint64_t)max_index * stride + 256;
             if (v.size && need > v.size) need = v.size;
             if (!v.addr) { static const uint8_t zero[256]; sp = vk_transient_copy(zero, 256, 16); }
@@ -3798,9 +4565,23 @@ static void draw_(CmdRec *r, bool indexed) {
     }
 
     if (profd) prof_vtx += SDL_GetTicksNS() - prof_t2_;
-    // ---- draw
+    // ---- draw (inside an occlusion query while SAMPLES_PASSED counts)
+    int oq = -1;
+    if (oq_counting && oq_nrun < OQ_RUN && oq_on()) {
+        uint32_t i = oq_next++ % OQ_SLOTS;
+        if (oq_seq[i] != vk_pending_seq()) {  // (not reused within one submission)
+            if (oq_seq[i] > vk_completed_seq()) vk_wait_seq(oq_seq[i]);
+            oq_seq[i] = vk_pending_seq();
+            oq_scale[i] = vp_sx * vp_sy > 0 ? vp_sx * vp_sy : 1;
+            vkCmdResetQueryPool(vk_upload_cmd(), oq_pool, i, 1);
+            vkCmdBeginQuery(cb, oq_pool, i, g_vk.occlusion_precise ? VK_QUERY_CONTROL_PRECISE_BIT : 0);
+            oq_run[oq_nrun++] = i;
+            oq = (int)i;
+        }
+    }
     if (!use_index) vkCmdDraw(cb, count, inst, first, base_inst);
     else vkCmdDrawIndexed(cb, icount, inst, 0, base_vertex, base_inst);
+    if (oq >= 0) vkCmdEndQuery(cb, oq_pool, (uint32_t)oq);
     stat_draws++;
     chunk_draws++;
     if (pr->vi->writes_gmem || pr->fi->writes_gmem) {
@@ -4375,8 +5156,9 @@ static VkPipeline post_pipeline(const char *fs, VkFormat fmt) {
 }
 
 // Post image `i` at w x h in format f (kept until the size or format changes). 0, 1: SMAA edges / weights, 2: SMAA
-// output, 3, 4: FSR EASU / RCAS of the presented image; 5, 6: FSR EASU / RCAS of the 3D scene (scene_upscale).
-enum { POST_IMAGES = 7 };
+// output, 3, 4: FSR EASU / RCAS of the presented image; 5, 6: FSR EASU / RCAS of the 3D scene, 7: its CAS
+// sharpening (scene_post).
+enum { POST_IMAGES = 8 };
 static TexBackend *post_image(int i, uint32_t w, uint32_t h, VkFormat f) {
     static TexBackend img[POST_IMAGES];
     TexBackend *d = &img[i];
@@ -4515,16 +5297,20 @@ static VkImageView post_process(VkCommandBuffer cb, TexBackend *b, double ow_d, 
     return v;
 }
 
-// ---- FSR 1 at the scene -> final image composite (Video > Upscaler: AMD FSR 1). The 3D scene's targets are at the
-// internal resolution (textures.c RS_SCENE), the final image at the window's (RS_OUT), and the game's composite draw
-// would scale the scene up bilinearly. Before that draw, EASU brings the scene to its size in the final image and
-// RCAS sharpens it, in the scene's own format (10-bit: no banding); the draw then samples that at 1:1 (texture_info).
-// SAVAGEWIND_SCENE_FSR=0: the game's own bilinear composite (A/B).
-static void scene_upscale(Prog *pr, CmdRec *r) {
+// ---- The 3D scene at the scene -> final image composite: FSR 1 (Video > Upscaler) and AMD CAS sharpening (Video >
+// Sharpening), on the 3D image only, before the game draws its HUD over it. The 3D scene's targets are at the internal
+// resolution (textures.c RS_SCENE), the final image at the window's (RS_OUT), and the game's composite draw would
+// scale the scene up bilinearly. Before that draw, EASU brings the scene to its size in the final image and RCAS
+// sharpens it; then CAS, if on, sharpens the result (or the native scene, with the upscaler off), all in the scene's
+// own format (10-bit: no banding); the draw then samples that at 1:1 (texture_info). SAVAGEWIND_SCENE_FSR=0: the
+// game's own bilinear composite (A/B); SAVAGEWIND_SCENE_CAS=0: no sharpening whatever the setting.
+static void scene_post(Prog *pr, CmdRec *r) {
     scene_up.t = NULL;
-    static int on = -1;
-    if (on < 0) on = getenv("SAVAGEWIND_SCENE_FSR") ? atoi(getenv("SAVAGEWIND_SCENE_FSR")) : 1;
-    if (!on || g_settings.upscaler != UPSCALE_FSR1) return;
+    static int fsr_on = -1, cas_on = -1;
+    if (fsr_on < 0) fsr_on = getenv("SAVAGEWIND_SCENE_FSR") ? atoi(getenv("SAVAGEWIND_SCENE_FSR")) : 1;
+    if (cas_on < 0) cas_on = getenv("SAVAGEWIND_SCENE_CAS") ? atoi(getenv("SAVAGEWIND_SCENE_CAS")) : 1;
+    bool fsr = fsr_on && g_settings.upscaler == UPSCALE_FSR1, cas = cas_on && g_settings.sharpening > 0;
+    if (!fsr && !cas) return;
     NvnTexture *rt = st.rt.ncolor ? st.rt.color[0] : NULL;
     if (!rt || r->x[2] > 6 || !pr->fi->ntex || vk_texture_scale_group(rt) != RS_OUT) return;
     const float *vp = st.viewport[0];
@@ -4540,30 +5326,48 @@ static void scene_upscale(Prog *pr, CmdRec *r) {
         if (!t || t->target != 1 || vk_texture_scale_group(t) != RS_SCENE || t->width * 2 < vp[2] || t->height * 2 < vp[3]) continue;
         TexBackend *b = vk_tex(t, false);
         if (!b->image || b->layers != 1 || b->samples != 1 || b->depth != 1 || (b->aspect & ~VK_IMAGE_ASPECT_COLOR_BIT)) continue;
-        if (ow <= b->width + 1 && oh <= b->height + 1) return;  // (at its size in the window already: the upscaler is off)
+        bool up = fsr && (ow > b->width + 1 || oh > b->height + 1);  // (else at its size in the window already)
+        if (!up && !cas) return;
         VkFormatProperties fp;
         vkGetPhysicalDeviceFormatProperties(g_vk.phys, b->format, &fp);
         if (!(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT)) continue;
         vk_end_pass();
         VkCommandBuffer cb = vk_cmd();
-        TexBackend *e = post_image(5, ow, oh, b->format), *o = post_image(6, ow, oh, b->format);
-        float iw = (float)b->width, ih = (float)b->height;
-        float pe[8] = {iw / ow, ih / oh, 0.5f * iw / ow - 0.5f, 0.5f * ih / oh - 0.5f, iw, ih};
         static const VkComponentMapping id = {0};
-        VkImageView in[3] = {vk_image_view(b, VK_IMAGE_VIEW_TYPE_2D, b->format, 0, 1, 0, 1, id, VK_IMAGE_ASPECT_COLOR_BIT)};
-        post_pass(cb, "easu.frag", in, 1, e, pe, false);
-        float pr_[8] = {exp2f(-0.2f), 0, 0, 0, (float)ow, (float)oh};  // (sharpness 0.2 stops: AMD's default)
-        VkImageView ri[3] = {post_view(e)};
-        post_pass(cb, "rcas.frag", ri, 1, o, pr_, false);
+        VkImageView src = vk_image_view(b, VK_IMAGE_VIEW_TYPE_2D, b->format, 0, 1, 0, 1, id, VK_IMAGE_ASPECT_COLOR_BIT);
+        uint32_t w = b->width, h = b->height;
+        TexBackend *out = NULL;
+        if (up) {
+            TexBackend *e = post_image(5, ow, oh, b->format), *o = post_image(6, ow, oh, b->format);
+            float iw = (float)b->width, ih = (float)b->height;
+            float pe[8] = {iw / ow, ih / oh, 0.5f * iw / ow - 0.5f, 0.5f * ih / oh - 0.5f, iw, ih};
+            VkImageView in[3] = {src};
+            post_pass(cb, "easu.frag", in, 1, e, pe, false);
+            float pr_[8] = {exp2f(-0.2f), 0, 0, 0, (float)ow, (float)oh};  // (sharpness 0.2 stops: AMD's default)
+            VkImageView ri[3] = {post_view(e)};
+            post_pass(cb, "rcas.frag", ri, 1, o, pr_, false);
+            src = post_view(o);
+            out = o;
+            w = ow; h = oh;
+        }
+        if (cas) {
+            TexBackend *c = post_image(7, w, h, b->format);
+            float pc[8] = {g_settings.sharpening / 10.0f, 0, 0, 0, (float)w, (float)h};
+            VkImageView ci[3] = {src};
+            post_pass(cb, "cas.frag", ci, 1, c, pc, false);
+            out = c;
+        }
         vk_full_barrier(cb);
         scene_up.t = t;
-        scene_up.view = post_view(o);
-        scene_up.sx = (float)ow / (float)t->width;
-        scene_up.sy = (float)oh / (float)t->height;
+        scene_up.img = out;
+        scene_up.sx = (float)w / (float)t->width;
+        scene_up.sy = (float)h / (float)t->height;
         static uint32_t lw, lh, low, loh;
-        if (b->width != lw || b->height != lh || ow != low || oh != loh)
-            LOG("[post] scene %ux%u -> fsr1 %ux%u (format %d)\n", b->width, b->height, ow, oh, b->format);
-        lw = b->width; lh = b->height; low = ow; loh = oh;
+        static int lcas = -1;
+        if (b->width != lw || b->height != lh || w != low || h != loh || g_settings.sharpening != lcas)
+            LOG("[post] scene %ux%u%s -> %ux%u%s (format %d)\n", b->width, b->height, up ? " fsr1" : "", w, h,
+                cas ? " cas" : "", b->format);
+        lw = b->width; lh = b->height; low = w; loh = h; lcas = g_settings.sharpening;
         return;
     }
 }
@@ -4671,8 +5475,123 @@ static void save_view_png(TexBackend *b, VkImageView src, const char *path) {
 }
 
 // ================================================================== executor (renderer.m exec_list)
+// (measuring) SAVAGEWIND_VK_LIST_STATS=1: how self-contained the command lists a frame calls are (whether each could be
+// translated on its own): per list, the state its draws use that it did not set itself, and UpdateUniformBuffer writes
+// another list's draws read. A "[lists]" line every 120 presents.
+static struct { uint32_t set, inh, ubuf_set[2], tex_set[2], ubuf_inh, tex_inh; int draws, uub; } lst[8];
+static struct { uint64_t lists, self, draws, self_draws, uub_lists, uub, cross, cat[32], ubuf_inh, tex_inh; } lsum;
+static struct { uint64_t lo, hi; int list; } lst_uub[256];
+static int lst_nuub, lst_id, lst_cur[8];
+static uint32_t lst_cat(uint32_t op) {
+    switch (op) {
+    case CMD_BIND_PROGRAM: return 1u << 0;
+    case CMD_BIND_BLEND: return 1u << 1;
+    case CMD_BIND_CHANNEL_MASK: return 1u << 2;
+    case CMD_BIND_COLOR: return 1u << 3;
+    case CMD_BIND_DEPTH_STENCIL: return 1u << 4;
+    case CMD_BIND_MULTISAMPLE: return 1u << 5;
+    case CMD_BIND_POLYGON: return 1u << 6;
+    case CMD_BIND_VERTEX_ATTRIB: return 1u << 7;
+    case CMD_BIND_VERTEX_STREAM: return 1u << 8;
+    case CMD_BIND_VERTEX_BUFFERS: return 1u << 9;
+    case CMD_SET_TEXTURE_POOL: return 1u << 10;
+    case CMD_SET_SAMPLER_POOL: return 1u << 11;
+    case CMD_SET_RENDER_TARGETS: return 1u << 12;
+    case CMD_SET_VIEWPORTS: return 1u << 13;
+    case CMD_SET_SCISSORS: return 1u << 14;
+    case CMD_SET_DEPTH_RANGES: return 1u << 15;
+    case CMD_SET_BLEND_COLOR: return 1u << 16;
+    case CMD_SET_STENCIL: return 1u << 17;
+    case CMD_SET_POLYGON_OFFSET: return 1u << 18;
+    case CMD_SET_PRIMITIVE_RESTART: return 1u << 19;
+    case CMD_SET_LINE_WIDTH: return 1u << 20;
+    case CMD_SET_DEPTH_CLAMP: return 1u << 21;
+    case CMD_BIND_STORAGE_BUFFERS: return 1u << 22;
+    default: return 0;
+    }
+}
+static const char *const lst_names[] = {"program", "blend", "chmask", "color", "depthstencil", "multisample", "polygon",
+                                        "vattrib", "vstream", "vbuffers", "texpool", "samplerpool", "targets", "viewports",
+                                        "scissors", "depthranges", "blendcolor", "stencil", "polyoffset", "restart",
+                                        "linewidth", "depthclamp", "storage"};
+static void lst_begin(int depth) {
+    if (depth < 1 || depth > 7) return;
+    memset(&lst[depth], 0, sizeof lst[depth]);
+    lst_cur[depth] = ++lst_id;
+}
+static void lst_op(int depth, CmdRec *r) {
+    if (depth < 1 || depth > 7) return;
+    lst[depth].set |= lst_cat(r->op);
+    if (r->op == CMD_BIND_UNIFORM_BUFFERS && r->x[0] < 2)
+        for (uint64_t i = 0; i < r->x[2] && r->x[1] + i < 18; i++) lst[depth].ubuf_set[r->x[0]] |= 1u << (r->x[1] + i);
+    if ((r->op == CMD_BIND_TEXTURES || r->op == CMD_BIND_TEXTURES_DEFERRED) && r->x[0] < 2)
+        for (uint64_t i = 0; i < r->x[2] && r->x[1] + i < 32; i++) lst[depth].tex_set[r->x[0]] |= 1u << (r->x[1] + i);
+    if (r->op == CMD_UPDATE_UNIFORM_BUFFER) {
+        lst[depth].uub++;
+        if (lst_nuub < 256) lst_uub[lst_nuub++] = (__typeof__(lst_uub[0])){r->x[0] + r->x[2], r->x[0] + r->x[2] + r->x[3], lst_cur[depth]};
+    }
+}
+static int lst_depth;  // (the list the draw in progress is in)
+static void lst_draw(Prog *pr) {
+    int d = lst_depth;
+    if (d < 1 || d > 7) return;
+    uint32_t all = (1u << 23) - 1 - (1u << 21) - (1u << 22);  // (depth clamp, storage: not always used)
+    lst[d].inh |= all & ~lst[d].set;
+    lst[d].draws++;
+    ShaderInfo *si[2] = {pr->vi, pr->fi};
+    for (int sg = 0; sg < 2; sg++) {
+        uint32_t used = 0;
+        for (int k = 3; k < 21; k++) if (si[sg]->cbuf_mask & (1u << k)) used |= 1u << (k - 3);
+        if (used & ~lst[d].ubuf_set[sg]) lst[d].ubuf_inh = 1;
+        uint32_t tu = 0;
+        for (int i = 0; i < si[sg]->ntex; i++) {
+            int slot = ((int)si[sg]->tex[i].handle_offset - 0x20) / 8;
+            if (slot >= 0 && slot < 32) tu |= 1u << slot;
+        }
+        if (tu & ~lst[d].tex_set[sg]) lst[d].tex_inh = 1;
+        for (int i = 0; i < 18; i++) {  // a constant buffer another list's UpdateUniformBuffer wrote
+            Range u = st.ubuf[sg][i];
+            if (!u.addr || !(used & (1u << i))) continue;
+            for (int k = 0; k < lst_nuub; k++)
+                if (lst_uub[k].list != lst_cur[d] && u.addr < lst_uub[k].hi && lst_uub[k].lo < u.addr + (u.size ? u.size : 256)) {
+                    lsum.cross++;
+                    break;
+                }
+        }
+    }
+}
+static void lst_end(int depth) {
+    if (depth < 1 || depth > 7) return;
+    lsum.lists++;
+    lsum.draws += lst[depth].draws;
+    uint32_t inh = lst[depth].inh & ~((1u << 10) | (1u << 11));  // (the pools: set once a frame at the top)
+    if (!inh && !lst[depth].ubuf_inh && !lst[depth].tex_inh) { lsum.self++; lsum.self_draws += lst[depth].draws; }
+    for (int b = 0; b < 23; b++) if (lst[depth].draws && (lst[depth].inh >> b & 1)) lsum.cat[b]++;
+    if (lst[depth].draws) { lsum.ubuf_inh += lst[depth].ubuf_inh; lsum.tex_inh += lst[depth].tex_inh; }
+    if (lst[depth].uub) { lsum.uub_lists++; lsum.uub += lst[depth].uub; }
+}
+void vk_list_stats_frame(void) {  // (device.c, each present)
+    if (lst_on <= 0) return;
+    static int n;
+    lst_nuub = 0;
+    if (++n % 120) return;
+    char buf[1024];
+    int o = snprintf(buf, sizeof buf, "[lists] 120 frames: %llu lists (%llu with draws self-contained, %llu of %llu draws), "
+                     "%llu lists with %llu UpdateUniformBuffer, %llu constant-buffer bindings read another list's; "
+                     "inherited by lists with draws: ubuf %llu tex %llu", (unsigned long long)lsum.lists,
+                     (unsigned long long)lsum.self, (unsigned long long)lsum.self_draws, (unsigned long long)lsum.draws,
+                     (unsigned long long)lsum.uub_lists, (unsigned long long)lsum.uub, (unsigned long long)lsum.cross,
+                     (unsigned long long)lsum.ubuf_inh, (unsigned long long)lsum.tex_inh);
+    for (int b = 0; b < 23 && o < (int)sizeof buf - 40; b++)
+        if (lsum.cat[b]) o += snprintf(buf + o, sizeof buf - o, " %s %llu", lst_names[b], (unsigned long long)lsum.cat[b]);
+    LOG("%s\n", buf);
+    memset(&lsum, 0, sizeof lsum);
+}
+
 static void exec_list(uint64_t handle, int depth) {
     uint64_t p = handle;
+    if (lst_on < 0) lst_on = getenv("SAVAGEWIND_VK_LIST_STATS") != NULL;
+    if (lst_on) lst_begin(depth);
     for (int guard = 0; guard < 10000000; guard++) {
         CmdRec *r = (CmdRec *)(uintptr_t)p;
         void *x = r->extra;
@@ -4683,14 +5602,28 @@ static void exec_list(uint64_t handle, int depth) {
         if (g_debug_frame && getenv("SAVAGEWIND_LOG_OPS"))
             LOG("[op] %u depth %d: %llx %llx %llx %llx %llx\n", r->op, depth, (unsigned long long)r->x[0], (unsigned long long)r->x[1],
                 (unsigned long long)r->x[2], (unsigned long long)r->x[3], (unsigned long long)r->x[4]);
+        if (lst_on) { lst_op(depth, r); lst_depth = depth; }
+        switch (r->op) {  // (key_gen: what the program and pipeline keys read)
+        case CMD_BIND_PROGRAM: case CMD_BIND_BLEND: case CMD_BIND_CHANNEL_MASK: case CMD_BIND_COLOR: case CMD_BIND_MULTISAMPLE:
+        case CMD_BIND_POLYGON: case CMD_BIND_VERTEX_ATTRIB: case CMD_BIND_VERTEX_STREAM: case CMD_SET_RENDER_TARGETS:
+        case CMD_SET_DEPTH_CLAMP:
+            key_gen++;
+            break;
+        default: break;
+        }
         switch (r->op) {
-        case CMD_END: return;
+        case CMD_END:
+            if (lst_on) lst_end(depth);
+            return;
         case CMD_JUMP: p = r->x[0]; continue;
         case CMD_CALL: {
             const uint64_t *h = x;
             if (g_debug_frame && getenv("SAVAGEWIND_LOG_OPS"))
                 for (uint64_t i = 0; i < r->x[0] && i < 8; i++) LOG("[call] depth %d -> %llx\n", depth, (unsigned long long)h[i]);
-            for (uint64_t i = 0; i < r->x[0] && depth < 8; i++) exec_list(h[i], depth + 1);
+            for (uint64_t i = 0; i < r->x[0] && depth < 8; i++) {
+                if (i + 1 < r->x[0]) __builtin_prefetch((const void *)(uintptr_t)h[i + 1]);  // (~2800 calls a frame)
+                exec_list(h[i], depth + 1);
+            }
             break;
         }
         case CMD_BIND_PROGRAM: st.program = (NvnProgram *)(uintptr_t)r->x[0]; break;
@@ -4903,10 +5836,25 @@ static void exec_list(uint64_t handle, int depth) {
             static uint64_t frame_seen = ~0ull, frame_ts;
             extern uint64_t vk_frame_counter(void);
             if (frozen && vk_frame_counter() != frame_seen) { frame_seen = vk_frame_counter(); frame_ts = SDL_GetTicksNS(); }
+            uint64_t ts = frozen ? frame_ts : SDL_GetTicksNS();
+            if (type == 1 && out && oq_on()) {  // SAMPLES_PASSED: written once the queries' submission is done
+                pthread_mutex_lock(&readback_lock);
+                if (oq_nreports == 32) { pthread_mutex_unlock(&readback_lock); renderer_flush(); pthread_mutex_lock(&readback_lock); oq_apply(); }
+                if (oq_nreports < 32) {
+                    OqReport *p = &oq_reports[oq_nreports++];
+                    p->addr = r->x[1]; p->seq = vk_pending_seq(); p->ts = ts; p->nq = oq_nrun;
+                    memcpy(p->q, oq_run, sizeof p->q[0] * (size_t)oq_nrun);
+                }
+                pthread_mutex_unlock(&readback_lock);
+                break;
+            }
             kernel_watch_write("ReportCounter", r->x[1], 16);
-            if (out) { out[0] = 0; out[1] = frozen ? frame_ts : SDL_GetTicksNS(); }
+            if (out) { out[0] = 0; out[1] = ts; }
             break;
         }
+        case CMD_RESET_COUNTER:
+            if (r->x[0] == 1) { oq_counting = true; oq_nrun = 0; }  // SAMPLES_PASSED
+            break;
         case CMD_COPY_TEXTURE_TO_TEXTURE: { const TexRefRec *t = x; copy_texture(&t[0], &t[1], r->x[6]); break; }
         case CMD_DOWNSAMPLE: { const TexRefRec *t = x; copy_texture(&t[0], &t[1], 1); break; }
         case CMD_COPY_BUFFER_TO_TEXTURE: copy_buffer_to_texture(r->x[0], x); break;

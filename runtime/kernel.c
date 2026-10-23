@@ -384,7 +384,7 @@ static KThread *thread_new(uint64_t entry, uint64_t arg, uint64_t stack_top, int
     pthread_cond_init(&t->cond, NULL);
     t->obj.type = KOBJ_THREAD;
     t->entry = entry;
-    t->prio = prio;
+    t->prio = t->base_prio = prio;
     t->core = core < 0 ? 0 : core & 3;  // (-2: the process's default core, 0)
     t->core_held = -1;
     t->id = next_thread_id++;
@@ -449,6 +449,53 @@ static bool mutex_acquire_or_mark(uint64_t m, uint32_t tag) {
 }
 
 // Pick a thread waiting on mutex `addr` and give it ownership. Caller holds g_klock.
+// Priority inheritance, as Horizon does for its mutexes: a thread holding a mutex runs at the best priority of the
+// threads waiting for it (and that passes on along a chain of mutex waits). BOTW's main thread waits once a second for
+// a mutex a job thread of priority 48 holds; the job thread then waited for its core behind threads the main thread
+// is better than. SAVAGEWIND_NO_PRIO_INHERIT=1: off. (g_klock held for all of these.)
+static bool prio_inherit_on(void) {
+    static int on = -1;
+    if (on < 0) on = getenv("SAVAGEWIND_NO_PRIO_INHERIT") == NULL;
+    return on;
+}
+
+static void prio_set(KThread *t, int p) {
+    if (t->prio == p) return;
+    t->prio = p;
+    if (!cores_on() || t->off_cores) return;
+    Core *k = &g_cores[t->core & 3];  // (waiting for its core or holding it: the waiters' order and the best wait change)
+    pthread_mutex_lock(&k->m);
+    core_best_update(k);
+    pthread_cond_broadcast(&k->cv);
+    pthread_mutex_unlock(&k->m);
+}
+
+static uint32_t mutex_owner(uint64_t addr) { return __atomic_load_n(u32p(addr), __ATOMIC_SEQ_CST) & ~WAITERS_BIT; }
+
+// The priority t should run at: its own, or the best of the threads waiting for a mutex it holds.
+static void prio_refresh(KThread *t) {
+    int p = t->base_prio;
+    if (prio_inherit_on())
+        for (KThread *w = g_waitlist; w; w = w->wnext)
+            if (w->wait_kind == WAIT_MUTEX && w->prio < p && mutex_owner(w->wait_addr) == t->handle) p = w->prio;
+    prio_set(t, p);
+}
+
+// waiter starts waiting for the mutex at addr: its owner (and the owner of a mutex that one waits for...) runs at least
+// at waiter's priority.
+static void prio_boost_owner(KThread *waiter, uint64_t addr) {
+    if (!prio_inherit_on()) return;
+    for (int depth = 0; depth < 8; depth++) {
+        KObject *o = handle_get(mutex_owner(addr));
+        if (!o || o->type != KOBJ_THREAD) return;
+        KThread *owner = (KThread *)o;
+        if (owner == waiter || owner->prio <= waiter->prio) return;
+        prio_set(owner, waiter->prio);
+        if (owner->wait_kind != WAIT_MUTEX) return;
+        addr = owner->wait_addr;
+    }
+}
+
 static void mutex_release(uint64_t addr) {
     KThread *next = NULL;
     int count = 0;
@@ -460,11 +507,16 @@ static void mutex_release(uint64_t addr) {
     }
     if (!next) {
         __atomic_store_n(u32p(addr), 0, __ATOMIC_SEQ_CST);
+        if (prio_inherit_on() && t_cur && t_cur->prio != t_cur->base_prio) prio_refresh(t_cur);
         return;
     }
     __atomic_store_n(u32p(addr), next->handle | (count > 1 ? WAITERS_BIT : 0), __ATOMIC_SEQ_CST);
     next->wait_kind = WAIT_NONE;
     next->wait_result = R_OK;
+    if (prio_inherit_on()) {
+        prio_refresh(next);  // (the other waiters now wait for it)
+        if (t_cur && t_cur != next) prio_refresh(t_cur);  // (the one letting go: back to its own, or another mutex's)
+    }
     wake(next);
 }
 
@@ -530,6 +582,7 @@ static uint32_t svc_arbitrate_lock(uint32_t owner, uint64_t addr, uint32_t tag) 
     t->wait_kind = WAIT_MUTEX;
     t->wait_addr = addr;
     t->wait_tag = tag;
+    prio_boost_owner(t, addr);
     uint32_t r = block_current(-1);
     pthread_mutex_unlock(&g_klock);
     return r == R_CANCELLED ? R_OK : r;
@@ -564,6 +617,7 @@ static uint32_t svc_wait_process_wide_key(uint64_t mutex, uint64_t key, uint32_t
         if (!mutex_acquire_or_mark(mutex, tag)) {
             t->wait_kind = WAIT_MUTEX;
             t->wait_addr = mutex;
+            prio_boost_owner(t, mutex);
             block_current(-1);
         }
     }
@@ -591,6 +645,7 @@ static void svc_signal_process_wide_key(uint64_t key, int32_t count) {
         } else {
             best->wait_kind = WAIT_MUTEX;
             best->wait_addr = m;
+            prio_boost_owner(best, m);
         }
     }
     for (KThread *t = g_waitlist; t; t = t->wnext)
@@ -853,7 +908,12 @@ static void svc_impl(Cpu *c, uint32_t imm, uint64_t pc) {
     }
     case 0x0D: {  // SetThreadPriority
         KObject *o = handle_get((uint32_t)x[0]);
-        if (o) ((KThread *)o)->prio = (int)x[1];
+        if (o) {
+            pthread_mutex_lock(&g_klock);
+            ((KThread *)o)->base_prio = (int)x[1];
+            prio_refresh((KThread *)o);
+            pthread_mutex_unlock(&g_klock);
+        }
         x[0] = o ? R_OK : R_INVALID_HANDLE;
         break;
     }
@@ -1096,6 +1156,23 @@ static bool guest_mapped(uint64_t a, uint64_t n) {
     for (int i = 0; i < nregions; i++)
         if (a >= regions[i].addr && a + n <= regions[i].addr + regions[i].size) return true;
     return false;
+}
+
+// The current guest thread's lr and frame-record chain as of its last call boundary (dispatch.c, SAVAGEWIND_WATCH:
+// who called the memcpy that wrote a watched range).
+void kernel_log_guest_chain(void) {
+    KThread *t = t_cur;
+    if (!t) return;
+    fprintf(stderr, "[watch]   guest lr %llx chain", (unsigned long long)t->cpu.x[30]);
+    uint64_t fp = t->cpu.x[29];
+    for (int i = 0; i < 10 && fp && !(fp & 7) && guest_mapped(fp, 16); i++) {
+        const uint64_t *rec = (const uint64_t *)(uintptr_t)fp;
+        if (!rec[1]) break;
+        fprintf(stderr, " %llx", (unsigned long long)rec[1]);
+        if (rec[0] <= fp) break;
+        fp = rec[0];
+    }
+    fprintf(stderr, "\n");
 }
 
 static void dump_threads(void) {

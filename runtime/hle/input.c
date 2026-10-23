@@ -2,7 +2,8 @@
 //
 // Both go through the player's bindings (runtime/hle/bindings.c has the defaults: keyboard and mouse laid out for
 // BOTW, controller by position, Switch A = east). Keyboard bindings can name mouse buttons; the mouse's motion turns
-// the camera (the right stick) while the cursor is held in the window.
+// the camera (the right stick) while the cursor is held in the window, or tilts the controller while the tilt key is
+// held (motion controls: runtime/hle/motion.c, which also takes the controller's gyroscope and accelerometer).
 #include <SDL3/SDL.h>
 #include <ctype.h>
 #include <math.h>
@@ -15,6 +16,7 @@
 #include "../nvn/renderer.h"
 #include "../settings.h"
 #include "../input_bind.h"
+#include "../motion.h"
 
 enum {
     BTN_A = 0, BTN_B, BTN_X, BTN_Y, BTN_LSTICK, BTN_RSTICK, BTN_L, BTN_R, BTN_ZL, BTN_ZR, BTN_PLUS, BTN_MINUS,
@@ -35,6 +37,9 @@ static uint8_t test_keys[SDL_SCANCODE_COUNT];
 static _Atomic uint32_t test_pad;
 static _Atomic int32_t test_lx, test_ly;  // (a resting stick's drift: "lstick" in SAVAGEWIND_HOST_INPUT)
 static bool host_test;  // (then a real controller is left out: the player's own pad must not spoil the test)
+static _Atomic int last_device;  // DEVICE_*: what the player used last
+static bool tilt_held;  // the tilt key: the mouse tilts the controller instead of turning the camera
+extern bool menu_input_captured(void);  // runtime/ui/menu.mm: overlay menu or name entry up (it has the keys / pad)
 
 static int held_key(int sc) {
     if (sc > BIND_MOUSE && sc <= BIND_MOUSE_LAST) return mouse_down[sc - BIND_MOUSE];
@@ -52,6 +57,8 @@ static void recompute_keyboard(void) {
     key_ly = (held_key(g_bind_key[BIND_LS_UP]) - held_key(g_bind_key[BIND_LS_DOWN])) * tilt;
     key_rx = (held_key(g_bind_key[BIND_RS_RIGHT]) - held_key(g_bind_key[BIND_RS_LEFT])) * 32767;
     key_ry = (held_key(g_bind_key[BIND_RS_UP]) - held_key(g_bind_key[BIND_RS_DOWN])) * 32767;
+    bool tilt_key = held_key(g_bind_key[BIND_TILT]) && !menu_input_captured();
+    if (tilt_key != tilt_held) motion_tilt_held(tilt_held = tilt_key);
 }
 
 // Controller buttons (and the triggers as buttons) -> Switch buttons through g_bind_pad; the sticks stay the sticks.
@@ -116,7 +123,6 @@ static void mouse_stick(int32_t *x, int32_t *y) {
 }
 
 // Main thread, every window loop turn (runtime/nvn/vulkan/device.c ui_run): hold or free the cursor.
-extern bool menu_input_captured(void);  // runtime/ui/menu.mm: overlay menu or name entry up (it has the keys / pad)
 extern bool menu_cursor_free(void);     // runtime/ui/menu.mm: Esc freed the cursor (a click in the window holds it)
 static bool win_focused = true;         // (main thread: window events and input_mouse_update)
 void input_mouse_update(SDL_Window *w) {
@@ -163,13 +169,17 @@ bool input_user_blocked(const SDL_Event *e) {
     case SDL_EVENT_MOUSE_MOTION: case SDL_EVENT_MOUSE_BUTTON_DOWN: case SDL_EVENT_MOUSE_BUTTON_UP:
     case SDL_EVENT_MOUSE_WHEEL:
     case SDL_EVENT_GAMEPAD_ADDED: case SDL_EVENT_GAMEPAD_AXIS_MOTION: case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
-    case SDL_EVENT_GAMEPAD_BUTTON_UP: case SDL_EVENT_JOYSTICK_ADDED: case SDL_EVENT_JOYSTICK_AXIS_MOTION:
-    case SDL_EVENT_JOYSTICK_BUTTON_DOWN: case SDL_EVENT_JOYSTICK_BUTTON_UP:
+    case SDL_EVENT_GAMEPAD_BUTTON_UP: case SDL_EVENT_GAMEPAD_SENSOR_UPDATE: case SDL_EVENT_JOYSTICK_ADDED:
+    case SDL_EVENT_JOYSTICK_AXIS_MOTION: case SDL_EVENT_JOYSTICK_BUTTON_DOWN: case SDL_EVENT_JOYSTICK_BUTTON_UP:
         return true;
     default:
         return false;
     }
 }
+
+// The device the player used last (button icons, runtime/nvn/glyphs.c): a key, a mouse button or a mouse turn, or a
+// controller's button or stick
+int input_last_device(void) { return pad ? last_device : DEVICE_KEYBOARD; }
 
 // Controller family for the Controls tab labels (runtime/hle/bindings.c): 0 Nintendo / other / none, 1 Xbox, 2 PlayStation.
 // SAVAGEWIND_PAD_TYPE=xbox|playstation|nintendo pretends one is attached (tests).
@@ -200,6 +210,7 @@ void input_handle_event(const SDL_Event *e) {
         int n = 0;
         SDL_JoystickID *ids = SDL_GetGamepads(&n);
         if (n > 0 && !pad) { pad = SDL_OpenGamepad(ids[0]); LOG("[input] gamepad: %s\n", SDL_GetGamepadName(pad)); note_family(); }
+        if (pad) motion_pad_opened(pad);
         SDL_free(ids);
     }
     switch (e->type) {
@@ -212,16 +223,21 @@ void input_handle_event(const SDL_Event *e) {
             LOG("[input] F8: SAVAGEWIND_SKIP_FSHASH shaders %s\n", g_skip_fs_off ? "drawn" : "skipped");
         }
         if (e->key.scancode < SDL_SCANCODE_COUNT) keys_down[e->key.scancode] = e->type == SDL_EVENT_KEY_DOWN;
+        if (e->type == SDL_EVENT_KEY_DOWN) last_device = DEVICE_KEYBOARD;
         recompute_keyboard();
         break;
     case SDL_EVENT_MOUSE_MOTION:
-        if (mouse_held) {
+        if ((tilt_held || mouse_held) && fabsf(e->motion.xrel) + fabsf(e->motion.yrel) > 4) last_device = DEVICE_KEYBOARD;
+        if (tilt_held) {
+            motion_mouse(e->motion.xrel, e->motion.yrel);
+        } else if (mouse_held) {
             mouse_dx_milli += (int64_t)lround(e->motion.xrel * 1000);
             mouse_dy_milli += (int64_t)lround(e->motion.yrel * 1000);
         }
         break;
     case SDL_EVENT_MOUSE_BUTTON_DOWN: case SDL_EVENT_MOUSE_BUTTON_UP:
         if (e->button.button < sizeof mouse_down && mouse_held) {
+            if (e->type == SDL_EVENT_MOUSE_BUTTON_DOWN) last_device = DEVICE_KEYBOARD;
             mouse_down[e->button.button] = e->type == SDL_EVENT_MOUSE_BUTTON_DOWN;
             recompute_keyboard();
         }
@@ -230,13 +246,29 @@ void input_handle_event(const SDL_Event *e) {
         win_focused = e->type == SDL_EVENT_WINDOW_FOCUS_GAINED;
         break;
     case SDL_EVENT_GAMEPAD_ADDED:
-        if (!pad) { pad = SDL_OpenGamepad(e->gdevice.which); LOG("[input] gamepad: %s\n", SDL_GetGamepadName(pad)); note_family(); }
+        if (!pad) {
+            pad = SDL_OpenGamepad(e->gdevice.which);
+            LOG("[input] gamepad: %s\n", SDL_GetGamepadName(pad));
+            note_family();
+            if (pad) motion_pad_opened(pad);
+        }
         break;
     case SDL_EVENT_GAMEPAD_REMOVED:
-        if (pad && SDL_GetGamepadID(pad) == e->gdevice.which) { SDL_CloseGamepad(pad); pad = NULL; note_family(); }
+        if (pad && SDL_GetGamepadID(pad) == e->gdevice.which) {
+            SDL_CloseGamepad(pad);
+            pad = NULL;
+            note_family();
+            motion_pad_closed();
+        }
         recompute_pad();
         break;
+    case SDL_EVENT_GAMEPAD_SENSOR_UPDATE:
+        if (pad && !host_test && SDL_GetGamepadID(pad) == e->gsensor.which) motion_sensor_event(e);
+        break;
     case SDL_EVENT_GAMEPAD_AXIS_MOTION: case SDL_EVENT_GAMEPAD_BUTTON_DOWN: case SDL_EVENT_GAMEPAD_BUTTON_UP:
+        if (pad && !host_test && (e->type == SDL_EVENT_GAMEPAD_BUTTON_DOWN ||
+                                  (e->type == SDL_EVENT_GAMEPAD_AXIS_MOTION && abs(e->gaxis.value) > 16000)))
+            last_device = DEVICE_PAD;
         recompute_pad();
         break;
     }
@@ -244,7 +276,8 @@ void input_handle_event(const SDL_Event *e) {
 
 // Scripted input for testing: SAVAGEWIND_INPUT="frame:BUTTON:frames,..." (BUTTON = A,B,X,Y,L,R,ZL,ZR,PLUS,
 // MINUS,LEFT,UP,RIGHT,DOWN, or STICK_UP/DOWN/LEFT/RIGHT, RSTICK_UP/DOWN/LEFT/RIGHT, STICK_<degrees>: full tilt at
-// that angle, 0 = right, 90 = up).
+// that angle, 0 = right, 90 = up; motion: TILT_UP/DOWN/LEFT/RIGHT hold the controller tilted 30 degrees that way,
+// TURN_LEFT/RIGHT turn it 90 degrees per second, TURN_UP/DOWN 60).
 static _Atomic uint64_t script_buttons;
 static _Atomic int32_t script_lx, script_ly, script_rx, script_ry;
 
@@ -407,6 +440,7 @@ void input_frame(uint64_t frame) {
                                         "MINUS", "LEFT", "UP", "RIGHT", "DOWN"};
     uint64_t b = 0;
     int32_t lx = 0, ly = 0, rx = 0, ry = 0;
+    float tilt_p = 0, tilt_r = 0, turn_p = 0, turn_y = 0;
     static char buf[16384];  // (long scripted sessions: the perf walk is ~4 KB)
     snprintf(buf, sizeof buf, "%s", spec);
     for (char *tok = strtok(buf, ","); tok; tok = strtok(NULL, ",")) {
@@ -422,6 +456,14 @@ void input_frame(uint64_t frame) {
         else if (!strcmp(name, "RSTICK_DOWN")) ry = -32767;
         else if (!strcmp(name, "RSTICK_LEFT")) rx = -32767;
         else if (!strcmp(name, "RSTICK_RIGHT")) rx = 32767;
+        else if (!strcmp(name, "TILT_UP")) tilt_p = 30;
+        else if (!strcmp(name, "TILT_DOWN")) tilt_p = -30;
+        else if (!strcmp(name, "TILT_LEFT")) tilt_r = -30;
+        else if (!strcmp(name, "TILT_RIGHT")) tilt_r = 30;
+        else if (!strcmp(name, "TURN_UP")) turn_p = 60;
+        else if (!strcmp(name, "TURN_DOWN")) turn_p = -60;
+        else if (!strcmp(name, "TURN_LEFT")) turn_y = 90;
+        else if (!strcmp(name, "TURN_RIGHT")) turn_y = -90;
         else if (!strncmp(name, "STICK_", 6) && name[6] >= '0' && name[6] <= '9') {
             double r = atoi(name + 6) * 3.14159265358979 / 180;
             lx = (int32_t)lround(cos(r) * 32767), ly = (int32_t)lround(sin(r) * 32767);
@@ -433,6 +475,7 @@ void input_frame(uint64_t frame) {
     script_ly = ly;
     script_rx = rx;
     script_ry = ry;
+    motion_script(tilt_p, tilt_r, turn_p, turn_y);
 }
 
 // Buttons held right now (keyboard, gamepad, test script), independent of whether the game polls (movies).
