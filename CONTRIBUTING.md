@@ -20,6 +20,16 @@ Nothing owned by Nintendo may ever be committed or attached to an issue or pull 
 Pull requests that include Nintendo files can't be merged and will be closed. Screenshots and short clips of the
 game in bug reports are fine.
 
+## Which branch to work on
+
+- **`test`** is where development happens. It has every change that is implemented and being tested, ahead of the
+  latest release: the most up-to-date code, but not an official release.
+- **`main`** only moves for a release. Once `test` has been tested well, it goes into `main` through a pull request
+  and the release is published from it.
+- **Base your work on `test` and open pull requests against `test`.** `main` is an older state, so work based on it
+  often repeats what `test` already has. Before you start, look at `test`: its README status table and roadmap say
+  what is done, in progress and planned.
+
 ## Reporting bugs
 
 Open a GitHub issue with:
@@ -65,6 +75,7 @@ recompile the game code from them, then `make -j`.
 
 ## Pull requests
 
+- Open it against `test`, on top of its latest commit (see "Which branch to work on").
 - Keep each pull request focused on one change; small is easier to review.
 - Describe what changed, why, and how you tested it.
 - Don't include personal paths or information in code, comments or commit messages.
