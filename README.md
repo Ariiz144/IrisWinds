@@ -19,6 +19,12 @@ mouse, and its text and voices in any of its languages.
 > find a bug, please [report it on GitHub](https://github.com/Revivedx/SavageWindRecomp/issues/new/choose): every
 > report shows how far the game really works.
 
+> [!TIP]
+> **Want to contribute? Look at the [`test`](https://github.com/Revivedx/SavageWindRecomp/tree/test) branch first.**
+> It has every change that is implemented and being tested, ahead of the latest release, so you don't start on
+> something that's already done or in progress. Base your work on `test` and open pull requests against it: `main`
+> only moves for a release. See [CONTRIBUTING.md](CONTRIBUTING.md).
+
 > [!NOTE]
 > **No game files are included.** Savage Wind Recomp needs your own legally obtained copy of the game, updated to
 > **version 1.9.0**, dumped from **your own** Nintendo Switch. This project does not include, and will not
