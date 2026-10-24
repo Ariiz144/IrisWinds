@@ -1477,11 +1477,13 @@ static VkPipelineLayout make_layout(const VkBindingInfo *binds, int nbinds, VkDe
     return l;
 }
 
+static uint64_t hmix(uint64_t h, const void *p, size_t n);
 static void save_glsl(const char *src, uint64_t addr, const char *suffix) {
     if (!getenv("SAVAGEWIND_SAVE_MSL")) return;
     mkdir("build/glsl", 0755);
     char path[256];
-    snprintf(path, sizeof path, "build/glsl/%llx_%s.glsl", (unsigned long long)addr, suffix);
+    uint64_t h = addr ? hmix(1469598103934665603ull, (const void *)(uintptr_t)(addr + 0x30), 0x200) : 0;  // ([draw]'s fs hash)
+    snprintf(path, sizeof path, "build/glsl/%llx_%016llx_%s.glsl", (unsigned long long)addr, (unsigned long long)h, suffix);
     FILE *f = fopen(path, "w");
     if (f) { fputs(src, f); fclose(f); }
 }
