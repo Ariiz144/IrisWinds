@@ -34,18 +34,18 @@ mouse, and its text and voices in any of its languages.
 > Savage Wind never decrypts anything: it only reads files you have already extracted yourself. The recompilation of
 > the game code happens locally, on your machine, from your files.
 
-## Getting started (Alpha 2.1, Windows)
+## Getting started (Alpha 0.2.5i, Windows)
 
-1. Download `IrisWinds-0.2.1-alpha.2.1-windows.zip` from [Releases](https://github.com/Ariiz144/IrisWinds/releases)
+1. Download `IrisWinds-0.2.5i-alpha-windows.zip` from [Releases](https://github.com/Ariiz144/IrisWinds/releases)
    and extract it to a folder you can write to (not Program Files): your game files, saves and settings are kept in
    that folder.
-2. Run `savagewind.exe`. The first time it asks for your game files: pick the folder with your own extracted game
+2. Run `iriswinds.exe`. The first time it asks for your game files: pick the folder with your own extracted game
    (`exefs/` and `romfs/`, version 1.9.0, see below) and choose **Set up game files**. It checks the
    version, copies the files, builds the data image and recompiles the game code on your machine - once, and it takes
    a while (about 40 minutes with a 12-thread CPU). Your own files aren't changed. When it's done the game starts.
-3. From then on `savagewind.exe` goes straight into the game. The settings, including the text and voice languages,
+3. From then on `iriswinds.exe` goes straight into the game. The settings, including the text and voice languages,
    are in the game's Options (pause menu > System > Options, or Options on the title screen).
-4. **Savage Wind Configuration** (`Savage Wind Configuration.exe`, in the same folder) opens the configuration
+4. **IrisWinds Configuration** (`IrisWinds Configuration.exe`, in the same folder) opens the configuration
    screen: Play, Settings, your game files (set them up again, rebuild the game code, delete them) and Quit. In
    game, Quit to Start Screen also comes back to it. (Built from source on Linux or macOS: `--config`, the
    AppImage's **Savage Wind Configuration** desktop action, or Option held while opening the Mac app.)

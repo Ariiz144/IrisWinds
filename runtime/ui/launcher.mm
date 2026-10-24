@@ -94,7 +94,7 @@ static void save_png(id<MTLTexture> tex, const char *path) {
 #endif
 
 // The version this build is (also names the release files; Makefile / tools/bundle_macos.sh / make_dmg.sh read it).
-#define IRISWINDS_VERSION "0.2.1-alpha.2.1"
+#define IRISWINDS_VERSION "0.2.5i-alpha"
 #define SAVAGEWIND_VERSION IRISWINDS_VERSION
 extern "C" const char *rt_version(void) { return SAVAGEWIND_VERSION; }  // (the title screen's version line: fs.c)
 
