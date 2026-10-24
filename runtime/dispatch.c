@@ -342,12 +342,12 @@ bool rt_fault_watch(uint64_t fa, uint64_t pc) {
             const char *nm = host_sym(pc, &off);
             bool node = fa >= node_lo && fa < node_hi;
             if (!nm) {  // our own executable: its offset from rt_fault_watch maps to a function with nm/addr2line
-                nm = "savagewind";
+                nm = "iriswinds";
                 off = pc - (uint64_t)(uintptr_t)&rt_fault_watch;
             }
             fprintf(stderr, "[watch] %.6f write %s+%#llx by %s%s%llx (thread %x)\n", plat_now_ns() / 1e9,
                     node ? "node" : "head", (unsigned long long)(fa - (node ? node_lo : g_watch_lo)), nm,
-                    !strcmp(nm, "savagewind") ? " rt_fault_watch+" : "+", (unsigned long long)off,
+                    !strcmp(nm, "iriswinds") ? " rt_fault_watch+" : "+", (unsigned long long)off,
                     kernel_current_thread_handle());
             extern void kernel_log_guest_chain(void);
             kernel_log_guest_chain();
