@@ -2720,13 +2720,28 @@ static void resolve_feedback(Prog *pr) {
                     stat_feedback_live++;
                     continue;
                 }
-                if (tl > sb) {  // (tl inside the sampled range: keep the levels under it; past it: all of them)
+                // Its sampler, when it is pinned to one level (lod_min == lod_max: BOTW's bloom pyramid reads one level
+                // per pass): the level it reads, in the texture's own numbering.
+                int pinned = -1;
+                {
+                    int slot = ((int)infos[sg]->tex[i].handle_offset - 0x20) / 8;
+                    uint64_t h = slot >= 0 && slot < 32 ? st.tex[sg][slot] : 0;
+                    uint32_t tsc = (uint32_t)(h >> 20) & 0xFFF;
+                    const NvnSamplerDesc *sd =
+                        h && st.spool && tsc < (uint32_t)st.spool->count ? &((NvnSamplerDesc *)st.spool->entries)[tsc] : NULL;
+                    if (sd && sd->lod_min >= 0 && sd->lod_max - sd->lod_min < 0.5f) pinned = (int)sb + (int)sd->lod_min;
+                }
+                if (tl > sb || (pinned > (int)tl && pinned < (int)(sb + sn))) {
                     NvnTextureView v;
                     memset(&v, 0, sizeof v);
                     if (e && e->has_view) v = e->view;
                     v.setmask |= 1;
-                    v.base_level = (uint8_t)sb;
-                    v.num_levels = (uint8_t)(tl < sb + sn ? tl - sb : sn);
+                    // Going back up the chain, it writes level n from a smaller level k > n (the pyramid's upsample
+                    // passes add level 2 into 1, ...): the levels under n don't hold k, and the lookup clamped to level
+                    // 0, the unblurred image (the bloom showed blocky, a sharp low-resolution glow stretched over the
+                    // screen). A view of level k alone: the pinned lod clamps to its one level.
+                    if (pinned > (int)tl) v.base_level = (uint8_t)pinned, v.num_levels = 1;
+                    else v.base_level = (uint8_t)sb, v.num_levels = (uint8_t)(tl < sb + sn ? tl - sb : sn);
                     VkImageView view = vk_view(t, &v, true, false, infos[sg]->tex[i].type);
                     if (view) {
                         stat_feedback_live++;
