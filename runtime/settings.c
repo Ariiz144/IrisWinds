@@ -5,22 +5,28 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <unistd.h>
 #include "hle.h"
 #include "input_bind.h"
 #include "language.h"
 
 #define SETTINGS_FILE settings_file()
 
-// SAVAGEWIND_SETTINGS=<path>: another settings file (test runs never touch the player's savagewind.ini)
+// IRISWINDS_SETTINGS / SAVAGEWIND_SETTINGS=<path>: another settings file
 static const char *settings_file(void) {
-    const char *e = getenv("SAVAGEWIND_SETTINGS");
-    return e && *e ? e : "savagewind.ini";
+    const char *e = getenv("IRISWINDS_SETTINGS");
+    if (!e || !*e) e = getenv("SAVAGEWIND_SETTINGS");
+    if (e && *e) return e;
+    if (access("iriswinds.ini", 0) == 0) return "iriswinds.ini";
+    if (access("savagewind.ini", 0) == 0) return "savagewind.ini";
+    return "iriswinds.ini";
 }
 
 Settings g_settings = {
     .fullscreen = false,
     .window_w = 1280,
     .window_h = 720,
+    .shadow_res = SHADOW_FAST,
     .volume = 1.0f,
     .reverb = true,
     .movie_audio = true,
@@ -30,7 +36,7 @@ Settings g_settings = {
     .mouse_sens = MOUSE_SENS_DEFAULT,
     .motion_sens = 1.0f,
     .stick_deadzone = {STICK_DEADZONE_DEFAULT, STICK_DEADZONE_DEFAULT},
-    .fps_limit = 30,
+    .fps_limit = 45,
     .precompile_shaders = true,
     .async_shaders = true,
     .vsync = VSYNC_DEFAULT,
@@ -116,9 +122,9 @@ void settings_load(void) {
         }
         else if (!strcmp(key, "async_shaders")) g_settings.async_shaders = atoi(val) != 0;
         else if (!strcmp(key, "precompile_shaders")) g_settings.precompile_shaders = atoi(val) != 0;
-        else if (!strcmp(key, "shadow_resolution"))  // (console / high / ultra / extreme)
+        else if (!strcmp(key, "shadow_resolution"))  // (fast / console / high / ultra / extreme)
             g_settings.shadow_res = !strcmp(val, "extreme") ? SHADOW_EXTREME : !strcmp(val, "ultra") ? SHADOW_ULTRA
-                                  : !strcmp(val, "high") ? SHADOW_HIGH : SHADOW_CONSOLE;
+                                  : !strcmp(val, "high") ? SHADOW_HIGH : !strcmp(val, "console") ? SHADOW_CONSOLE : SHADOW_FAST;
         else if (!strcmp(key, "text_language")) {  // (a region language: USen, EUes, ...; auto)
             g_settings.text_language = 0;
             for (int i = 1; i < g_ntext_languages; i++)
@@ -174,7 +180,7 @@ void settings_load(void) {
 void settings_save(void) {
     FILE *f = fopen(SETTINGS_FILE, "w");
     if (!f) { LOG("[settings] cannot write %s\n", SETTINGS_FILE); return; }
-    fprintf(f, "# Savage Wind settings (edited from the in-game menu: F1, Esc, or Minus+Plus on a controller)\n");
+    fprintf(f, "# Iris Winds settings (edited from the in-game menu: F1, Esc, or Minus+Plus on a controller)\n");
     fprintf(f, "settings_version = %d\n", SETTINGS_VERSION);
     fprintf(f, "fullscreen = %d\n", g_settings.fullscreen);
     if (g_settings.window_w > 0 && g_settings.window_h > 0)
@@ -213,9 +219,9 @@ void settings_save(void) {
                                                 g_settings.button_icons : ICONS_AUTO]);
     fprintf(f, "async_shaders = %d\n", g_settings.async_shaders);
     fprintf(f, "precompile_shaders = %d\n", g_settings.precompile_shaders);
-    static const char *const shadow[SHADOW_COUNT] = {"console", "high", "ultra", "extreme"};
+    static const char *const shadow[SHADOW_COUNT] = {"fast", "console", "high", "ultra", "extreme"};
     int sr = g_settings.shadow_res;
-    fprintf(f, "shadow_resolution = %s\n", shadow[sr >= 0 && sr < SHADOW_COUNT ? sr : SHADOW_CONSOLE]);
+    fprintf(f, "shadow_resolution = %s\n", shadow[sr >= 0 && sr < SHADOW_COUNT ? sr : SHADOW_FAST]);
     int tl = g_settings.text_language, vl = g_settings.voice_language;
     fprintf(f, "text_language = %s\n", tl > 0 && tl < g_ntext_languages ? g_text_languages[tl].folder : "auto");
     fprintf(f, "voice_language = %s\n", vl > 0 && vl < g_nvoice_languages ? g_voice_languages[vl].folder : "text");

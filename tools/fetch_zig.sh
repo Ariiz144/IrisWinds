@@ -27,7 +27,7 @@ mkdir -p "$DL"
 GOT=$( (shasum -a 256 2>/dev/null || sha256sum) < "$DL/$NAME.$EXT" | cut -d' ' -f1)
 [ "$GOT" = "$SHA" ] || { echo "$NAME.$EXT: sha256 $GOT, expected $SHA"; exit 1; }
 rm -rf "$DL/$NAME" build/zig
-if [ "$EXT" = zip ]; then unzip -q "$DL/$NAME.$EXT" -d "$DL"; else tar -xJf "$DL/$NAME.$EXT" -C "$DL"; fi
+if [ "$EXT" = zip ]; then (command -v unzip >/dev/null && unzip -q "$DL/$NAME.$EXT" -d "$DL") || python3 -m zipfile -e "$DL/$NAME.$EXT" "$DL" || /c/Windows/System32/tar.exe -xf "$DL/$NAME.$EXT" -C "$DL"; else tar -xJf "$DL/$NAME.$EXT" -C "$DL"; fi
 mv "$DL/$NAME" build/zig
 
 # size: only what compiling C for this same OS needs (the game code is built for the machine it runs on): its libc

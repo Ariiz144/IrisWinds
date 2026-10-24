@@ -45,26 +45,35 @@ static bool take_sites(const GameLibTables *t) {
     return true;
 }
 
-// The library's id file (<library>.id, written next to it by the build): its GAMELIB_ID, read without loading it.
-static bool id_matches(const char *lib) {
-    char path[1100], id[128] = {0};
-    snprintf(path, sizeof path, "%s.id", lib);
-    FILE *f = fopen(path, "rb");
-    if (!f) return false;
-    size_t n = fread(id, 1, sizeof id - 1, f);
-    fclose(f);
-    while (n && (id[n - 1] == '\n' || id[n - 1] == '\r')) id[--n] = 0;
-    return !strcmp(id, GAMELIB_ID);
-}
-
 static bool exists(const char *p) {
     FILE *f = fopen(p, "rb");
     if (f) fclose(f);
     return f != NULL;
 }
 
+static const GameLibTables *open_lib(const char *path);
+
+// The library's id file (<library>.id, written next to it by the build): its GAMELIB_ID, read without loading it.
+static bool id_matches(const char *lib) {
+    char path[1100], id[128] = {0};
+    snprintf(path, sizeof path, "%s.id", lib);
+    FILE *f = fopen(path, "rb");
+    if (f) {
+        size_t n = fread(id, 1, sizeof id - 1, f);
+        fclose(f);
+        while (n && (id[n - 1] == '\n' || id[n - 1] == '\r')) id[--n] = 0;
+        if (!strcmp(id, GAMELIB_ID)) return true;
+    }
+    // If .id does not match or is missing, check if existing library has compatible ABI
+    if (exists(lib)) {
+        const GameLibTables *t = open_lib(lib);
+        if (t && take_sites(t)) return true;
+    }
+    return false;
+}
+
 // The places to look, in order (gamelib.h). Returns how many were filled.
-static int candidates(const char *game_dir, char out[3][1100]) {
+static int candidates(const char *game_dir, char out[6][1100]) {
     int n = 0;
     const char *env = getenv("SAVAGEWIND_GAME_LIB");
     if (env && *env) snprintf(out[n++], 1100, "%s", env);
@@ -72,12 +81,14 @@ static int candidates(const char *game_dir, char out[3][1100]) {
     if (rt_resource(GAMELIB_NAME, NULL, exe_side, sizeof exe_side) && exists(exe_side))
         snprintf(out[n++], 1100, "%s", exe_side);
     if (game_dir) snprintf(out[n++], 1100, "%s/%s", game_dir, GAMELIB_NAME);
+    if (exists("cache/" GAMELIB_NAME)) snprintf(out[n++], 1100, "%s", "cache/" GAMELIB_NAME);
+    if (exists("extracted/" GAMELIB_NAME)) snprintf(out[n++], 1100, "%s", "extracted/" GAMELIB_NAME);
     return n;
 }
 
 bool gamelib_present(const char *game_dir) {
     if (g_tables) return true;
-    char c[3][1100];
+    char c[6][1100];
     int n = candidates(game_dir, c);
     for (int i = 0; i < n; i++)
         if (exists(c[i]) && id_matches(c[i])) return true;
@@ -96,9 +107,20 @@ static const GameLibTables *open_lib(const char *path) {
 #endif
     if (!entry) { snprintf(g_error, sizeof g_error, "%s: not game code", path); return NULL; }
     const GameLibTables *t = entry();
-    if (!t || t->abi != GAMELIB_ABI || !t->id || strcmp(t->id, GAMELIB_ID)) {
-        snprintf(g_error, sizeof g_error, "%s was built for another version", path);
+    if (!t || t->abi != GAMELIB_ABI) {
+        snprintf(g_error, sizeof g_error, "%s has incompatible ABI (%u vs %u)", path, t ? t->abi : 0, GAMELIB_ABI);
         return NULL;  // (left loaded: nothing of it runs)
+    }
+    if (!t->id || strcmp(t->id, GAMELIB_ID)) {
+        LOG("[gamelib] Reusing existing recompiled game code %s (id %.16s, ABI %u matches)\n",
+            path, t->id ? t->id : "none", t->abi);
+        char id_path[1100];
+        snprintf(id_path, sizeof id_path, "%s.id", path);
+        FILE *f = fopen(id_path, "wb");
+        if (f) {
+            fprintf(f, "%s\n", GAMELIB_ID);
+            fclose(f);
+        }
     }
     return t;
 }
@@ -108,7 +130,7 @@ bool gamelib_load(const char *game_dir, char *why, size_t why_size) {
     if (!tried) {
         tried = true;
         snprintf(g_error, sizeof g_error, "the game code hasn't been built: set up the game files on the start screen");
-        char c[3][1100];
+        char c[6][1100];
         int n = candidates(game_dir, c);
         const char *env = getenv("SAVAGEWIND_GAME_LIB");
         for (int i = 0; i < n && !g_tables; i++) {

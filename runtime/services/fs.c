@@ -496,9 +496,9 @@ static void rom_index(int fd) {
         ov_n++;
         ov_end = (ov_end + size + 0xF) & ~0xFull;
     }
-    // The title screen's version line shows System/Version.txt ("1.8.2") through "Ver.%s": it reads "Savage Wind
+    // The title screen's version line shows System/Version.txt ("1.8.2") through "Ver.%s": it reads "Iris Winds
     // <major>.<minor>" instead (the "Ver." goes in fs_title_version_patch), unless the overlay folder replaces the
-    // file. The line's text box holds 15 characters, so the full version is only in Savage Wind Configuration.
+    // file. The line's text box holds 15 characters, so the full version is only in Iris Winds Configuration.
     for (int i = 0; i < rom_nfiles; i++) {
         if (strcmp(rom_files[i].path, "System/Version.txt")) continue;
         char host[1200];
@@ -508,8 +508,8 @@ static void rom_index(int fd) {
         static char text[64];
         const char *v = rt_version(), *dot = strchr(v, '.');
         int n = dot ? (int)strcspn(dot + 1, ".-") + (int)(dot - v) + 1 : (int)strlen(v);  // (up to the second '.')
-        snprintf(text, sizeof text, "Savage Wind %.*s", n, v);
-        if (strlen(text) > 15) snprintf(text, sizeof text, "Savage Wind");
+        snprintf(text, sizeof text, "Iris Winds %.*s", n, v);
+        if (strlen(text) > 15) snprintf(text, sizeof text, "Iris Winds");
         meta_copy(fd, fmeta, foff, fsz);
         uint64_t rel = ov_end - rom_data_off, size = strlen(text);
         memcpy(ov_meta + rom_files[i].meta + 8, &rel, 8);
@@ -530,7 +530,7 @@ static void rom_index(int fd) {
 }
 
 // The title screen's version line: main formats System/Version.txt with "Ver.%s" (title_version_format; 1.8.2
-// 0x71014b854e in the Ghidra project, read by FUN_7100d4b57c and FUN_7100d4bca0); "%s" leaves just "Savage Wind
+// 0x71014b854e in the Ghidra project, read by FUN_7100d4b57c and FUN_7100d4bca0); "%s" leaves just "Iris Winds
 // <version>". Called once main is loaded; anything else at that address is left alone.
 void fs_title_version_patch(void) {
     char *fmt = (char *)(uintptr_t)g_site.title_version_format;

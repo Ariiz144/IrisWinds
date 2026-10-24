@@ -1,9 +1,9 @@
 // Start screen, shown before the game boots, in two modes (runtime/main.c picks):
 // - setup: a plain start whose game files aren't set up yet (or whose game code was built for another version of
-//   Savage Wind). Only the game files page: nothing of the game ships with Savage Wind, so the user picks the folder
+//   Iris Winds). Only the game files page: nothing of the game ships with Iris Winds, so the user picks the folder
 //   with their own extracted game files (exefs/ and romfs/), we check the main module is an NSO of a supported version,
 //   copy the files, build the game's data image and recompile the game code - then the game starts.
-// - configuration ("Savage Wind Configuration", --config): PLAY, SETTINGS, GAME FILES (set up, set up again,
+// - configuration ("Iris Winds Configuration", --config): PLAY, SETTINGS, GAME FILES (set up, set up again,
 //   delete), QUIT, the game-files status at the lower left.
 // Once the game files are ready a plain start goes straight into the game. Skipped with --play,
 // SAVAGEWIND_NO_LAUNCHER=1, or any scripted test run (SAVAGEWIND_INPUT): tests boot straight in. Quit to Start Screen
@@ -94,7 +94,8 @@ static void save_png(id<MTLTexture> tex, const char *path) {
 #endif
 
 // The version this build is (also names the release files; Makefile / tools/bundle_macos.sh / make_dmg.sh read it).
-#define SAVAGEWIND_VERSION "0.2.1-alpha.2.1"
+#define IRISWINDS_VERSION "0.2.1-alpha.2.1"
+#define SAVAGEWIND_VERSION IRISWINDS_VERSION
 extern "C" const char *rt_version(void) { return SAVAGEWIND_VERSION; }  // (the title screen's version line: fs.c)
 
 // ------------------------------------------------------------------ game files
@@ -232,7 +233,7 @@ static std::string check_copied_files(const std::string &root) {
 // "" = ready to play, else what is wrong
 static std::string check_game_files(const std::string &root) {
     std::string why = check_copied_files(root);
-    if (why.empty() && !gamelib_present(root.c_str()))  // (a library with another id: an update of Savage Wind)
+    if (why.empty() && !gamelib_present(root.c_str()))  // (a library with another id: an update of Iris Winds)
         return file_exists(root + "/" GAMELIB_NAME) ? "Game code built for another version" : "Game code not built yet";
     return why;
 }
@@ -241,7 +242,7 @@ static std::string check_game_files(const std::string &root) {
 extern "C" bool launcher_game_ready(const char *root) { return check_game_files(root).empty(); }
 
 #ifdef __APPLE__
-// (runtime/main.c) macOS: Option held while the app opens asks for the configuration screen - what "Savage Wind
+// (runtime/main.c) macOS: Option held while the app opens asks for the configuration screen - what "Iris Winds
 // Configuration.exe" is on Windows and the desktop entry's action on Linux. The Mac way (as Photos or Steam ask for
 // their library with it), and no second app to install.
 extern "C" bool launcher_config_key_held(void) { return (NSEvent.modifierFlags & NSEventModifierFlagOption) != 0; }
@@ -284,9 +285,9 @@ static void set_failure(int k) {
         "exefs/main must be the decrypted, extracted main module (an NSO file).",
         "Some files are missing. Choose the folder again; if it happens again, extract the game again.",
         "Make sure there's enough free space and try again. The log has the details.",
-        "Savage Wind needs the game updated to version %s: the %s ExeFS and the RomFS with the update merged "
+        "Iris Winds needs the game updated to version %s: the %s ExeFS and the RomFS with the update merged "
         "in. Update the game on your console, extract it again and choose that folder.",
-        "Savage Wind plays version %s for now. If you kept a copy of the game at that version, choose its folder."};
+        "Iris Winds plays version %s for now. If you kept a copy of the game at that version, choose its folder."};
     if (k >= 1 && k <= 8) set_job(head[k], true, hint[k]);
     if (k == FAIL_ROMFS) {  // (screenshots: a cartridge's RomFS)
         char found[200];
@@ -300,7 +301,7 @@ static void set_failure(int k) {
 static void set_romfs_failure(const GameVersion &v, const std::string &found) {
     char head[200], hint[700];
     snprintf(head, sizeof head, tr("The RomFS isn't version %s with the update applied"), v.name);
-    snprintf(hint, sizeof hint, tr("Savage Wind needs the RomFS of version %s with the update applied over the base "
+    snprintf(hint, sizeof hint, tr("Iris Winds needs the RomFS of version %s with the update applied over the base "
                                    "game. Extract the RomFS again that way and choose that folder."), v.name);
     set_job(head, true, found + " " + hint);
 }
@@ -315,8 +316,8 @@ static int version_failure(const std::string &st) {
 static void explain_status(const std::string &st) {
     if (st.empty() || st == "No game files") return;
     if (st == "Game code built for another version")
-        set_job("The game code was built for another version of Savage Wind", true,
-                "Savage Wind was updated: choose Set up game files to build the game code again from your copy of the "
+        set_job("The game code was built for another version of Iris Winds", true,
+                "Iris Winds was updated: choose Set up game files to build the game code again from your copy of the "
                 "game. This takes a few minutes.");
     else if (st == "Game code not built yet")
         set_job("The game code isn't built yet", true,
@@ -474,7 +475,7 @@ static void *extract_thread(void *) {
         if (!found.empty()) { set_romfs_failure(*v, found); goto done; }
     }
     {
-        // (the picked folder can't be Savage Wind's own copy: setting up again deletes that first)
+        // (the picked folder can't be Iris Winds's own copy: setting up again deletes that first)
         char a[4096], b[4096];
         mkdir(g_root.c_str(), 0755);
         if (realpath(exefs.c_str(), a) && realpath(g_root.c_str(), b) && !strncmp(a, b, strlen(b)) &&
@@ -616,7 +617,7 @@ static bool menu_tip(float s) {
     if (open) {
         ImGui::SetWindowFontScale(1.25f);
         ImGui::PushTextWrapPos(0);
-        ImGui::TextUnformatted(tr("Savage Wind's video, audio and controls settings are in the game's own Options."));
+        ImGui::TextUnformatted(tr("Iris Winds's video, audio and controls settings are in the game's own Options."));
         ImGui::Spacing();
         ImGui::TextUnformatted(tr("Open them from the title screen, or pause the game and choose System > Options. "
                                   "Esc frees the mouse cursor."));
@@ -835,7 +836,7 @@ static void prelaunch_tab(float sc) {
         ImGui::PushFont(g_font_menu);
         ImGui::TextColored(ImVec4(1, 0.72f, 0.4f, 1), "%s", tr("Are you sure?"));
         ImGui::PopFont();
-        ImGui::Text(tr("This deletes Savage Wind's copy of the game files (%.1f GB)."), gb);
+        ImGui::Text(tr("This deletes Iris Winds's copy of the game files (%.1f GB)."), gb);
         ImGui::TextDisabled("%s", tr("Saves and settings are kept. Your own game files aren't touched."));
         if (rt_dev_mode()) {  // (a source checkout: the files are the project's own extracted/)
             bool abs = !g_root.empty() && (g_root[0] == '/' || (g_root.size() > 1 && g_root[1] == ':'));
@@ -845,7 +846,7 @@ static void prelaunch_tab(float sc) {
         ImGui::Spacing();
         if (ImGui::Button(tr("Delete"), ImVec2(220 * sc, 0))) {
             bool ok = rt_remove_game_files(g_root.c_str());  // (runtime/paths.c: only what the extraction made)
-            set_job(ok ? "Game files deleted." : "Could not delete the game files (not in Savage Wind's data folder?).", !ok);
+            set_job(ok ? "Game files deleted." : "Could not delete the game files (not in Iris Winds's data folder?).", !ok);
             g_files_deleted = true, gb = -1;
             ImGui::CloseCurrentPopup();
         }
@@ -936,7 +937,7 @@ extern "C" void launcher_run(const char *root, int mode) {
     ui_window_init();
     SDL_Window *win = ui_window();
     g_launcher_win = win;
-    SDL_SetWindowTitle(win, g_setup_only ? "Savage Wind" : "Savage Wind Configuration");
+    SDL_SetWindowTitle(win, g_setup_only ? "Iris Winds" : "Iris Winds Configuration");
 #ifdef __APPLE__
     CAMetalLayer *layer = (__bridge CAMetalLayer *)ui_metal_layer();
     id<MTLDevice> dev = (__bridge id<MTLDevice>)ui_metal_device();
@@ -1083,7 +1084,7 @@ extern "C" void launcher_run(const char *root, int mode) {
             float s = ds.y / 720.0f;  // layout scale (fonts are built for ~2x)
             ImGui::GetIO().FontGlobalScale = s * 0.5f;
             ImDrawList *bg = ImGui::GetBackgroundDrawList();
-            splash_draw(bg, ds, (float)ImGui::GetTime());  // (the player's picture, or Savage Wind's own art)
+            splash_draw(bg, ds, (float)ImGui::GetTime());  // (the player's picture, or Iris Winds's own art)
             {  // a shadow banner fading in from the left behind the menu, and one from the right behind the version
                 const float stops[][2] = {{0.0f, 225}, {0.3f, 215}, {0.44f, 165}, {0.55f, 95}, {0.64f, 35}, {0.74f, 0}};
                 for (int i = 0; i + 1 < (int)(sizeof stops / sizeof stops[0]); i++) {
@@ -1108,7 +1109,7 @@ extern "C" void launcher_run(const char *root, int mode) {
             ImGui::SetCursorPos(ImVec2(x0, 120 * s));
             ImGui::PushFont(g_font_title);
             if (page == MAIN) {  // gold to orange, shadowed (not behind the Settings / Game Files windows)
-                const char *t = "Savage Wind";
+                const char *t = "Iris Winds";
                 ImVec2 p = ImGui::GetCursorScreenPos();
                 text_fx(ImGui::GetWindowDrawList(), ImGui::GetFont(), ImGui::GetFontSize(), p, IM_COL32(255, 232, 120, 255),
                         IM_COL32(255, 138, 48, 255), t, 3 * s);
@@ -1239,7 +1240,7 @@ extern "C" void launcher_run(const char *root, int mode) {
                 bool welcome = g_setup_only && status == "No game files";
                 ImGui::PushFont(g_font_small);
                 ImGui::PushFont(g_font_menu);
-                ImGui::TextColored(ImVec4(0.93f, 0.76f, 0.33f, 1), "%s", tr(welcome ? "Welcome to Savage Wind" : "Game Files"));
+                ImGui::TextColored(ImVec4(0.93f, 0.76f, 0.33f, 1), "%s", tr(welcome ? "Welcome to Iris Winds" : "Game Files"));
                 ImGui::PopFont();
                 bool back = false;
                 if (!busy) {  // close: the drawn X in the corner, as Settings (B / Esc too; setup mode: the X quits)
@@ -1261,7 +1262,7 @@ extern "C" void launcher_run(const char *root, int mode) {
                 if (welcome && !busy) {  // what this is about, the first time
                     ImGui::PushTextWrapPos(0);
                     ImGui::TextColored(ImVec4(0.86f, 0.85f, 0.80f, 1), "%s",
-                                       trv("Savage Wind needs your own copy of the game, version %s. Choose the folder "
+                                       trv("Iris Winds needs your own copy of the game, version %s. Choose the folder "
                                            "with its extracted files and set them up: the game starts when it's done.")
                                            .c_str());
                     ImGui::PopTextWrapPos();
@@ -1288,16 +1289,16 @@ extern "C" void launcher_run(const char *root, int mode) {
                     dl->AddLine(ImVec2(x + u * 0.35f, cy + u * 0.35f), ImVec2(x + u, cy - u * 0.4f), g, fs * 0.11f);
                 };
                 std::string src_d = trv("The folder with your own extracted game files: exefs (main, main.npdm, sdk...) and "
-                                        "romfs, version %s with the update merged in. The game isn't included with Savage Wind.");
+                                        "romfs, version %s with the update merged in. The game isn't included with Iris Winds.");
                 if (!src.empty()) src_d += std::string("\n\n") + tr("Chosen:") + " " + src;
                 // the step that's running / its result, under the rows and in the Set up row's explanation
                 const std::string &job_line = job;
-                std::string ex_d = tr("Copies the game files Savage Wind needs and recompiles the game from them. This only "
+                std::string ex_d = tr("Copies the game files Iris Winds needs and recompiles the game from them. This only "
                                       "needs to be done once and may take a while. Your own files aren't changed.");
                 if (!job.empty())
                     ex_d += std::string("\n\n") + trv(job) + (job_hint.empty() ? "" : std::string(".\n") + trv(job_hint));
-                std::string again_d = tr("Sets the game files up again from the folder chosen above, in place of Savage Wind's "
-                                         "copy. With no folder chosen, builds the game code again from Savage Wind's copy. "
+                std::string again_d = tr("Sets the game files up again from the folder chosen above, in place of Iris Winds's "
+                                         "copy. With no folder chosen, builds the game code again from Iris Winds's copy. "
                                          "Saves and settings are kept.");
 
                 // the controller's cursor starts on the first row (not the X), a few frames while the window lays out
@@ -1309,14 +1310,14 @@ extern "C" void launcher_run(const char *root, int mode) {
                 };
                 opt_begin("##files", sc);
                 if (ready && !g_setup_only) {
-                    // DELETE: frees Savage Wind's copy (runtime/paths.c removes only what the setup made, only inside
+                    // DELETE: frees Iris Winds's copy (runtime/paths.c removes only what the setup made, only inside
                     // the data root). Saves, settings and the user's own files stay.
                     if (files_gb < 0) files_gb = rt_game_files_size(g_root.c_str()) / 1e9;
                     char gb[32];
                     snprintf(gb, sizeof gb, "%.1f GB", files_gb);
                     opt_section("Game files");
                     if (!g_confirm_delete) {
-                        if (opt_action("Delete game files", gb, "Frees the space Savage Wind's copy of the game files takes. "
+                        if (opt_action("Delete game files", gb, "Frees the space Iris Winds's copy of the game files takes. "
                                        "Saves and settings are kept, and your own game files aren't touched: you can "
                                        "set the game files up again from them.", true))
                             g_confirm_delete = true;
@@ -1326,7 +1327,7 @@ extern "C" void launcher_run(const char *root, int mode) {
                             bool ok = rt_remove_game_files(g_root.c_str());
                             status = check_game_files(g_root);
                             if (ok) set_job("Game files deleted.");
-                            else set_job("Couldn't delete the game files", true, "They aren't in Savage Wind's data folder, "
+                            else set_job("Couldn't delete the game files", true, "They aren't in Iris Winds's data folder, "
                                          "so they were left alone.");
                             g_confirm_delete = false, files_gb = -1;
                         }
@@ -1344,7 +1345,7 @@ extern "C" void launcher_run(const char *root, int mode) {
                             snprintf(sum, sizeof sum, tr("%d shaders, %s"), nsh, date);
                             pd += std::string("\n\n") + tr("Last time:") + " " + sum;
                         }
-                        if (pst == 2) pd += std::string("\n") + tr("Savage Wind's shader translator or the graphics driver has changed "
+                        if (pst == 2) pd += std::string("\n") + tr("Iris Winds's shader translator or the graphics driver has changed "
                                                                        "since: run it again.");
                         opt_section("Shaders");
                         if (opt_action("Precompile shaders", tr(pst == 1 ? "Done" : pst == 2 ? "Run again" : "Not done"), pd.c_str(),
@@ -1377,7 +1378,7 @@ extern "C" void launcher_run(const char *root, int mode) {
                                        "After the setup, translates and compiles every shader of the game, so that none "
                                        "stutters the first time it is drawn, also in places never visited. A few more "
                                        "minutes and about 1.5 GB of disk. It can be done later too, from the game "
-                                       "files page of Savage Wind Configuration."))
+                                       "files page of Iris Winds Configuration."))
                             settings_save();
                     }
 #endif
@@ -1406,11 +1407,11 @@ extern "C" void launcher_run(const char *root, int mode) {
                     ImGui::Dummy(ImVec2(0, 14 * sc));
                     ImGui::PushTextWrapPos(0);
 #ifdef _WIN32
-                    ImGui::TextDisabled("%s", tr("To change settings or the game files later, open Savage Wind Configuration."));
+                    ImGui::TextDisabled("%s", tr("To change settings or the game files later, open Iris Winds Configuration."));
 #elif defined(__APPLE__)
-                    ImGui::TextDisabled("%s", tr("To change settings or the game files later, hold Option while you open Savage Wind."));
+                    ImGui::TextDisabled("%s", tr("To change settings or the game files later, hold Option while you open Iris Winds."));
 #else
-                    ImGui::TextDisabled("%s", tr("To change settings or the game files later, start Savage Wind with --config."));
+                    ImGui::TextDisabled("%s", tr("To change settings or the game files later, start Iris Winds with --config."));
 #endif
                     ImGui::PopTextWrapPos();
                 }
@@ -1570,7 +1571,7 @@ extern "C" void launcher_run(const char *root, int mode) {
     }
     // play: hand the window to the game
     settings_save();
-    SDL_SetWindowTitle(win, "Savage Wind");
+    SDL_SetWindowTitle(win, "Iris Winds");
     splash_unload();
 #ifdef __APPLE__
     ImGui_ImplMetal_Shutdown();

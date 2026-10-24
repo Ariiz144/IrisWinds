@@ -70,7 +70,7 @@ void plat_thread_realtime(uint64_t period_ns) {
 }
 
 // ---- process
-// Started from a desktop (the AppImage) there is no terminal: stdout / stderr go to savagewind.log in the data folder
+// Started from a desktop (the AppImage) there is no terminal: stdout / stderr go to iriswinds.log in the data folder
 // (runtime/paths.h; rt_paths_init runs later, so the same rule is applied here). Processes started by this one (the
 // start screen re-executing itself for the game) append to the same log.
 static char g_log_path[1024];
@@ -87,7 +87,7 @@ static void log_to_file_without_terminal(void) {
     for (char *c = dir + 1; *c; c++)
         if (*c == '/') { *c = 0; mkdir(dir, 0755); *c = '/'; }
     mkdir(dir, 0755);
-    snprintf(g_log_path, sizeof g_log_path, "%s/savagewind.log", dir);
+    snprintf(g_log_path, sizeof g_log_path, "%s/iriswinds.log", dir);
     bool append = getenv("SAVAGEWIND_LOG_APPEND") != NULL;
     if (!freopen(g_log_path, append ? "a" : "w", stderr)) { g_log_path[0] = 0; return; }
     dup2(STDERR_FILENO, STDOUT_FILENO);
@@ -100,7 +100,7 @@ static void log_to_file_without_terminal(void) {
 static void require_cpu(void) {
     __builtin_cpu_init();
     if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma") && __builtin_cpu_supports("bmi2")) return;
-    fprintf(stderr, "FATAL: Savage Wind needs a CPU with AVX2 (Intel Haswell / 2013 or newer, AMD Excavator / Zen or "
+    fprintf(stderr, "FATAL: Iris Winds needs a CPU with AVX2 (Intel Haswell / 2013 or newer, AMD Excavator / Zen or "
                     "newer).\n");
     exit(1);
 }
@@ -160,8 +160,8 @@ void plat_fatal_notice(void) {
     if (!g_log_path[0]) return;
     fflush(stderr);
     char text[1200];
-    snprintf(text, sizeof text, "Savage Wind stopped because of an error.\n\nDetails: %s", g_log_path);
-    SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Savage Wind", text, NULL);
+    snprintf(text, sizeof text, "Iris Winds stopped because of an error.\n\nDetails: %s", g_log_path);
+    SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Iris Winds", text, NULL);
 }
 
 const char *rt_host_fn_name(uint64_t pc, uint64_t *offset);  // runtime/dispatch.c

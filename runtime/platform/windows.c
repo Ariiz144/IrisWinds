@@ -132,7 +132,7 @@ void plat_thread_realtime(uint64_t period_ns) {
 }
 
 // ---- process
-// Release builds are GUI-subsystem executables (no console window): stdout / stderr go to savagewind.log next to the
+// Release builds are GUI-subsystem executables (no console window): stdout / stderr go to iriswinds.log next to the
 // exe, and a fatal error shows a message box (plat_fatal_notice) instead of vanishing. Processes started by this one
 // (the start screen re-executing itself for the game) append to the same log.
 static char g_log_path[MAX_PATH];
@@ -144,7 +144,7 @@ static void log_to_file_without_console(void) {
     if (!n || n >= sizeof exe) return;
     char *slash = strrchr(exe, '\\');
     if (slash) slash[1] = 0;
-    snprintf(g_log_path, sizeof g_log_path, "%ssavagewind.log", exe);
+    snprintf(g_log_path, sizeof g_log_path, "%siriswinds.log", exe);
     bool append = getenv("SAVAGEWIND_LOG_APPEND") != NULL;
     if (!freopen(g_log_path, append ? "ab" : "wb", stderr)) { g_log_path[0] = 0; return; }
     setvbuf(stderr, NULL, _IONBF, 0);
@@ -157,8 +157,8 @@ static void log_to_file_without_console(void) {
 static void require_cpu(void) {
     __builtin_cpu_init();
     if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma") && __builtin_cpu_supports("bmi2")) return;
-    MessageBoxA(NULL, "Savage Wind needs a CPU with AVX2 (Intel Haswell / 2013 or newer, AMD Excavator / Zen or newer).",
-                "Savage Wind", MB_ICONERROR | MB_OK);
+    MessageBoxA(NULL, "Iris Winds needs a CPU with AVX2 (Intel Haswell / 2013 or newer, AMD Excavator / Zen or newer).",
+                "Iris Winds", MB_ICONERROR | MB_OK);
     ExitProcess(1);
 }
 
@@ -166,7 +166,7 @@ static void require_cpu(void) {
 void plat_fatal_notice(void) {
     if (!g_log_path[0]) return;
     fflush(stderr);
-    char text[1024] = "Savage Wind stopped because of an error.";
+    char text[1024] = "Iris Winds stopped because of an error.";
     FILE *f = fopen(g_log_path, "rb");
     if (f) {
         static char tail[16384];
@@ -182,17 +182,17 @@ void plat_fatal_notice(void) {
         if (line) {
             char *end = strchr(line, '\n');
             if (end) *end = 0;
-            snprintf(text, sizeof text, "Savage Wind stopped because of an error:\n\n%.600s", line);
+            snprintf(text, sizeof text, "Iris Winds stopped because of an error:\n\n%.600s", line);
             if (strstr(line, "Vulkan") || strstr(line, "VK_") || strstr(line, "vk")) {
                 size_t l = strlen(text);
-                snprintf(text + l, sizeof text - l, "\n\nSavage Wind needs a graphics driver with Vulkan 1.3: install the "
+                snprintf(text + l, sizeof text - l, "\n\nIris Winds needs a graphics driver with Vulkan 1.3: install the "
                          "latest driver for your GPU (NVIDIA, AMD or Intel).");
             }
         }
     }
     size_t l = strlen(text);
     snprintf(text + l, sizeof text - l, "\n\nDetails: %s", g_log_path);
-    MessageBoxA(NULL, text, "Savage Wind", MB_ICONERROR | MB_OK);
+    MessageBoxA(NULL, text, "Iris Winds", MB_ICONERROR | MB_OK);
 }
 
 void plat_init(void) {

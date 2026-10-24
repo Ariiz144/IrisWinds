@@ -1,9 +1,9 @@
-// Savage Wind's settings as pages of the game's own Options screen (pause menu > System > Options): the game draws
+// Iris Winds's settings as pages of the game's own Options screen (pause menu > System > Options): the game draws
 // them, with its font, sounds and cursor. The first page has one button per section (Gameplay: the game's own
 // options; Video, Audio, Controls: the game's camera options and the mouse; Keyboard, Controller, Language) and a
 // Quit button; A on a section shows its page, B goes back. The screen opens from the pause menu (System > Options) and
 // from the title screen menu (Options); this replaces the overlay menu in game (menu.mm). Quit (here, and in place of
-// the title menu's amiibo settings) asks with the game's own dialog: desktop or the Savage Wind start screen.
+// the title menu's amiibo settings) asks with the game's own dialog: desktop or the Iris Winds start screen.
 //
 // The game side (tools/patches.py): the screen builds one row per entry of a static option table each time it opens
 // (g_site.opt_table: its count, entries, row count and row order; 1.8.2 0x7001cccd98..0x7001cccdb0). The
@@ -136,11 +136,11 @@ const char16_t GREY = 3;    // (the game's message colour for greyed values)
 const char *const k_modes[] = {"Ultra Quality", "Quality", "Balanced", "Performance"};
 const char *const k_aa[] = {"Off", "SMAA"};
 const char *const k_aniso[] = {"Off", "2x", "4x", "8x", "16x"};  // (settings anisotropy 0..4)
-const char *const k_shadow[] = {"Console (896)", "High (2048)", "Ultra (4096)", "Extreme (8192)"};  // (SHADOW_*)
+const char *const k_shadow[] = {"Fast (512)", "Console (896)", "High (2048)", "Ultra (4096)", "Extreme (8192)"};  // (SHADOW_*)
 const char *const k_icons[] = {"Automatic", "Keyboard", "Xbox", "PlayStation", "Nintendo"};  // (ICONS_*)
 constexpr int k_fps[] = FPS_CHOICES;  // frame rate (0: Off, no limit)
 const char *const k_vsync[VSYNC_COUNT] = {"On", "Fast", "Adaptive", "Off"};  // (settings.h VSYNC_*)
-constexpr int FPS_DEFAULT_INDEX = 1;
+constexpr int FPS_DEFAULT_INDEX = 2;
 static_assert(k_fps[FPS_DEFAULT_INDEX] == FPS_DEFAULT);
 constexpr int k_sens[] = {10, 25, 50, 75, 100, 125, 150, 200, 250, 300, 400, 500, 600, 800, 1000};  // mouse sensitivity, %
 constexpr int SENS_DEFAULT = 9;  // (300%: MOUSE_SENS_DEFAULT)
@@ -246,7 +246,7 @@ void build_items(void) {
     v.push_back(button(P_MAIN, "Keyboard (sticks)", "Keys for the sticks and for walking.", "Open", A_PAGE, P_STICKS));
     v.push_back(button(P_MAIN, "Controller", "Which controller button does each button.", "Open", A_PAGE, P_PAD));
     v.push_back(button(P_MAIN, "Language", "Language of the texts and of the voices.", "Open", A_PAGE, P_LANGUAGE));
-    v.push_back(button(P_MAIN, "Quit game", "To the desktop, or back to the Savage Wind start screen.", "Quit",
+    v.push_back(button(P_MAIN, "Quit game", "To the desktop, or back to the Iris Winds start screen.", "Quit",
                        A_QUIT, 0));
 
     // Video (fullscreen and the window size are applied by the window loop: menu.mm)
@@ -482,7 +482,7 @@ bool install(void) {
     uint32_t count = rd32(OPT_COUNT), rows = rd32(OPT_ROWS);
     uint64_t order = rd64(OPT_ORDER);
     if (count != GAME_ENTRIES || !ent || !order || rows == 0 || rows > 32) {
-        fprintf(stderr, "[options] unexpected option table (%u entries, %u rows): Savage Wind's pages left out\n",
+        fprintf(stderr, "[options] unexpected option table (%u entries, %u rows): Iris Winds's pages left out\n",
                 count, rows);
         g_installed = 0;
         return false;
@@ -518,7 +518,7 @@ bool install(void) {
     g_installed = (uint64_t)(uintptr_t)g_entries.data();
     wr64(OPT_ENTRIES, g_installed);
     wr32(OPT_COUNT, (uint32_t)g_entries.size());
-    fprintf(stderr, "[options] Savage Wind's pages added to the Options screen (%zu entries)\n", g_items.size());
+    fprintf(stderr, "[options] Iris Winds's pages added to the Options screen (%zu entries)\n", g_items.size());
     return true;
 }
 
@@ -781,7 +781,7 @@ extern "C" void rt_opt_back(void) {
     }
 }
 
-// The title menu's Downloadable Content button (id 0x6d) is gone until Savage Wind has DLC: its eShop button opened the
+// The title menu's Downloadable Content button (id 0x6d) is gone until Iris Winds has DLC: its eShop button opened the
 // shop applet, which isn't there, and the game waited for it forever (issue #19). Two parts, both through the game's
 // own means, so the menu behaves as it does when the game itself leaves buttons out (no save: no Continue):
 //  - which buttons the cursor can reach: the menu enables them at its start from static lists {u32 count, ids} (one
@@ -869,7 +869,7 @@ extern "C" uint64_t rt_opt_screen(void) { return options_screen(); }
 // (lower). Its buttons write their answer to dialog_answer (1.8.2 0x7001c4b308; upper 0x5b: 0, lower 0x5a: 1;
 // FUN_7100d46598) and leave the dialog up; B closes it without an answer (rt_quit_dialog_back).
 
-// The title menu's amiibo settings button (Savage Wind has no amiibo support) is Quit
+// The title menu's amiibo settings button (Iris Winds has no amiibo support) is Quit
 extern "C" int rt_title_event(uint32_t id) { return id == TITLE_AMIIBO_BUTTON; }
 
 // LayoutMsg/Title_00 lookups: "0003" (the amiibo settings button) reads Quit
@@ -897,7 +897,7 @@ extern "C" uint64_t rt_quit_dialog_begin(uint64_t owner) {
 extern "C" void rt_quit_dialog_texts(uint64_t msg, uint64_t left, uint64_t right) {
     if (!g_quit_texts) return;
     g_quit_texts = false;
-    put_text(MSG_QUIT_QUESTION, tr("Quit to the desktop, or back to the Savage Wind start screen? Unsaved progress "
+    put_text(MSG_QUIT_QUESTION, tr("Quit to the desktop, or back to the Iris Winds start screen? Unsaved progress "
                                    "is lost."), msg);
     // (left: the lower button, 0x5a, the cursor's and B's; right: the upper one, 0x5b)
     put_text(MSG_QUIT_START, tr("Start screen"), left);

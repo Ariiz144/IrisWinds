@@ -143,7 +143,9 @@ static bool find_tools(Tools *t) {
     if (b > s) s = b;
     if (s) *s = 0;
 #ifdef _WIN32
-    if (!rt_resource("savagewind.dll.a", "build/savagewind.dll.a", t->implib, sizeof t->implib)) return false;
+    if (!rt_resource("iriswinds.dll.a", "build/iriswinds.dll.a", t->implib, sizeof t->implib) &&
+        !rt_resource("savagewind.dll.a", "build/savagewind.dll.a", t->implib, sizeof t->implib))
+        return false;
     t->zig_rt[0] = 0;
     if (t->zig && rt_resource("zig" SEP "rt" SEP "link.rsp", NULL, t->zig_rt, sizeof t->zig_rt)) {
         char *s = strrchr(t->zig_rt, '/'), *b = strrchr(t->zig_rt, '\\');
@@ -296,7 +298,7 @@ bool gamebuild_run(const char *game_dir, const GameBuildOpts *o, char *why, size
     if (!registered) registered = true, atexit(end_all);
     Tools t;
     if (!find_tools(&t)) {
-        snprintf(why, why_size, "the game code builder is missing from this copy of Savage Wind");
+        snprintf(why, why_size, "the game code builder is missing from this copy of Iris Winds");
         return false;
     }
     char work[1100], lib[1100], tmp[1100];
@@ -534,6 +536,32 @@ bool gamebuild_run(const char *game_dir, const GameBuildOpts *o, char *why, size
             ok = false;
         }
         if (f) fclose(f);
+        if (ok) {
+            mkdir("cache", 0755);
+            char cache_lib[1100], cache_id[1100];
+            snprintf(cache_lib, sizeof cache_lib, "cache" SEP "%s", GAMELIB_NAME);
+            snprintf(cache_id, sizeof cache_id, "cache" SEP "%s.id", GAMELIB_NAME);
+            FILE *in = fopen(lib, "rb");
+            if (in) {
+                FILE *out = fopen(cache_lib, "wb");
+                if (out) {
+                    char buf[65536]; size_t n;
+                    while ((n = fread(buf, 1, sizeof buf, in)) > 0) fwrite(buf, 1, n, out);
+                    fclose(out);
+                }
+                fclose(in);
+            }
+            FILE *in_id = fopen(idp, "rb");
+            if (in_id) {
+                FILE *out_id = fopen(cache_id, "wb");
+                if (out_id) {
+                    char buf[256]; size_t n;
+                    while ((n = fread(buf, 1, sizeof buf, in_id)) > 0) fwrite(buf, 1, n, out_id);
+                    fclose(out_id);
+                }
+                fclose(in_id);
+            }
+        }
     }
     free(units.u);
     rt_remove_game_file(game_dir, ".gamebuild");  // the C, the objects, the logs

@@ -102,22 +102,46 @@ static inline uint64_t gob_offset(uint32_t xb, uint32_t y, uint32_t z, uint32_t 
     return off;
 }
 
+typedef struct { uint64_t a, b; } TegraWord128;
+
 static void copy_surface(const uint8_t *src, uint8_t *dst, uint32_t wb, uint32_t hb, uint32_t d, uint32_t bpb,
                          uint32_t bh_log2, uint32_t bd_log2, bool to_linear) {
     uint32_t row_bytes = wb * bpb;
     uint32_t width_gobs = (row_bytes + 63) / 64;
     uint32_t gob_rows = 8u << bh_log2;
     uint64_t blocks_rows = (hb + gob_rows - 1) / gob_rows;
+    uint64_t block_size = 512ull << (bh_log2 + bd_log2);
+
     for (uint32_t z = 0; z < d; z++) {
+        uint32_t block_z = z >> bd_log2, z_in_block = z & ((1u << bd_log2) - 1);
+        uint64_t z_block_off = (uint64_t)block_z * blocks_rows;
+        uint64_t z_gob_off = ((uint64_t)z_in_block << bh_log2) * 512;
+
         for (uint32_t y = 0; y < hb; y++) {
             uint8_t *lin = dst + ((uint64_t)z * hb + y) * row_bytes;
             const uint8_t *lin_src = src + ((uint64_t)z * hb + y) * row_bytes;
-            // 16-byte runs are contiguous in both layouts
+
+            uint32_t gob_y = y >> 3;
+            uint32_t block_y = gob_y >> bh_log2, gob_in_block_y = gob_y & ((1u << bh_log2) - 1);
+            uint64_t row_base = (z_block_off + block_y) * width_gobs * block_size + z_gob_off + ((uint64_t)gob_in_block_y * 512);
+
+            uint32_t yi = y & 7;
+            uint32_t y_sector = ((yi >> 1) << 6) | ((yi & 1) << 4);
+
             for (uint32_t x = 0; x < row_bytes; x += 16) {
-                uint32_t n = row_bytes - x < 16 ? row_bytes - x : 16;
-                uint64_t o = gob_offset(x, y, z, width_gobs, bh_log2, bd_log2, blocks_rows);
-                if (to_linear) memcpy(lin + x, src + o, n);
-                else memcpy(dst + o, lin_src + x, n);
+                uint32_t gob_x = x >> 6;
+                uint32_t xi = x & 63;
+                uint32_t x_sector = ((xi >> 5) << 8) | (((xi >> 4) & 1) << 5) | (xi & 0x0F);
+                uint64_t o = row_base + (uint64_t)gob_x * block_size + y_sector + x_sector;
+
+                if (row_bytes - x >= 16) {
+                    if (to_linear) *(TegraWord128 *)(lin + x) = *(const TegraWord128 *)(src + o);
+                    else *(TegraWord128 *)(dst + o) = *(const TegraWord128 *)(lin_src + x);
+                } else {
+                    uint32_t n = row_bytes - x;
+                    if (to_linear) memcpy(lin + x, src + o, n);
+                    else memcpy(dst + o, lin_src + x, n);
+                }
             }
         }
     }

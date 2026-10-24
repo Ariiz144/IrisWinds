@@ -713,8 +713,8 @@ static void tab_quit(float scale, bool in_game) {
         ask = 0;
     const char *lost = in_game ? tr("\n\nProgress since your last save is lost.") : "";
     char d1[400], d2[400];
-    snprintf(d1, sizeof d1, tr("Leaves the game and goes back to the Savage Wind start screen.%s"), lost);
-    snprintf(d2, sizeof d2, tr("Closes Savage Wind.%s"), lost);
+    snprintf(d1, sizeof d1, tr("Leaves the game and goes back to the Iris Winds start screen.%s"), lost);
+    snprintf(d2, sizeof d2, tr("Closes Iris Winds.%s"), lost);
     opt_begin("##quit", scale);
     opt_section("Quit");
     if (!ask) {
