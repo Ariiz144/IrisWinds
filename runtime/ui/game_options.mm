@@ -148,6 +148,9 @@ static_assert(k_sens[SENS_DEFAULT] == 300);
 constexpr int k_motion_sens[] = {25, 50, 75, 100, 125, 150, 200, 250, 300, 400};  // motion sensitivity, %
 constexpr int MOTION_SENS_DEFAULT = 3;
 static_assert(k_motion_sens[MOTION_SENS_DEFAULT] == 100);
+constexpr int k_deadzone[] = {0, 3, 5, 8, 10, 12, 15, 20, 25, 30, 40};  // stick dead zone, % of full tilt
+constexpr int DEADZONE_DEFAULT = 4;
+static_assert(k_deadzone[DEADZONE_DEFAULT] == (int)(STICK_DEADZONE_DEFAULT * 100 + 0.5f));
 const char *const k_invert[] = {"Off", "Up and down", "Left and right", "Both"};  // (MOTION_INVERT_* bits)
 #define N(a) (int)(sizeof(a) / sizeof((a)[0]))
 
@@ -381,6 +384,20 @@ void build_items(void) {
     v.push_back(toggle(P_CONTROLS, "D-pad as left stick", "The d-pad also moves like the left stick.",
                        [](const Item &) { return (int)g_settings.dpad_move; },
                        [](const Item &, int x) { g_settings.dpad_move = x; }, 0));
+    for (int s = 0; s < 2; s++)  // (runtime/hle/input.c dead_zone)
+        v.push_back(choice(P_CONTROLS, s ? "Right stick dead zone" : "Left stick dead zone",
+                           "How far the stick must move before it counts. Raise it if the stick drifts.",
+                           [](const Item &) { return N(k_deadzone); },
+                           [](const Item &, int x) {
+                               static std::string str;
+                               str = pct(k_deadzone[x]);
+                               return str.c_str();
+                           },
+                           s ? [](const Item &) { return nearest(k_deadzone, N(k_deadzone), g_settings.stick_deadzone[1] * 100); }
+                             : [](const Item &) { return nearest(k_deadzone, N(k_deadzone), g_settings.stick_deadzone[0] * 100); },
+                           s ? [](const Item &, int x) { g_settings.stick_deadzone[1] = k_deadzone[x] / 100.0f; }
+                             : [](const Item &, int x) { g_settings.stick_deadzone[0] = k_deadzone[x] / 100.0f; },
+                           DEADZONE_DEFAULT));
     v.push_back(toggle(P_CONTROLS, "Mouse camera", "The mouse turns the camera. Esc frees the cursor.",
                        [](const Item &) { return (int)g_settings.mouse_camera; },
                        [](const Item &, int x) { g_settings.mouse_camera = x; }, 1));
