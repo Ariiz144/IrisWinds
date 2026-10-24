@@ -34,9 +34,9 @@ mouse, and its text and voices in any of its languages.
 > Savage Wind never decrypts anything: it only reads files you have already extracted yourself. The recompilation of
 > the game code happens locally, on your machine, from your files.
 
-## Getting started (Alpha 2, Windows)
+## Getting started (Alpha 2.1, Windows)
 
-1. Download `SavageWind-0.2.0-alpha.2-windows.zip` from [Releases](https://github.com/Revivedx/SavageWindRecomp/releases)
+1. Download `IrisWinds-0.2.1-alpha.2.1-windows.zip` from [Releases](https://github.com/Ariiz144/IrisWinds/releases)
    and extract it to a folder you can write to (not Program Files): your game files, saves and settings are kept in
    that folder.
 2. Run `savagewind.exe`. The first time it asks for your game files: pick the folder with your own extracted game
