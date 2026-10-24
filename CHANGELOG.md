@@ -2,7 +2,7 @@
 
 What changed in each Savage Wind release. The `test` branch holds what the next one will contain.
 
-## Alpha 3 (0.3.0-alpha.3) - unreleased
+## Alpha 3 (0.3.0-alpha.3) - 2026-10-24
 
 **The first release for Linux, with a highly experimental build for ARM.** Alpha 3 supports game version 1.9.0. It
 adds ultrawide, a field of view slider, motion controls and shader precompilation, builds the game code about five

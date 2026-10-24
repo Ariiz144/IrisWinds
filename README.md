@@ -32,24 +32,35 @@ mouse, and its text and voices in any of its languages.
 > Savage Wind never decrypts anything: it only reads files you have already extracted yourself. The recompilation of
 > the game code happens locally, on your machine, from your files.
 
-## Getting started (Alpha 2, Windows)
+## Getting started (Alpha 3)
 
-1. Download `SavageWind-0.2.0-alpha.2-windows.zip` from [Releases](https://github.com/Revivedx/SavageWindRecomp/releases)
-   and extract it to a folder you can write to (not Program Files): your game files, saves and settings are kept in
-   that folder.
-2. Run `savagewind.exe`. The first time it asks for your game files: pick the folder with your own extracted game
-   (`exefs/` and `romfs/`, version 1.9.0, see below) and choose **Set up game files**. It checks the
-   version, copies the files, builds the data image and recompiles the game code on your machine - once, and it takes
-   a while (about 40 minutes with a 12-thread CPU). Your own files aren't changed. When it's done the game starts.
-3. From then on `savagewind.exe` goes straight into the game. The settings, including the text and voice languages,
+1. Download from [Releases](https://github.com/Revivedx/SavageWindRecomp/releases):
+   - **Windows:** `SavageWind-0.3.0-alpha.3-windows.zip`. Extract it to a folder you can write to (not Program
+     Files): your game files, saves and settings are kept in that folder.
+   - **Linux (x86-64, Steam Deck too):** `Savage_Wind-0.3.0-alpha.3-x86_64.AppImage`. Make it executable
+     (`chmod +x`) and run it; your game files, saves and settings go to `~/.local/share/savagewind`. See
+     [docs/linux.md](docs/linux.md).
+   - **Linux on ARM (aarch64):** `Savage_Wind-0.3.0-alpha.3-aarch64.AppImage` is **highly experimental**: it has
+     never run on real ARM hardware. Reports from real hardware are welcome ([docs/linux.md](docs/linux.md),
+     "Testing on ARM").
+2. Run `savagewind.exe` (or the AppImage). The first time it asks for your game files: pick the folder with your own
+   extracted game (`exefs/` and `romfs/`, version 1.9.0, see below) and choose **Set up game files**. It checks the
+   version, copies the files, builds the data image and recompiles the game code on your machine - once (about 6
+   minutes for the game code with a 12-thread CPU, plus the copy and the optional shader precompilation). Your own
+   files aren't changed. When it's done the game starts.
+3. From then on Savage Wind goes straight into the game. The settings, including the text and voice languages,
    are in the game's Options (pause menu > System > Options, or Options on the title screen).
-4. **Savage Wind Configuration** (`Savage Wind Configuration.exe`, in the same folder) opens the configuration
-   screen: Play, Settings, your game files (set them up again, rebuild the game code, delete them) and Quit. In
-   game, Quit to Start Screen also comes back to it. (Built from source on Linux or macOS: `--config`, the
-   AppImage's **Savage Wind Configuration** desktop action, or Option held while opening the Mac app.)
+4. **Savage Wind Configuration** (`Savage Wind Configuration.exe` on Windows, the AppImage's **Savage Wind
+   Configuration** desktop action or `--config` on Linux) opens the configuration screen: Play, Settings, your game
+   files (set them up again, rebuild the game code, delete them) and Quit. In game, Quit to Start Screen also comes
+   back to it.
+
+Coming from Alpha 2: extract Alpha 3 to a new folder and set the game files up again with your 1.9.0 files (the game
+code has to be built again); copy your `save` folder over to keep your progress. What's new is in
+[CHANGELOG.md](CHANGELOG.md).
 
 The setup and configuration screens show Savage Wind's own art. To see a picture of your own there instead, put it
-next to `savagewind.exe` as `splash.jpg` or `splash.png`; it's only read from your folder and never part of
+next to `savagewind.exe` (on Linux, in the data folder) as `splash.jpg` or `splash.png`; it's only read from your folder and never part of
 Savage Wind.
 
 Needs Windows 10 or later, a CPU with SSE4.2 (2008 or newer), a GPU with Vulkan 1.3 and about 35 GB of free disk

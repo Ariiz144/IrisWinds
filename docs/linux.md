@@ -5,8 +5,8 @@ the game itself untested on real hardware - community reports decide (see the en
 package the release AppImages.
 
 ## Running the AppImage
-    chmod +x Savage_Wind-beta_3-x86_64.AppImage
-    ./Savage_Wind-beta_3-x86_64.AppImage
+    chmod +x Savage_Wind-0.3.0-alpha.3-x86_64.AppImage
+    ./Savage_Wind-0.3.0-alpha.3-x86_64.AppImage
 
 Needs: a distribution with glibc 2.35 or newer (Ubuntu 22.04, Debian 12, Fedora 36, Arch, ...), a Vulkan 1.3 driver
 (Mesa RADV / ANV / NVK / Turnip / Asahi Honeykrisp, or NVIDIA's), and on x86-64 a CPU with SSE4.2 (2008 or newer;
@@ -130,7 +130,7 @@ The aarch64 AppImage is experimental: built on x86-64, only its start screen has
    A crash writes `*** signal ...` and a backtrace there; attach the whole file.
 5. **A crash backtrace with gdb** when the log's isn't enough:
 
-       ./Savage_Wind-beta_3-aarch64.AppImage --appimage-extract    # -> squashfs-root/
+       ./Savage_Wind-0.3.0-alpha.3-aarch64.AppImage --appimage-extract    # -> squashfs-root/
        cd ~/.local/share/savagewind
        gdb -batch -ex 'handle SIGSEGV nostop noprint pass' -ex run -ex 'thread apply all bt 20' \
            --args ~/squashfs-root/usr/bin/savagewind > gdb.txt 2>&1
