@@ -32,7 +32,8 @@
 // Test and debug switches:
 //   SAVAGEWIND_FPS=<n>             frame rate instead of the setting (0: no limit)
 //   SAVAGEWIND_FRAMEPACE=0         the game's own pacing and clock (its 30 / 20 fps, as before)
-//   SAVAGEWIND_MOVIE_FPS=<n>       frame rate while a movie plays (default: the movie's own; 0: the chosen one)
+//   SAVAGEWIND_MOVIE_FPS=<n>       frame rate while a movie plays (default: the chosen one, the pictures paced by
+//                                  their time; with SAVAGEWIND_MOVIE_PACE=0 the movie's own; 0: the chosen one)
 //   SAVAGEWIND_MENU_FPS=<n>        frame rate in the menus (default 30; 0: the chosen one)
 //   SAVAGEWIND_EVENT_FPS=<n>       frame rate in the events (default 30; 0: the chosen one)
 //   SAVAGEWIND_LOG_FRAMEPACE=<n>   every n clock updates: target, frame length, VFR ratio and interval
@@ -86,7 +87,8 @@ static bool in_event(void) {
 int framepace_target(void) {
     static int forced = -2, movie = -2, menu = -2, event = -2;
     if (forced == -2) forced = env_int("SAVAGEWIND_FPS", -1);
-    if (movie == -2) movie = env_int("SAVAGEWIND_MOVIE_FPS", -1);  // (-1: the movie's own frame rate)
+    extern bool movie_paced(void);
+    if (movie == -2) movie = env_int("SAVAGEWIND_MOVIE_FPS", movie_paced() ? 0 : -1);  // (-1: the movie's own frame rate)
     if (menu == -2) menu = env_int("SAVAGEWIND_MENU_FPS", 30);
     if (event == -2) event = env_int("SAVAGEWIND_EVENT_FPS", 30);
     int fps = forced >= 0 ? forced : g_settings.fps_limit;

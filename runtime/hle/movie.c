@@ -20,6 +20,7 @@
 #include <unistd.h>
 
 #include "../hle.h"
+#include "../kernel.h"
 #include "../settings.h"
 
 #define MOVIE_EOS 4u
@@ -440,6 +441,7 @@ typedef struct {
     bool stopped;  // Stop / destroyed: no more events (see dec_stop)
     bool playing;  // a started video decoder, counted in g_movie_playing
     int fps;       // a video's frame rate (its file's)
+    int64_t clock_ns, clock_us;  // pacing: when the frame of time clock_us was handed out (0: not yet)
     pthread_mutex_t lock;
 } Decoder;
 
@@ -536,11 +538,18 @@ static void dec_output_format(Decoder *d, MediaData *m) {
 static void dec_get_output_format(Cpu *c) { dec_output_format(self_state(c), md(c->x[1])); c->x[0] = 0; }
 static void dec_get_output_buffer_format(Cpu *c) { dec_output_format(self_state(c), md(c->x[2])); c->x[0] = 0; }
 
-// Video decoders started and not stopped: a movie is playing. The game shows one of its pictures per frame, so the
-// frame rate is held at the movie's own meanwhile (runtime/hle/framepace.c): 30 for the game's, 60 for a 60 fps
-// replacement in the RomFS overlay.
+// Video decoders started and not stopped: a movie is playing. The game shows a new picture every frame it gets one,
+// so the pictures are paced by their time (movie_paced, dec_acquire_output) and the game keeps its frame rate, as Cemu
+// does; without the pacing (SAVAGEWIND_MOVIE_PACE=0) the frame rate is held at the movie's own meanwhile
+// (runtime/hle/framepace.c): 30 for the game's, 60 for a 60 fps replacement in the RomFS overlay.
 volatile int g_movie_playing;
 volatile int g_movie_fps = 30;
+
+bool movie_paced(void) {
+    static int on = -1;
+    if (on < 0) on = !getenv("SAVAGEWIND_MOVIE_PACE") || atoi(getenv("SAVAGEWIND_MOVIE_PACE")) != 0;
+    return on;
+}
 
 static void dec_start(Cpu *c) {
     Decoder *d = self_state(c);
@@ -548,6 +557,7 @@ static void dec_start(Cpu *c) {
     d->stopped = false;
     if (d->video && !d->playing) {
         d->playing = true;
+        d->clock_ns = 0;
         g_movie_fps = d->fps > 0 ? d->fps : 30;
         __atomic_add_fetch(&g_movie_playing, 1, __ATOMIC_RELAXED);
     }
@@ -725,6 +735,26 @@ static void dec_acquire_output(Cpu *c) {
     pthread_mutex_lock(&d->lock);
     if (!d->nready) { pthread_mutex_unlock(&d->lock); c->x[0] = 1; return; }
     OutReady r = d->ready[0];
+    if (d->video && !(r.flags & MOVIE_EOS) && movie_paced()) {
+        // A picture is handed out once its time has come on a clock started at the first one: the game's player
+        // thread waits here until then (the emulated core released), and the game shows the last one meanwhile.
+        // (Answering "none yet" instead stalled the player: it waits for the output event, which a full decoder
+        // doesn't signal again.) Late by more than a frame or two (a hitch): the clock moves on to the picture
+        // instead of rushing through the ones after it.
+        int64_t now = av_gettime_relative() * 1000;
+        if (!d->clock_ns) d->clock_ns = now, d->clock_us = r.time;
+        int64_t due = d->clock_ns + (r.time - d->clock_us) * 1000;
+        if (now < due) {
+            int64_t wait = due - now < 100000000 ? due - now : 100000000;  // (100 ms at most: a bad timestamp)
+            pthread_mutex_unlock(&d->lock);
+            kernel_host_work_begin();
+            av_usleep((unsigned)(wait / 1000));
+            kernel_host_work_end();
+            pthread_mutex_lock(&d->lock);
+            if (!d->nready) { pthread_mutex_unlock(&d->lock); c->x[0] = 1; return; }  // (stopped meanwhile)
+            r = d->ready[0];
+        } else if (now - due > 100000000) d->clock_ns = now, d->clock_us = r.time;
+    }
     memmove(d->ready, d->ready + 1, --d->nready * sizeof *d->ready);
     int remaining = d->nready;
     pthread_mutex_unlock(&d->lock);
