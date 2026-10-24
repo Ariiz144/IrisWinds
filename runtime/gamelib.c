@@ -64,11 +64,6 @@ static bool id_matches(const char *lib) {
         while (n && (id[n - 1] == '\n' || id[n - 1] == '\r')) id[--n] = 0;
         if (!strcmp(id, GAMELIB_ID)) return true;
     }
-    // If .id does not match or is missing, check if existing library has compatible ABI
-    if (exists(lib)) {
-        const GameLibTables *t = open_lib(lib);
-        if (t && take_sites(t)) return true;
-    }
     return false;
 }
 
@@ -111,16 +106,12 @@ static const GameLibTables *open_lib(const char *path) {
         snprintf(g_error, sizeof g_error, "%s has incompatible ABI (%u vs %u)", path, t ? t->abi : 0, GAMELIB_ABI);
         return NULL;  // (left loaded: nothing of it runs)
     }
-    if (!t->id || strcmp(t->id, GAMELIB_ID)) {
-        LOG("[gamelib] Reusing existing recompiled game code %s (id %.16s, ABI %u matches)\n",
-            path, t->id ? t->id : "none", t->abi);
-        char id_path[1100];
-        snprintf(id_path, sizeof id_path, "%s.id", path);
-        FILE *f = fopen(id_path, "wb");
-        if (f) {
-            fprintf(f, "%s\n", GAMELIB_ID);
-            fclose(f);
-        }
+    if (!t->id || strcmp(t->id, GAMELIB_ID) != 0) {
+        snprintf(g_error, sizeof g_error, "%s id mismatch (%s vs expected %s)",
+                 path, t->id ? t->id : "none", GAMELIB_ID);
+        LOG("[gamelib] Incompatible game library %s: id is %.16s, expected %.16s\n",
+            path, t->id ? t->id : "none", GAMELIB_ID);
+        return NULL;
     }
     return t;
 }

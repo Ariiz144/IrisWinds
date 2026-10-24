@@ -12,6 +12,7 @@
 #include "paths.h"
 #include "platform.h"
 #include "rt.h"
+#include "recomp_cache.h"
 
 // From the Makefile: the flags the game code is compiled and linked with (as `make` builds it in a source checkout)
 #ifndef GAMELIB_CFLAGS
@@ -235,6 +236,8 @@ static void log_tail(const char *path, char *out, size_t n) {  // the last line 
 // ------------------------------------------------------------------ compiling
 typedef struct {
     char src[1100], obj[1100], log[1100];
+    char stem[64];
+    bool uses_gamelib_id;
     unsigned long long bytes;
 } Unit;
 
@@ -243,7 +246,7 @@ typedef struct {
     int n, cap;
 } Units;
 
-static void add_unit(Units *us, const char *src, const char *work, const char *stem) {
+static void add_unit(Units *us, const char *src, const char *work, const char *stem, bool uses_gamelib_id) {
     if (us->n == us->cap) {
         us->cap = us->cap ? us->cap * 2 : 64;
         us->u = (Unit *)realloc(us->u, sizeof *us->u * us->cap);
@@ -252,6 +255,8 @@ static void add_unit(Units *us, const char *src, const char *work, const char *s
     snprintf(u->src, sizeof u->src, "%s", src);
     snprintf(u->obj, sizeof u->obj, "%s" SEP "%s.o", work, stem);
     snprintf(u->log, sizeof u->log, "%s" SEP "%s.log", work, stem);
+    snprintf(u->stem, sizeof u->stem, "%s", stem);
+    u->uses_gamelib_id = uses_gamelib_id;
     struct stat st;
     u->bytes = stat(src, &st) == 0 ? (unsigned long long)st.st_size : 0;
 }
@@ -281,7 +286,9 @@ static PlatProc start_compile(const Tools *t, const Unit *u) {
     char inc[1200];
     snprintf(inc, sizeof inc, "-I%s", t->inc);
     add(&a, inc);
-    add(&a, "-DGAMELIB_ID=\"" GAMELIB_ID "\"");
+    if (u->uses_gamelib_id) {
+        add(&a, "-DGAMELIB_ID=\"" GAMELIB_ID "\"");
+    }
     add(&a, "-c");
     add(&a, u->src);
     add(&a, "-o");
@@ -305,13 +312,11 @@ bool gamebuild_run(const char *game_dir, const GameBuildOpts *o, char *why, size
     snprintf(work, sizeof work, "%s" SEP ".gamebuild", game_dir);
     snprintf(lib, sizeof lib, "%s" SEP "%s", game_dir, GAMELIB_NAME);
     snprintf(tmp, sizeof tmp, "%s" SEP "%s.tmp", work, GAMELIB_NAME);
-    rt_remove_game_file(game_dir, ".gamebuild");
-    rt_remove_game_file(game_dir, GAMELIB_NAME);
-    rt_remove_game_file(game_dir, GAMELIB_NAME ".id");
     mkdir(work, 0755);
-    if (t.zig) {  // its caches in the work folder too (deleted below), not ~/.cache: hundreds of MB, used once
-        char zc[1200];
-        snprintf(zc, sizeof zc, "%s" SEP "zig-cache", work);
+
+    recomp_cache_init(rt_data_root(), t.cc, t.zig, t.inc, GAMELIB_CFLAGS, t.zig ? GAMELIB_ZIGFLAGS : "");
+    if (t.zig) {
+        const char *zc = recomp_cache_zig_dir();
 #ifdef _WIN32
         _putenv_s("ZIG_GLOBAL_CACHE_DIR", zc);
         _putenv_s("ZIG_LOCAL_CACHE_DIR", zc);
@@ -425,6 +430,17 @@ bool gamebuild_run(const char *game_dir, const GameBuildOpts *o, char *why, size
         snprintf(g->out, sizeof g->out, "%s" SEP "%s", work, g->name);
         char nso[1100];
         snprintf(nso, sizeof nso, "%s" SEP "%s", exefs, g->name);
+
+        int cached_files = recomp_cache_get_module(g->name, nso, layout,
+                                                   strcmp(g->name, "main") ? t.hle : NULL,
+                                                   t.gen, g->out);
+        if (cached_files > 0) {
+            g->exit = 0;
+            g->files = cached_files;
+            g->p = 0;
+            continue;
+        }
+
         Args a = {0};
         add(&a, t.gen);
         if (t.gen_script[0]) add(&a, t.gen_script);
@@ -447,8 +463,8 @@ bool gamebuild_run(const char *game_dir, const GameBuildOpts *o, char *why, size
     unsigned long long done_bytes = 0;
     double shown = 0;
     {
-        add_unit(&units, t.entry, work, "gamelib_entry");
-        add_unit(&units, layout_c, work, "layout");
+        add_unit(&units, t.entry, work, "gamelib_entry", true);
+        add_unit(&units, layout_c, work, "layout", false);
     }
     while (ok) {
         // generator progress, newly finished files
@@ -463,7 +479,19 @@ bool gamebuild_run(const char *game_dir, const GameBuildOpts *o, char *why, size
                 if (r >= 0) {
                     g->exit = r;
                     read_gen_log(g);
-                    if (r != 0) {
+                    for (int c = g->files; ; c++) {
+                        char chunk_check[1200];
+                        snprintf(chunk_check, sizeof chunk_check, "%s" SEP "%s_%03d.c", g->out, g->name, c);
+                        if (!file_exists(chunk_check)) break;
+                        g->files = c + 1;
+                    }
+                    if (r == 0) {
+                        char nso[1100];
+                        snprintf(nso, sizeof nso, "%s" SEP "%s", exefs, g->name);
+                        recomp_cache_put_module(g->name, nso, layout,
+                                                strcmp(g->name, "main") ? t.hle : NULL,
+                                                t.gen, g->out, g->files, true);
+                    } else {
                         char last[300];
                         log_tail(g->log, last, sizeof last);
                         LOG("[gamebuild] generator (%s) failed: %s\n", g->name, last);
@@ -477,13 +505,13 @@ bool gamebuild_run(const char *game_dir, const GameBuildOpts *o, char *why, size
                 char src[1100], stem[64];
                 snprintf(stem, sizeof stem, "%s_%03d", g->name, queued[i]);
                 snprintf(src, sizeof src, "%s" SEP "%s.c", g->out, stem);
-                add_unit(&units, src, work, stem);
+                add_unit(&units, src, work, stem, false);
             }
             if (g->exit == 0 && !tables[i]) {
                 char src[1100], stem[64];
                 snprintf(stem, sizeof stem, "%s_table", g->name);
                 snprintf(src, sizeof src, "%s" SEP "%s.c", g->out, stem);
-                add_unit(&units, src, work, stem);
+                add_unit(&units, src, work, stem, false);
                 tables[i] = true;
             }
             gen_frac += g->exit == 0 ? weight[i] : g->n ? weight[i] * (double)g->ci / (double)g->n : 0;
@@ -493,7 +521,13 @@ bool gamebuild_run(const char *game_dir, const GameBuildOpts *o, char *why, size
 
         // compiles
         while (nrun < jobs && next < units.n) {
-            PlatProc p = start_compile(&t, &units.u[next]);
+            Unit *u = &units.u[next];
+            if (recomp_cache_get_obj(u->src, u->stem, u->uses_gamelib_id, GAMELIB_ID, u->obj)) {
+                done_bytes += u->bytes;
+                next++;
+                continue;
+            }
+            PlatProc p = start_compile(&t, u);
             if (!p) { snprintf(why, why_size, "the compiler didn't start"); ok = false; break; }
             run[nrun].p = p, run[nrun].unit = next++;
             nrun++;
@@ -508,9 +542,10 @@ bool gamebuild_run(const char *game_dir, const GameBuildOpts *o, char *why, size
                 LOG("[gamebuild] compiling %s failed: %s\n", u->src, last);
                 snprintf(why, why_size, "the game code didn't compile");
                 ok = false;
+            } else {
+                recomp_cache_put_obj(u->src, u->stem, u->uses_gamelib_id, GAMELIB_ID, u->obj);
             }
             done_bytes += u->bytes;
-            if (run[k].unit > 0) remove(u->src);  // (generated C, done with: not kept. Unit 0 is the shipped entry file)
             run[k--] = run[--nrun];
         }
         if (!ok) break;
@@ -624,7 +659,8 @@ bool gamebuild_run(const char *game_dir, const GameBuildOpts *o, char *why, size
         }
     }
     free(units.u);
-    rt_remove_game_file(game_dir, ".gamebuild");  // the C, the objects, the logs
+    recomp_cache_enforce_limit();
+    recomp_cache_log_summary((double)(plat_now_ns() - t0) / 1e9);
     LOG("[gamebuild] %s in %.0fs\n", ok ? "done" : "failed", (double)(plat_now_ns() - t0) / 1e9);
     if (ok && o->progress) o->progress(1, "Finishing...");
     return ok;

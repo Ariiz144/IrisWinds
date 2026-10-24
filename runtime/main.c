@@ -6,6 +6,7 @@
 #include <string.h>
 
 #include "gamelib.h"
+#include "gamebuild.h"
 #include "paths.h"
 #include "nvn/maxwell/shader.h"
 #include "nvn/shader_archive.h"
@@ -288,6 +289,19 @@ static int precompile_shaders(const char *root) {
 }
 #endif
 
+static void cli_build_progress(double frac, const char *label) {
+    fprintf(stderr, "\r[build] %3.0f%%: %s        ", frac * 100.0, label);
+}
+
+static int build_game_lib(const char *root) {
+    int cores = SDL_GetNumLogicalCPUCores(), ram_gb = SDL_GetSystemRAM() / 1024;
+    GameBuildOpts o = {cli_build_progress, cores < ram_gb - 2 ? cores : ram_gb - 2 > 1 ? ram_gb - 2 : 1};
+    char why[256] = "";
+    bool ok = gamebuild_run(root, &o, why, sizeof why);
+    fprintf(stderr, "\n[build] %s%s%s\n", ok ? "success" : "failed: ", ok ? "" : why, ok ? "" : "");
+    return ok ? 0 : 1;
+}
+
 static int build_romfs_image(const char *root) {
     char dir[1100], out[1100], why[256] = "";
     snprintf(dir, sizeof dir, "%s/romfs", root);
@@ -316,11 +330,12 @@ int main(int argc, char **argv) {
     bool skip_launcher = getenv("SAVAGEWIND_NO_LAUNCHER") || getenv("SAVAGEWIND_INPUT");  // tests boot straight in
     bool config = false;
     static char arg_root[1024];
-    bool build_romfs = false, scan = false, precompile = false;
+    bool build_romfs = false, build_gamelib = false, scan = false, precompile = false;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--play")) skip_launcher = true;
         else if (!strcmp(argv[i], "--config")) config = true;
         else if (!strcmp(argv[i], "--build-romfs")) build_romfs = true;
+        else if (!strcmp(argv[i], "--build-gamelib") || !strcmp(argv[i], "--build-game-lib")) build_gamelib = true;
         else if (!strcmp(argv[i], "--scan-shaders")) scan = true;
         else if (!strcmp(argv[i], "--precompile-shaders")) precompile = true;
         else if (argv[i][0] != '-' && !realpath(argv[i], arg_root)) root = argv[i];  // (relative to where we started)
@@ -331,6 +346,7 @@ int main(int argc, char **argv) {
 #endif
     rt_paths_init();  // the data root becomes the working directory (runtime/paths.h)
     if (build_romfs) return build_romfs_image(root);
+    if (build_gamelib) return build_game_lib(root);
     if (scan) return scan_shaders(root);
 #ifndef __APPLE__
     if (precompile) return precompile_shaders(root);
