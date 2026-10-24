@@ -538,8 +538,8 @@ static void tab_display(void) {
         }
         std::string desc = tr("How many pictures a second the game draws. The game itself runs at the same speed at "
                               "every rate (the console runs it at 30). Higher rates need a faster computer. Menus, "
-                              "cutscenes and conversations run at 30, as on the console. Off: as many as the computer "
-                              "can draw.");
+                              "cutscenes and conversations use it too, and videos play at their own speed. Off: as "
+                              "many as the computer can draw.");
         int hz = (int)lroundf(winsize_refresh_rate());
         if (hz > 0) {
             char line[200];
