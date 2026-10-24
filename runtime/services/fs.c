@@ -46,6 +46,50 @@ static GrownFile *grown;
 static int ngrown;
 static uint8_t *rstb_blob;  // the patched ResourceSizeTable served from memory (rstb_patch)
 
+typedef struct StringChunk {
+    struct StringChunk *next;
+    size_t used;
+    size_t cap;
+    char data[];
+} StringChunk;
+
+typedef struct {
+    StringChunk *head;
+} StringArena;
+
+static StringArena g_fs_arena = {0};
+
+static char *arena_strcat(StringArena *a, const char *s1, const char *s2) {
+    size_t l1 = strlen(s1);
+    size_t l2 = strlen(s2);
+    size_t total = l1 + l2 + 1;
+    if (!a->head || a->head->used + total > a->head->cap) {
+        size_t cap = 512 * 1024;
+        if (total > cap) cap = total;
+        StringChunk *chunk = malloc(sizeof(StringChunk) + cap);
+        chunk->next = a->head;
+        chunk->used = 0;
+        chunk->cap = cap;
+        a->head = chunk;
+    }
+    char *dst = a->head->data + a->head->used;
+    memcpy(dst, s1, l1);
+    memcpy(dst + l1, s2, l2);
+    dst[l1 + l2] = '\0';
+    a->head->used += total;
+    return dst;
+}
+
+static void arena_free(StringArena *a) {
+    StringChunk *cur = a->head;
+    while (cur) {
+        StringChunk *next = cur->next;
+        free(cur);
+        cur = next;
+    }
+    a->head = NULL;
+}
+
 // Reboot: the next boot builds its own index / overlay when the game opens the RomFS again.
 RT_ON_RESET(fs_reset) {
     for (int i = 0; i < ov_n; i++) {
@@ -53,7 +97,7 @@ RT_ON_RESET(fs_reset) {
         free(ov[i].path);
     }
     for (int i = 0; i < npatches; i++) free(patches[i].data);  // (ov_meta and the extended table are among these)
-    for (int i = 0; i < rom_nfiles; i++) free(rom_files[i].path);
+    arena_free(&g_fs_arena);
     free(ov), free(rom_files), free(grown), free(rstb_blob);
     grown = NULL, ngrown = 0, rstb_blob = NULL;
     ov = NULL, ov_n = ov_cap = 0;
@@ -226,7 +270,7 @@ static void add_new_files(int fd, const uint64_t *h, const uint8_t *dmeta, uint6
         o += 0x20 + ((nl + 3) & ~3u);
         if (ov_n == ov_cap) { ov_cap = ov_cap ? ov_cap * 2 : 256; ov = realloc(ov, sizeof *ov * ov_cap); }
         ov[ov_n++] = (Overlay){data_at, size, strdup(nf[i].host), -1, NULL};
-        rom_files[rom_nfiles++] = (RomFile){data_at, size, strdup(nf[i].rel), entry};
+        rom_files[rom_nfiles++] = (RomFile){data_at, size, arena_strcat(&g_fs_arena, "", nf[i].rel), entry};
         data_at = (data_at + size + 0xF) & ~0xFull;
         added++;
     }
@@ -427,9 +471,7 @@ static void rom_index(int fd) {
         memcpy(name, fmeta + o + 0x20, nl);
         name[nl] = 0;
         if (rom_nfiles == cap) { cap *= 2; rom_files = realloc(rom_files, sizeof(RomFile) * cap); }
-        char *path = malloc(strlen(dir) + nl + 1);
-        strcpy(path, dir);
-        strcat(path, name);
+        char *path = arena_strcat(&g_fs_arena, dir, name);
         rom_files[rom_nfiles++] = (RomFile){rom_data_off + data, size, path, (uint32_t)o};
         o += 0x20 + ((namelen + 3) & ~3u);
     }

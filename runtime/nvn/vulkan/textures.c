@@ -414,7 +414,7 @@ static void destroy_image(TexBackend *b) {
 // registered with an object it finalized, copies of NVNtexture objects, command buffers recorded before it made its
 // frame's render targets again in the same memory), so they all take the same image. An image no texture holds any
 // more waits a few frames for the next texture made there, then goes.
-#define PARK_FRAMES 4
+#define PARK_FRAMES 2
 #define KEY_BUCKETS 4096
 static TexBackend *g_keyed[KEY_BUCKETS];
 static uint32_t key_bucket(uint64_t addr) { return (uint32_t)((addr >> 9) * 0x9E3779B97F4A7C15ull >> 40) & (KEY_BUCKETS - 1); }
@@ -611,8 +611,24 @@ void backend_texture_destroyed(NvnTexture *t) {
     gpu_unlock();
 }
 
+static void *g_tex_scratch = NULL;
+static size_t g_tex_scratch_cap = 0;
+static void *tex_scratch_alloc(size_t sz) {
+    if (sz > g_tex_scratch_cap) {
+        free(g_tex_scratch);
+        g_tex_scratch_cap = (sz + 0xFFFF) & ~0xFFFF;
+        g_tex_scratch = malloc(g_tex_scratch_cap);
+    }
+    return g_tex_scratch;
+}
+
 // Reboot (device.c backend_reset; GPU idle): every game texture and its views go.
 void vk_textures_reset(void) {
+    if (g_tex_scratch) {
+        free(g_tex_scratch);
+        g_tex_scratch = NULL;
+        g_tex_scratch_cap = 0;
+    }
     int n = g_nimages;
     while (g_nholders > 0) release_backend(g_holders[g_nholders - 1]);
     while (g_nimages > 0) free_backend(g_images[g_nimages - 1]);
@@ -798,12 +814,11 @@ static void upload_levels(NvnTexture *t, TexBackend *b, uint32_t level_mask) {
             LevelLayout l = tegra_level(&t->layout, lv);
             if (b->astc_bw) {  // blocks -> linear block rows -> RGBA8 texels
                 const uint8_t *src = (const uint8_t *)(uintptr_t)t->addr + layer * layer_size + l.offset;
-                uint8_t *blocks = malloc((uint64_t)l.wb * l.hb * 16);
+                uint8_t *blocks = tex_scratch_alloc((uint64_t)l.wb * l.hb * 16);
                 if (linear) for (uint32_t y = 0; y < l.hb; y++) memcpy(blocks + (uint64_t)y * l.wb * 16, src + (uint64_t)y * t->stride, l.wb * 16);
                 else tegra_deswizzle(src, blocks, l.wb, l.hb, 1, 16, l.block_height_log2, l.block_depth_log2);
                 VkSpan s = vk_transient((uint64_t)l.w * l.h * 4, 16);
                 astc_decode_ldr(blocks, l.w, l.h, b->astc_bw, b->astc_bh, b->astc_srgb, s.ptr);
-                free(blocks);
                 VkBufferImageCopy rg = {.bufferOffset = s.off, .bufferRowLength = l.w, .bufferImageHeight = l.h,
                                         .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, lv, layer, 1},
                                         .imageExtent = {l.w < level_w(b, lv) ? l.w : level_w(b, lv), l.h < level_h(b, lv) ? l.h : level_h(b, lv), 1}};
@@ -816,7 +831,7 @@ static void upload_levels(NvnTexture *t, TexBackend *b, uint32_t level_mask) {
             bool expand = mf.expand_rgb && fi->bpb == 3;
             uint32_t out_row = expand ? l.wb * 4 : row;
             VkSpan s = vk_transient((uint64_t)out_row * l.hb * l.d, 16);
-            uint8_t *lin = expand ? malloc(sz) : s.ptr;
+            uint8_t *lin = expand ? tex_scratch_alloc(sz) : s.ptr;
             const uint8_t *src = (const uint8_t *)(uintptr_t)t->addr + layer * layer_size + l.offset;
             if (linear) {
                 for (uint32_t y = 0; y < l.hb; y++) memcpy(lin + (uint64_t)y * row, src + (uint64_t)y * (t->stride ? t->stride : row), row);
@@ -844,7 +859,6 @@ static void upload_levels(NvnTexture *t, TexBackend *b, uint32_t level_mask) {
                 uint8_t *o = s.ptr;
                 uint64_t n = (uint64_t)l.wb * l.hb * l.d;
                 for (uint64_t i = 0; i < n; i++) { o[i * 4] = lin[i * 3]; o[i * 4 + 1] = lin[i * 3 + 1]; o[i * 4 + 2] = lin[i * 3 + 2]; o[i * 4 + 3] = 255; }
-                free(lin);
             }
             uint32_t w = l.w, hh = l.h, d = l.d;
             // the copy stays inside the image's level: a texture allocated at the internal resolution (16:9, render

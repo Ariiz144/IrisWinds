@@ -928,6 +928,14 @@ static void recreate_swapchain(void) {
 // presents, on a second queue of the same family (queues are externally synchronized: the GPU thread keeps submitting
 // on the first one meanwhile). One present at a time; the next acquire, a swapchain change and teardown wait for it.
 // SAVAGEWIND_VK_PRESENT_THREAD=0 (or a family with one queue): presents on the calling thread, as before.
+static pthread_mutex_t g_queue_lock = PTHREAD_MUTEX_INITIALIZER;
+void vk_queue_lock(void) {
+    pthread_mutex_lock(&g_queue_lock);
+}
+void vk_queue_unlock(void) {
+    pthread_mutex_unlock(&g_queue_lock);
+}
+
 static pthread_mutex_t pres_m = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t pres_cv = PTHREAD_COND_INITIALIZER;
 static bool pres_busy;           // a present is queued or in progress
@@ -944,7 +952,9 @@ static void *present_thread(void *arg) {
         while (!pres_busy) pthread_cond_wait(&pres_cv, &pres_m);
         VkPresentInfoKHR pi = pres_info;
         pthread_mutex_unlock(&pres_m);
+        vk_queue_lock();
         VkResult r = queue_present(g_vk.present_queue, &pi);
+        vk_queue_unlock();
         if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) atomic_store(&pres_stale, 1);
         else if (r != VK_SUCCESS) { static int n; if (n++ < 5) LOG("[vk] present failed: %d\n", r); }
         pthread_mutex_lock(&pres_m);
@@ -958,9 +968,9 @@ static bool present_threaded(void) {
     static int on = -1;
     if (on < 0) {
         const char *e = getenv("SAVAGEWIND_VK_PRESENT_THREAD");
-        on = g_vk.present_queue != g_vk.queue && !(e && !strcmp(e, "0"));
+        on = !(e && !strcmp(e, "0"));
         if (on) { pthread_t t; pthread_create(&t, NULL, present_thread, NULL); }
-        LOG("[vk] presents on %s\n", on ? "a thread of their own (second queue)" : "the calling thread");
+        LOG("[vk] presents on %s\n", on ? (g_vk.present_queue != g_vk.queue ? "a thread of their own (second queue)" : "a thread of their own (queue lock)") : "the calling thread");
     }
     return on;
 }
@@ -976,7 +986,9 @@ static bool present_image(uint32_t img, VkSemaphore sem) {
     if (!present_threaded()) {
         VkPresentInfoKHR pi = {.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, .waitSemaphoreCount = 1, .pWaitSemaphores = &sem,
                                .swapchainCount = 1, .pSwapchains = &g_vk.swapchain, .pImageIndices = &img};
+        vk_queue_lock();
         VkResult r = queue_present(g_vk.queue, &pi);
+        vk_queue_unlock();
         return !(r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR);
     }
     pthread_mutex_lock(&pres_m);

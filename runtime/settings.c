@@ -19,17 +19,20 @@ static const char *settings_file(void) {
 
 Settings g_settings = {
     .fullscreen = false,
+    .window_w = 1280,
+    .window_h = 720,
     .volume = 1.0f,
     .reverb = true,
     .movie_audio = true,
-    .upscaler = UPSCALE_DEFAULT,  // (Off: the window's resolution; MetalFX on macOS)
-    .upscale_quality = UPQ_QUALITY,
+    .upscaler = UPSCALE_FSR1,
+    .upscale_quality = UPQ_BALANCED,
     .mouse_camera = true,
     .mouse_sens = MOUSE_SENS_DEFAULT,
     .motion_sens = 1.0f,
     .stick_deadzone = {STICK_DEADZONE_DEFAULT, STICK_DEADZONE_DEFAULT},
-    .fps_limit = FPS_DEFAULT,
+    .fps_limit = 30,
     .precompile_shaders = true,
+    .async_shaders = true,
     .vsync = VSYNC_DEFAULT,
 };
 
