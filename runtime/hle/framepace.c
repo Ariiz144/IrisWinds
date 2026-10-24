@@ -157,6 +157,16 @@ void framepace_presented(uint64_t t, bool on_grid) {
     if (!fixed) *(float *)(uintptr_t)CONTROLLER_STEP = g_step;
 }
 
+// The menus' speed: every frame the game sets a GUI speed to its integer interval x 0.5: 1 at 30 fps, 0.5 at 60, and
+// never lower, so the menus' cursor and animations ran faster above 60 fps (and at 60 when the interval follows the
+// frame rate). It becomes the frame's length in console frames, as Cemu's FPS++ does on the Wii U.
+// SAVAGEWIND_NO_GUI_SPEED=1: the game's own.
+float rt_gui_speed(float game) {
+    static int off = -1;
+    if (off < 0) off = env_int("SAVAGEWIND_NO_GUI_SPEED", 0);
+    return off || !framepace_on() ? game : g_step;
+}
+
 // ------------------------------------------------------------------ the game's clock (ksys::VFR)
 // VFR fields (1.8.2; the layout of zeldaret's ksys::VFR): +0x28 interval changed, +0x29 interval override on,
 // +0x30 new interval ratio, +0x34 interval, +0x3c interval ratio (both read through per-core pointers).
