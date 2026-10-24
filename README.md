@@ -118,6 +118,7 @@ Estimates of where each part stands. "Tested in game" is how much of the game ha
 | 🗺️ | **Effects on or off** | ![0%](https://progress-bar.xyz/0/?width=150&style=square&progress_color=d9534f) | Planned: a Video page that turns each of the game's own effects on or off, where BOTW has them: ambient occlusion, volumetric fog, grass (3 layers), character light (normal and custom), tone mapper, fragment and main lighting, bloom (3 layers), lens flare, cel shading, fog effects, water, torch fire, the sword sheath, depth of field (also when aiming the bow), screen-space reflections, global illumination and far lights |
 | 🗺️ | **Graphics extras** | ![0%](https://progress-bar.xyz/0/?width=150&style=square&progress_color=d9534f) | Later: ambient occlusion, volumetric fog and depth of field |
 | 🗺️ | **Built-in benchmark** | ![0%](https://progress-bar.xyz/0/?width=150&style=square&progress_color=d9534f) | Planned: fixed camera routes that measure fps and frame times and save the results, to compare settings |
+| 🗺️ | **GPU readings on AMD and Intel (Windows)** | ![0%](https://progress-bar.xyz/0/?width=150&style=square&progress_color=d9534f) | Planned: the performance overlay's GPU use and VRAM for any GPU on Windows ([#58](https://github.com/Revivedx/SavageWindRecomp/issues/58)); today only NVIDIA, and AMD on Linux |
 | 🗺️ | **Mods** | ![0%](https://progress-bar.xyz/0/?width=150&style=square&progress_color=d9534f) | Planned |
 | 🗺️ | **Accessibility and assists** | ![0%](https://progress-bar.xyz/0/?width=150&style=square&progress_color=d9534f) | Planned: text size, colour-blind filters and toggles in place of held buttons; enemy and Link health, damage dealt and taken, weapon durability and stamina use on screen; optional assists: infinite stamina, health or weapon durability, arrows and rupees, no damage at all, no fall damage, health that refills over time, nearby enemies defeated at once, and multipliers for weapon durability, stamina use, damage dealt and taken, and walking, running, climbing, swimming and gliding speed |
 | 🗺️ | **Teleport with bookmarks** | ![0%](https://progress-bar.xyz/0/?width=150&style=square&progress_color=d9534f) | Planned: save places and travel back to them |
@@ -204,7 +205,7 @@ switches - are in [docs/SAVAGE-WIND.md](docs/SAVAGE-WIND.md).
   [SMAA](https://github.com/iryoku/smaa) (MIT), [AMD FidelityFX Super Resolution 1](https://github.com/GPUOpen-Effects/FidelityFX-FSR)
   (MIT), [AMD FidelityFX CAS](https://github.com/GPUOpen-Effects/FidelityFX-CAS) (MIT),
   [Fira Sans](https://github.com/mozilla/Fira) (SIL OFL 1.1), [Noto Sans Thai](https://github.com/notofonts/thai)
-  (SIL OFL 1.1), [stb_image](https://github.com/nothings/stb)
+  (SIL OFL 1.1), [stb_image / stb_image_write](https://github.com/nothings/stb)
   (public domain / MIT), [shaderc](https://github.com/google/shaderc)
   (Apache 2.0), [Zig](https://ziglang.org) (MIT), [Capstone](https://www.capstone-engine.org) (BSD),
   [Unicorn](https://www.unicorn-engine.org) (GPL 2.0), [python-lz4](https://github.com/python-lz4/python-lz4) (BSD).

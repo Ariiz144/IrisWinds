@@ -27,6 +27,8 @@ static bool pass_ds_written;         // a draw of the current pass wrote depth o
 static uint8_t pass_color_written;   // the color targets (bits) a draw of the current pass wrote
 static uint8_t pass_color_unsynced;  // the color targets drawn or cleared since the pass began or its last feedback barrier
 static uint8_t pass_feedback;        // the color targets (bits) the current pass began with a feedback loop enabled
+static TexBackend *pass_fbl[8];      // (g_vk.feedback_layout) its targets moved to ATTACHMENT_FEEDBACK_LOOP_OPTIMAL
+static int pass_nfbl;
 static bool draw_feedback;           // the current draw samples a target it writes (its pipeline allows the loop)
 static uint64_t stat_upload_bytes;
 static uint64_t stat_sets, stat_sets_reused;  // descriptor sets asked for / shared with an identical one
@@ -1029,6 +1031,25 @@ static void readback_schedule(VkCommandBuffer cb, NvnTexture *t, const NvnTextur
     vkCmdCopyImageToBuffer(cb, b->image, VK_IMAGE_LAYOUT_GENERAL, r->buf, 1, &c);
 }
 
+// (g_vk.feedback_layout) A target between GENERAL and ATTACHMENT_FEEDBACK_LOOP_OPTIMAL, the layout a pass that
+// samples it while writing it needs without VK_KHR_unified_image_layouts. Whole image: the draws may sample other
+// levels or layers of it than the pass writes (texture_info names the layout in their descriptors).
+static void feedback_layout_move(VkCommandBuffer cb, TexBackend *b, bool to_loop) {
+    VkImageLayout g = VK_IMAGE_LAYOUT_GENERAL, l = VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT;
+    VkImageMemoryBarrier2 ib = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+                                .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                                .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT,
+                                .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                                .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
+                                .oldLayout = to_loop ? g : l, .newLayout = to_loop ? l : g,
+                                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                                .image = b->image,
+                                .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS}};
+    VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &ib};
+    vkCmdPipelineBarrier2(cb, &di);
+    b->in_feedback_layout = to_loop;
+}
+
 static void vk_end_pass_at(int line);
 void vk_end_pass(void) { vk_end_pass_at(0); }
 #define vk_end_pass() vk_end_pass_at(__LINE__)
@@ -1037,6 +1058,8 @@ static void vk_end_pass_at(int line) {
     if (prof && line < 4096) prof_end_line[line]++;
     vkCmdEndRendering(vk_cmd());
     in_pass = false;
+    for (int i = 0; i < pass_nfbl; i++) feedback_layout_move(vk_cmd(), pass_fbl[i], false);
+    pass_nfbl = 0;
     for (int i = 0; i < pass_nlinear; i++) readback_schedule(vk_cmd(), pass_linear[i], &pass_linear_view[i], pass_linear_has_view[i]);
     pass_nlinear = 0;
     // (debug frame) what the pass drew: its targets, as begin_pass recorded them (st.rt may name the next pass's)
@@ -1123,7 +1146,9 @@ static void begin_pass(void) {
         }
     }
     VkRenderingAttachmentInfo ca[8], da = {0}, sa = {0};
+#ifdef VK_KHR_unified_image_layouts  // (Vulkan headers 1.4.321+; older ones never enable feedback loops: device.c)
     VkAttachmentFeedbackLoopInfoEXT ca_fb[8];
+#endif
     uint32_t w = 0, minw = UINT32_MAX, minh = UINT32_MAX;  // w: first attachment seen
     pass_ncolor = (uint32_t)st.rt.ncolor;
     pass_dbg_n = st.rt.ncolor > 8 ? 8 : st.rt.ncolor;
@@ -1164,9 +1189,19 @@ static void begin_pass(void) {
         ca[i].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
         ca[i].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
         if (b->feedback_seen && b->feedback_ok) {  // a target some draw samples while writing it (resolve_feedback)
-            ca_fb[i] = (VkAttachmentFeedbackLoopInfoEXT){.sType = VK_STRUCTURE_TYPE_ATTACHMENT_FEEDBACK_LOOP_INFO_EXT,
-                                                         .feedbackLoopEnable = VK_TRUE};
-            ca[i].pNext = &ca_fb[i];
+            if (g_vk.feedback_layout) {
+                if (!b->in_feedback_layout && pass_nfbl < 8) {
+                    feedback_layout_move(cb, b, true);
+                    pass_fbl[pass_nfbl++] = b;
+                }
+                ca[i].imageLayout = VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT;
+            } else {
+#ifdef VK_KHR_unified_image_layouts
+                ca_fb[i] = (VkAttachmentFeedbackLoopInfoEXT){.sType = VK_STRUCTURE_TYPE_ATTACHMENT_FEEDBACK_LOOP_INFO_EXT,
+                                                             .feedbackLoopEnable = VK_TRUE};
+                ca[i].pNext = &ca_fb[i];
+#endif
+            }
             pass_feedback |= (uint8_t)(1u << i);
         }
         bool fresh = (int)renderer_texture_level_fresh(t) | (int)renderer_texture_frame_fresh(t);  // both: each marks its state
@@ -2960,13 +2995,87 @@ static bool gmem_import(uint64_t size) {
 }
 
 static uint64_t gmem_tried;  // heap size the import was last attempted for (gmem_info imports / re-imports)
+static bool gmem_mapped;     // the heap is GPU memory mapped at its addresses (backend_heap_set): no import
+
+#ifdef __linux__
+#include <sys/mman.h>
+// On amdgpu the import is a userptr buffer, and the kernel gets every page of every userptr buffer again at each
+// submission: on the Steam Deck ~4 ms a submit for the 3 GB heap (0.03 ms without it), half of a 40 ms frame. So
+// there the heap is GPU memory from the start: the first SetHeapSize (kernel.c), before the game has touched the
+// heap, makes host-cached GPU memory of its size, exported as a dma-buf, and maps that over the heap's addresses;
+// the shaders' global memory and the vertex reads use it in place, as they did the import. RADV only (the drivers
+// that showed the cost); SAVAGEWIND_VK_HEAP_IMPORT=1: the import, as before.
+void backend_heap_set(uint64_t size) {
+    static int off = -1;
+    if (off < 0) off = getenv("SAVAGEWIND_VK_HEAP_IMPORT") != NULL || getenv("SAVAGEWIND_VK_NO_GMEM") != NULL;
+    if (gmem_mapped && size > gmem_size)
+        LOG("[vk] guest heap grew to %llu MB past the %llu MB mapped: the rest is copied, not shared\n",
+            (unsigned long long)(size >> 20), (unsigned long long)(gmem_size >> 20));
+    if (off || gmem_mapped || gmem_buf || !size) return;
+    vk_wait_ready();
+    if (!g_vk.dmabuf || !g_vk.radv) return;
+    size = (size + 0x1FFFFF) & ~0x1FFFFFull;  // (2 MB pages)
+    uint32_t type = UINT32_MAX;
+    VkPhysicalDeviceMemoryProperties mp;
+    vkGetPhysicalDeviceMemoryProperties(g_vk.phys, &mp);
+    VkMemoryPropertyFlags want = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    for (int pass = 0; pass < 2 && type == UINT32_MAX; pass++)  // host-cached first: the game's own memory
+        for (uint32_t i = 0; i < mp.memoryTypeCount && type == UINT32_MAX; i++) {
+            VkMemoryPropertyFlags f = mp.memoryTypes[i].propertyFlags;
+            if ((f & want) == want && !(f & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) && (pass || (f & VK_MEMORY_PROPERTY_HOST_CACHED_BIT)) &&
+                !(f & VK_MEMORY_PROPERTY_DEVICE_COHERENT_BIT_AMD))
+                type = i;
+        }
+    PFN_vkGetMemoryFdKHR get_fd = (PFN_vkGetMemoryFdKHR)vkGetDeviceProcAddr(g_vk.dev, "vkGetMemoryFdKHR");
+    if (type == UINT32_MAX || !get_fd) return;
+    VkExportMemoryAllocateInfo ex = {.sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO,
+                                     .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT};
+    VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = &ex, .allocationSize = size,
+                               .memoryTypeIndex = type};
+    VkDeviceMemory mem;
+    VkResult r = vkAllocateMemory(g_vk.dev, &ai, NULL, &mem);
+    if (r != VK_SUCCESS) { LOG("[vk] guest heap as GPU memory: allocation failed (%d), imported instead\n", r); return; }
+    VkMemoryGetFdInfoKHR gi = {.sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR, .memory = mem,
+                               .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT};
+    int fd = -1;
+    if (get_fd(g_vk.dev, &gi, &fd) != VK_SUCCESS || fd < 0) {
+        LOG("[vk] guest heap as GPU memory: no dma-buf, imported instead\n");
+        vkFreeMemory(g_vk.dev, mem, NULL);
+        return;
+    }
+    void *p = mmap((void *)(uintptr_t)HEAP_BASE, size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0);
+    close(fd);  // (the mapping keeps the dma-buf)
+    if (p != (void *)(uintptr_t)HEAP_BASE) {
+        LOG("[vk] guest heap as GPU memory: mapping failed, imported instead\n");
+        mmap((void *)(uintptr_t)HEAP_BASE, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED, -1, 0);
+        vkFreeMemory(g_vk.dev, mem, NULL);
+        return;
+    }
+    VkExternalMemoryBufferCreateInfo eb = {.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO,
+                                           .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT};
+    VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .pNext = &eb, .size = size,
+                             .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                                      VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
+                                      VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT};
+    VkBuffer buf;
+    VK_CHECK(vkCreateBuffer(g_vk.dev, &bi, NULL, &buf));  // (the heap is mapped now: no way back)
+    VK_CHECK(vkBindBufferMemory(g_vk.dev, buf, mem, 0));
+    gmem_buf = buf;
+    gmem_mem = mem;
+    gmem_size = size;
+    gmem_mapped = true;
+    LOG("[vk] guest heap is GPU memory (dma-buf mapped at the heap, type %u): %llu MB\n", type, (unsigned long long)(size >> 20));
+}
+#else
+void backend_heap_set(uint64_t size) { (void)size; }
+#endif
 
 static VkDescriptorBufferInfo gmem_info(void) {
     static int off = -1;
     if (off < 0) off = getenv("SAVAGEWIND_VK_NO_GMEM") != NULL || !g_vk.host_import;
     uint64_t want = (kernel_heap_size() + 0xFFFF) & ~0xFFFFull;
     if (want > HEAP_MAX) want = HEAP_MAX;
-    if (!off && want > gmem_size && !gmem_import(want)) {
+    if (!off && !gmem_mapped && want > gmem_size && !gmem_import(want)) {
         LOG("[vk] guest heap import failed (%llu MB): shader global memory reads return zero\n", (unsigned long long)(want >> 20));
         off = 1;
     }
@@ -2983,7 +3092,7 @@ static bool guest_direct(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceSi
     static int copy = -1;
     if (copy < 0) copy = getenv("SAVAGEWIND_VK_COPY_VERTICES") != NULL;
     if (copy || addr < HEAP_BASE) return false;
-    if (addr + size > HEAP_BASE + gmem_size && kernel_heap_size() != gmem_tried) { gmem_tried = kernel_heap_size(); gmem_info(); }
+    if (!gmem_mapped && addr + size > HEAP_BASE + gmem_size && kernel_heap_size() != gmem_tried) { gmem_tried = kernel_heap_size(); gmem_info(); }
     if (!gmem_buf || addr + size > HEAP_BASE + gmem_size) return false;
     *buf = gmem_buf;
     *off = addr - HEAP_BASE;
@@ -3133,6 +3242,7 @@ void vk_exec_reset(void) {
         gmem_mem = VK_NULL_HANDLE;
     }
     gmem_size = gmem_tried = 0;
+    gmem_mapped = false;  // (still mapped until main.c resets guest memory: the dma-buf lives on until then)
     st_defaults();
 }
 
@@ -3146,6 +3256,7 @@ static void texture_info(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo
     uint64_t h = (slot >= 0 && slot < 32) ? st.tex[stage][slot] : 0;
     VkImageView view = VK_NULL_HANDLE;
     VkSampler smp = VK_NULL_HANDLE;
+    VkImageLayout layout = VK_IMAGE_LAYOUT_GENERAL;
     uint32_t tic = h & 0xFFFFF, tsc = (uint32_t)(h >> 20) & 0xFFF;
     sc[0] = sc[1] = 1;
     wh[0] = wh[1] = 0;
@@ -3179,18 +3290,22 @@ static void texture_info(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo
                 sc[0] = scene_up.sx; sc[1] = scene_up.sy;
             }
             wh[0] = et->width; wh[1] = et->height;
+            // (a target of this pass that loops, g_vk.feedback_layout: its own image, not one of the copies below)
+            if (et->backend && ((TexBackend *)et->backend)->in_feedback_layout && et != scene_up.t)
+                layout = VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT;
             for (int k = 0; k < nfeedback; k++)
-                if (et == feedback_tex[k] && feedback_any_type[k]) view = feedback_view[k];
+                if (et == feedback_tex[k] && feedback_any_type[k]) view = feedback_view[k], layout = VK_IMAGE_LAYOUT_GENERAL;
                 else if (et == feedback_tex[k] && (st_->type == TEXTYPE_2D || st_->type == TEXTYPE_2D_ARRAY)) {
                     view = feedback_view[k];
+                    layout = VK_IMAGE_LAYOUT_GENERAL;
                     if (st_->type == TEXTYPE_2D_ARRAY) view = vk_dummy_view(TEXTYPE_2D_ARRAY);  // (2D snapshot as array: rare)
                 }
         }
     }
     if (h && st.spool && tsc < (uint32_t)st.spool->count) smp = vk_sampler(&((NvnSamplerDesc *)st.spool->entries)[tsc]);
-    if (!view) view = vk_dummy_view(st_->type);
+    if (!view) view = vk_dummy_view(st_->type), layout = VK_IMAGE_LAYOUT_GENERAL;
     if (!smp) smp = vk_default_sampler(true);
-    *out = (VkDescriptorImageInfo){smp, view, VK_IMAGE_LAYOUT_GENERAL};
+    *out = (VkDescriptorImageInfo){smp, view, layout};
 }
 
 // Descriptor sets of identical contents within one submission are one set (the open world draws many objects with
