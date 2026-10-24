@@ -313,6 +313,7 @@ bool gamebuild_run(const char *game_dir, const GameBuildOpts *o, char *why, size
     snprintf(lib, sizeof lib, "%s" SEP "%s", game_dir, GAMELIB_NAME);
     snprintf(tmp, sizeof tmp, "%s" SEP "%s.tmp", work, GAMELIB_NAME);
     mkdir(work, 0755);
+    recomp_cache_recover_lib(lib);
 
     recomp_cache_init(rt_data_root(), t.cc, t.zig, t.inc, GAMELIB_CFLAGS, t.zig ? GAMELIB_ZIGFLAGS : "");
     if (t.zig) {
@@ -431,9 +432,11 @@ bool gamebuild_run(const char *game_dir, const GameBuildOpts *o, char *why, size
         char nso[1100];
         snprintf(nso, sizeof nso, "%s" SEP "%s", exefs, g->name);
 
+        char gen_opts[256] = "";
+        if (strcmp(g->name, "main")) snprintf(gen_opts, sizeof gen_opts, "--hle %s", t.hle);
         int cached_files = recomp_cache_get_module(g->name, nso, layout,
                                                    strcmp(g->name, "main") ? t.hle : NULL,
-                                                   t.gen, g->out);
+                                                   t.gen, t.gen_script, gen_opts, g->out);
         if (cached_files > 0) {
             g->exit = 0;
             g->files = cached_files;
@@ -488,9 +491,11 @@ bool gamebuild_run(const char *game_dir, const GameBuildOpts *o, char *why, size
                     if (r == 0) {
                         char nso[1100];
                         snprintf(nso, sizeof nso, "%s" SEP "%s", exefs, g->name);
+                        char gen_opts[256] = "";
+                        if (strcmp(g->name, "main")) snprintf(gen_opts, sizeof gen_opts, "--hle %s", t.hle);
                         recomp_cache_put_module(g->name, nso, layout,
                                                 strcmp(g->name, "main") ? t.hle : NULL,
-                                                t.gen, g->out, g->files, true);
+                                                t.gen, t.gen_script, gen_opts, g->out, g->files, true);
                     } else {
                         char last[300];
                         log_tail(g->log, last, sizeof last);
@@ -622,18 +627,13 @@ bool gamebuild_run(const char *game_dir, const GameBuildOpts *o, char *why, size
         }
     }
     if (ok) {
-        remove(lib);
-        char idp[1100];
-        snprintf(idp, sizeof idp, "%s.id", lib);
-        FILE *f = NULL;
-        if (rename(tmp, lib) != 0 || !(f = fopen(idp, "wb")) || fprintf(f, "%s\n", GAMELIB_ID) < 0) {
-            snprintf(why, why_size, "the game code couldn't be saved");
+        if (!recomp_cache_promote_lib(tmp, lib, GAMELIB_ID, why, why_size)) {
             ok = false;
         }
-        if (f) fclose(f);
         if (ok) {
             mkdir("cache", 0755);
-            char cache_lib[1100], cache_id[1100];
+            char cache_lib[1100], cache_id[1100], idp[1100];
+            snprintf(idp, sizeof idp, "%s.id", lib);
             snprintf(cache_lib, sizeof cache_lib, "cache" SEP "%s", GAMELIB_NAME);
             snprintf(cache_id, sizeof cache_id, "cache" SEP "%s.id", GAMELIB_NAME);
             FILE *in = fopen(lib, "rb");
