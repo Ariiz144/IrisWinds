@@ -32,7 +32,7 @@
 // Test and debug switches:
 //   SAVAGEWIND_FPS=<n>             frame rate instead of the setting (0: no limit)
 //   SAVAGEWIND_FRAMEPACE=0         the game's own pacing and clock (its 30 / 20 fps, as before)
-//   SAVAGEWIND_MOVIE_FPS=<n>       frame rate while a movie plays (default 30; 0: the chosen one)
+//   SAVAGEWIND_MOVIE_FPS=<n>       frame rate while a movie plays (default: the movie's own; 0: the chosen one)
 //   SAVAGEWIND_MENU_FPS=<n>        frame rate in the menus (default 30; 0: the chosen one)
 //   SAVAGEWIND_EVENT_FPS=<n>       frame rate in the events (default 30; 0: the chosen one)
 //   SAVAGEWIND_LOG_FRAMEPACE=<n>   every n clock updates: target, frame length, VFR ratio and interval
@@ -49,6 +49,7 @@
 #include "../window_size.h"
 
 extern volatile int g_movie_playing;  // runtime/hle/movie.c: video decoders running
+extern volatile int g_movie_fps;      // runtime/hle/movie.c: the playing movie's frame rate
 
 #define VF(T, base, off) (*(T *)(uintptr_t)((base) + (off)))
 #define PAUSE_STATE g_site.pause_state  // (u32: 0 playing, 2 in the pause menu or the map)
@@ -85,12 +86,15 @@ static bool in_event(void) {
 int framepace_target(void) {
     static int forced = -2, movie = -2, menu = -2, event = -2;
     if (forced == -2) forced = env_int("SAVAGEWIND_FPS", -1);
-    if (movie == -2) movie = env_int("SAVAGEWIND_MOVIE_FPS", 30);
+    if (movie == -2) movie = env_int("SAVAGEWIND_MOVIE_FPS", -1);  // (-1: the movie's own frame rate)
     if (menu == -2) menu = env_int("SAVAGEWIND_MENU_FPS", 30);
     if (event == -2) event = env_int("SAVAGEWIND_EVENT_FPS", 30);
     int fps = forced >= 0 ? forced : g_settings.fps_limit;
     if (fps < 0) fps = FPS_DEFAULT;
-    if (movie > 0 && __atomic_load_n(&g_movie_playing, __ATOMIC_RELAXED) > 0 && (fps == 0 || fps > movie)) fps = movie;
+    if (movie != 0 && __atomic_load_n(&g_movie_playing, __ATOMIC_RELAXED) > 0) {
+        int cap = movie > 0 ? movie : g_movie_fps;
+        if (fps == 0 || fps > cap) fps = cap;
+    }
     if (menu > 0 && (fps == 0 || fps > menu) && in_menu()) fps = menu;
     if (event > 0 && (fps == 0 || fps > event) && in_event()) fps = event;
     return fps;
