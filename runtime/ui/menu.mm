@@ -517,12 +517,37 @@ static void tab_display(void) {
         }
         char desc[600];
         snprintf(desc, sizeof desc, tr("The size of the game's window, or of the screen in fullscreen. Only the sizes your "
-                                       "display can show, grouped by shape (the game itself stays 16:9, with bars on "
-                                       "wider screens).\n\nYour display: %d x %d."), desk.w, desk.h);
+                                       "display can show: its own first, then grouped by shape. A shape wider than 16:9 "
+                                       "is filled with Fill wide screens on; any other keeps 16:9 with bars.\n\nYour display: %d x %d."), desk.w, desk.h);
         if (opt_choice("Window size", &cur, names, n, def, desc)) {  // (past either end: the other one)
             g_settings.window_w = list[cur].w, g_settings.window_h = list[cur].h;
             g_want_window_apply.store(true);
         }
+    }
+    {   // Fill wide screens (runtime/nvn/output_scale.c rt_persp)
+        bool wv = g_settings.wide_view;
+        if (opt_toggle("Fill wide screens", &wv, true,
+                       "On a window or screen wider than 16:9 (21:9, 32:9) the game shows more to the sides instead "
+                       "of black bars. The HUD stays 16:9 in the middle; the pause menu, the map and the start "
+                       "screen are shown 16:9."))
+            g_settings.wide_view = wv;
+    }
+    {   // Field of view (runtime/nvn/output_scale.c rt_persp)
+        static const int fov[] = FOV_CHOICES;
+        enum { NV = sizeof fov / sizeof fov[0] };
+        static char names_buf[NV][16];
+        const char *names[NV];
+        int cur = 0, def = 0;
+        for (int i = 0; i < NV; i++) {
+            snprintf(names_buf[i], sizeof names_buf[i], "%d%%", fov[i]);
+            names[i] = names_buf[i];
+            if (fov[i] == g_settings.fov) cur = i;
+            if (fov[i] == 100) def = i;
+        }
+        if (opt_choice("Field of view", &cur, names, NV, def,
+                       "How much of the world the camera shows in play: 100% is the game's own. Cutscenes and "
+                       "conversations keep theirs.", false))
+            g_settings.fov = fov[cur];
     }
     {   // Frame rate (runtime/hle/framepace.c)
         static const int fps[] = FPS_CHOICES;

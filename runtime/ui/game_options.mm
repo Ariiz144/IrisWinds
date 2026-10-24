@@ -148,6 +148,9 @@ static_assert(k_sens[SENS_DEFAULT] == 300);
 constexpr int k_motion_sens[] = {25, 50, 75, 100, 125, 150, 200, 250, 300, 400};  // motion sensitivity, %
 constexpr int MOTION_SENS_DEFAULT = 3;
 static_assert(k_motion_sens[MOTION_SENS_DEFAULT] == 100);
+constexpr int k_fov[] = FOV_CHOICES;  // field of view, % of the game's own
+constexpr int FOV_DEFAULT_INDEX = 3;
+static_assert(k_fov[FOV_DEFAULT_INDEX] == 100);
 constexpr int k_deadzone[] = {0, 3, 5, 8, 10, 12, 15, 20, 25, 30, 40};  // stick dead zone, % of full tilt
 constexpr int DEADZONE_DEFAULT = 4;
 static_assert(k_deadzone[DEADZONE_DEFAULT] == (int)(STICK_DEADZONE_DEFAULT * 100 + 0.5f));
@@ -285,6 +288,18 @@ void build_items(void) {
     };
     ws.wrap = true;
     v.push_back(ws);
+    v.push_back(toggle(P_VIDEO, "Fill wide screens", "Shows more to the sides on screens wider than 16:9, instead of bars.",
+                       [](const Item &) { return (int)g_settings.wide_view; },
+                       [](const Item &, int x) { g_settings.wide_view = x; }, 1));
+    v.push_back(choice(P_VIDEO, "Field of view", "How much the camera shows in play. Cutscenes keep their own.",
+                       [](const Item &) { return N(k_fov); },
+                       [](const Item &, int x) {
+                           static std::string str;
+                           str = pct(k_fov[x]);
+                           return str.c_str();
+                       },
+                       [](const Item &) { return nearest(k_fov, N(k_fov), (float)g_settings.fov); },
+                       [](const Item &, int x) { g_settings.fov = k_fov[x]; }, FOV_DEFAULT_INDEX));
     Item fps = choice(P_VIDEO, "Frame rate", "",
                       [](const Item &) { return N(k_fps); }, fps_label,
                       [](const Item &) {
