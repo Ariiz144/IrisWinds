@@ -33,16 +33,25 @@ typedef struct {
     VmaAllocator vma;
     VkPhysicalDeviceProperties props;
     VkPipelineCache pcache;
+    VkPipelineCache pcache_pre;  // the precompiled shaders' libraries (cache/vk_precompiled.bin; read only while playing)
     VkSemaphore timeline;      // value = last completed submission number
     VkCommandPool pool;        // render thread only
     bool custom_border, divisor, host_import, wide_lines;
+    bool feat_aniso;  // samplerAnisotropy (Video > Anisotropic filtering)
     bool depth_clamp;          // depthClamp feature (nvnCommandBufferSetDepthClamp: shadow maps keep occluders before the near plane)
-    bool feedback_loop;        // attachment feedback loops in GENERAL layout + barriers inside dynamic rendering (exec.c)
+    bool occlusion_precise;    // occlusionQueryPrecise: SAMPLES_PASSED counts samples, not just "any"
+    bool feedback_loop;        // attachment feedback loops + barriers inside dynamic rendering (exec.c)
+    bool feedback_layout;      // ... in ATTACHMENT_FEEDBACK_LOOP_OPTIMAL layout (no VK_KHR_unified_image_layouts: GENERAL otherwise)
+    bool gpl;                  // graphics pipeline libraries with fast linking (exec.c)
+    bool dmabuf;               // memory exported as dma-bufs (Linux: the guest heap, exec.c backend_heap_set)
+    bool radv;                 // the driver is Mesa's RADV
+    bool present_wait;         // VK_KHR_present_id + present_wait on (SAVAGEWIND_LOG_PRESENT: when frames are shown)
     // window
     VkSurfaceKHR surface;
     VkSwapchainKHR swapchain;
     VkFormat sc_format;
     VkExtent2D sc_extent;
+    VkPresentModeKHR sc_mode;
     uint32_t sc_count;
     VkImage sc_images[8];
     VkImageView sc_views[8];
@@ -56,11 +65,14 @@ VkCommandBuffer vk_upload_cmd(void);  // upload command buffer of the pending su
 uint64_t vk_pending_seq(void);        // number the pending submission will get
 uint64_t vk_completed_seq(void);
 void vk_wait_seq(uint64_t seq);
+void vk_wait_ready(void);  // until the main thread has made the window and device (device.c)
 void vk_full_barrier(VkCommandBuffer cb);
 void vk_end_pass(void);
 void vk_submit_extra(VkSemaphore wait, VkSemaphore signal, VkCommandBuffer extra);  // submit + one more cb (present)
 void vk_present_idle(void);  // device.c: the presentation thread has no present queued or in progress
 void vk_dyn_forget(void);    // exec.c: graphics pipeline / dynamic state of the main command buffer changed elsewhere
+void vk_queue_lock(void);
+void vk_queue_unlock(void);
 
 // Transient GPU-visible memory that lives until the submission it was allocated for completes.
 typedef struct { VkBuffer buf; uint64_t off; void *ptr; } VkSpan;
@@ -71,8 +83,8 @@ VkDescriptorSet vk_alloc_set(VkDescriptorSetLayout layout);
 
 // ---- textures (textures.c)
 // Render-target scale groups (textures.c tex_scale_group): none, the 3D scene's (internal resolution), the final
-// image's (the window's resolution)
-enum { RS_NONE = 0, RS_SCENE = 1, RS_OUT = 2 };
+// image's (the window's resolution), shadow maps (Video > Shadow resolution)
+enum { RS_NONE = 0, RS_SCENE = 1, RS_OUT = 2, RS_SHADOW = 3 };
 
 typedef struct TexBackend {
     VkImage image;
@@ -85,9 +97,11 @@ typedef struct TexBackend {
     bool slices_renderable;  // 3D image made 2D-array compatible: its slices are render targets
     bool feedback_ok;        // made with VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT (sampled while it is rendered to)
     bool feedback_seen;      // a draw sampled it while writing it: its passes begin with the feedback loop enabled
+    bool in_feedback_layout; // in ATTACHMENT_FEEDBACK_LOOP_OPTIMAL now (g_vk.feedback_layout: a pass that loops, exec.c)
     uint64_t data_hash, sample_hash, checked_frame, full_frame;
     bool scalable, presented;
     uint8_t rs_group;            // RS_*: which output scale its allocation follows (textures.c)
+    uint32_t guest_w;            // (RS_SHADOW: the guest width its scale is worked out from)
     uint64_t touched_frame, frame_cleared;
     uint32_t level_gen;
     float sx, sy;
@@ -95,6 +109,7 @@ typedef struct TexBackend {
     uint32_t pending_w, pending_h, pending_stride;
     uint8_t astc_bw, astc_bh;  // ASTC without GPU support: decoded to RGBA8 on upload (runtime/nvn/astc.c)
     bool astc_srgb;
+    uint32_t glyph_gen;          // a button glyph sheet (runtime/nvn/glyphs.c): the icons it was uploaded with
     // textures.c: one image per memory and shape, shared by every texture made there
     uint64_t key_addr;           // 0: not shared
     uint32_t key[7];             // target, format, width, height, depth, levels, samples
@@ -102,6 +117,10 @@ typedef struct TexBackend {
     int refs;                    // textures holding the image
     int all, idle;               // slots + 1 in textures.c's lists of all images / images no texture holds
     uint64_t idle_frame, used_frame;  // when it was let go / last asked for by a finalized texture (zombies)
+    uint64_t guest_size;         // bytes of guest storage its last texture covered (textures.c: kept images)
+    uint64_t kept_hash, kept_bytes;
+    bool kept;                   // parked past PARK_FRAMES with its contents (textures.c idle_expire)
+    uint64_t drawn_frame, prev_drawn;  // last two frames a pass drew into it (exec.c: one-shot draws)
     uint64_t serial;             // which image this is: every image made gets a new one (exec.c's linear targets)
 } TexBackend;
 
@@ -110,6 +129,7 @@ VkFormat vk_format(uint32_t nvn_format);
 bool vk_format_alpha_one(uint32_t nvn_format);
 // View of t (optionally through an NVN texture view) for rendering or sampling.
 VkImageView vk_view(NvnTexture *t, const NvnTextureView *v, bool has_view, bool render, int want_textype);
+VkComponentMapping vk_sample_swizzle(NvnTexture *t, const NvnTextureView *v);  // (a colour texture's, sampled)
 VkImageView vk_image_view(TexBackend *b, VkImageViewType type, VkFormat fmt, uint32_t lv0, uint32_t nlv, uint32_t ly0,
                           uint32_t nly, VkComponentMapping sw, VkImageAspectFlags aspect);
 VkImageView vk_dummy_view(int textype);
@@ -124,6 +144,7 @@ void vk_make_scalable_like(NvnTexture *t, NvnTexture *like);  // a pass's attach
 uint8_t vk_texture_scale_group(NvnTexture *t);
 void renderer_get_scene_scale(float *sx, float *sy);
 void renderer_set_scene_scale(float sx, float sy);
+void renderer_set_shadow_size(uint32_t n);  // shadow maps' width (RS_SHADOW; 0: the game's own)
 uint64_t vk_frame_counter(void);
 
 // ---- shaders / pipelines (shaders.c)

@@ -4,8 +4,8 @@
 # as an AppDir and packed by appimagetool: build/dist/Savage_Wind-<version>-<arch>.AppImage.
 # Shipped next to the executable (usr/bin, where runtime/paths.c rt_resource looks): what the start screen
 # builds the game code with on the player's machine (runtime/gamebuild.c: swgen/, zig/ from tools/fetch_zig.sh,
-# gamelib-src/), the window icon, the start screen font. No game code: that's built from the player's own files. usr/lib: the libraries from deps/ only - glibc, libstdc++, the Vulkan loader and the
-# GPU drivers are the system's (a bundled loader would not find the user's drivers). No game files or fonts.
+# gamelib-src/), the window icon, the start screen font. No game code: that's built from the player's own files. usr/lib: the libraries from deps/ only - glibc, libstdc++, zlib, the Vulkan loader
+# and the GPU drivers are the system's (a bundled loader would not find the user's drivers). No game files or fonts.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 ARCH=$1
@@ -29,7 +29,7 @@ else
 fi
 
 # the app alone (the game code is built on the player's machine)
-make -j"$JOBS" B="$B" DEPS="$P" SHADERC=-lshaderc_shared "${MAKEARGS[@]}" "$B/savagewind"
+make -j"$JOBS" B="$B" DEPS="$P" "${MAKEARGS[@]}" "$B/savagewind"  # (the DEPS link line asks for libshaderc_shared itself)
 if nm "$B/savagewind" | grep ' f_70' >/dev/null; then echo "$B/savagewind has game code linked in"; exit 1; fi
 ZIG_TARGET=$ARCH-linux tools/fetch_zig.sh
 
@@ -40,6 +40,8 @@ llvm-strip --strip-debug "$APPDIR/usr/bin/savagewind"  # (symbols stay: crash ba
 cp docs/icon/icon_1024.png "$APPDIR/usr/bin/icon.png"
 cp third_party/fonts/FiraSans/FiraSans-SemiBold.ttf third_party/fonts/FiraSans/FiraSans-Medium.ttf "$APPDIR/usr/bin/"  # (menus, OFL)
 cp third_party/fonts/FiraSans/OFL.txt "$APPDIR/usr/bin/FiraSans-OFL.txt"
+cp third_party/fonts/NotoSansThai/NotoSansThai-Medium.ttf "$APPDIR/usr/bin/"  # (Thai menus, OFL)
+cp third_party/fonts/NotoSansThai/OFL.txt "$APPDIR/usr/bin/NotoSansThai-OFL.txt"
 cp README.md LICENSE "$APPDIR/usr/bin/"  # (licenses and source links of the bundled components: README "License")
 [ -d "$L/helper/swgen" ] || { echo "no game code generator helper: tools/linux/gen_helper.sh $ARCH first"; exit 1; }
 cp -R "$L/helper/swgen" build/zig "$APPDIR/usr/bin/"
@@ -52,7 +54,7 @@ cp docs/icon/icon_1024.png "$APPDIR/savagewind.png" && ln -sf savagewind.png "$A
 
 # libraries: what savagewind needs (DT_NEEDED, recursively) that deps/ provides; anything else must be a system one
 needed() { readelf -d "$1" | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p'; }
-SYSTEM_LIBS='^(libc|libm|libdl|libpthread|librt|libresolv|libstdc\+\+|libgcc_s|libvulkan)\.so|^ld-linux'
+SYSTEM_LIBS='^(libc|libm|libdl|libpthread|librt|libresolv|libstdc\+\+|libgcc_s|libz|libvulkan)\.so|^ld-linux'
 todo=("$APPDIR/usr/bin/savagewind")
 while [ ${#todo[@]} -gt 0 ]; do
     f=${todo[0]}; todo=("${todo[@]:1}")

@@ -24,7 +24,7 @@
 #ifndef GAMELIB_ID
 #define GAMELIB_ID "dev"
 #endif
-#define GAMELIB_ABI 2
+#define GAMELIB_ABI 3
 
 // One exefs module as the game code was generated for it: where it goes (tools/layout.py, the generated layout.c)
 // and its functions. runtime/loader.c loads the module there.
@@ -37,11 +37,21 @@ typedef struct {
     const uint64_t *count;
 } GameLibModule;
 
+// An address in the main module the runtime uses, by name (tools/game_sites.py finds them for the game version the
+// code was generated from; runtime/game_sites.h).
+typedef struct {
+    const char *name;
+    uint64_t addr;
+} GameLibSite;
+
 typedef struct {
     uint32_t abi;    // GAMELIB_ABI
     const char *id;  // GAMELIB_ID
     const GameLibModule *modules;  // in load order, main first
     const uint32_t *nmodules;
+    const char *version;  // the game version ("1.8.2")
+    const GameLibSite *sites;
+    const uint32_t *nsites;
 } GameLibTables;
 
 // The library's one exported function (tools/gamelib_entry.c).

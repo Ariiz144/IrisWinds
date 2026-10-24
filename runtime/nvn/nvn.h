@@ -48,6 +48,7 @@ typedef struct {
     float lod_min, lod_max, lod_bias, max_aniso;
     float border[4];
     void *backend;
+    float backend_aniso;  // the max anisotropy `backend` was made with (vulkan/textures.c vk_sampler)
 } NvnSamplerDesc;
 
 // Our layout inside the guest NVNtextureView. NVN 55's struct is 16 bytes (its driver's SetDefaults clears exactly
@@ -138,7 +139,7 @@ enum {
     CMD_COPY_TEXTURE_TO_TEXTURE, CMD_DOWNSAMPLE, CMD_UPDATE_UNIFORM_BUFFER, CMD_FENCE_SYNC, CMD_WAIT_SYNC,
     CMD_BARRIER, CMD_SIGNAL_EVENT, CMD_WAIT_EVENT, CMD_REPORT_COUNTER, CMD_DISCARD_COLOR,
     CMD_DISCARD_DEPTH_STENCIL, CMD_SET_COPY_STRIDES, CMD_DRAW_TEXTURE, CMD_RESOLVE_DEPTH, CMD_BIND_TEXTURES_DEFERRED,
-    CMD_SET_DEPTH_CLAMP,
+    CMD_SET_DEPTH_CLAMP, CMD_RESET_COUNTER,
     CMD_COUNT
 };
 

@@ -8,6 +8,11 @@ The module's guest address comes from layout.txt, which `gen.py layout` writes (
 (tools/layout.py). `all` does that and then generates every module into <outdir>/<name>, with --hle for all of them
 but main (`make gen`).
 
+The main module has to be a game version Savage Wind supports (tools/game_sites.py VERSIONS): its sites are looked
+up there, for tools/patches.py and for the runtime (layout.c). --any-version takes any main module whose sites the
+patterns all find (bringing up a new version); --no-sites generates without sites or patches (the made-up modules
+of tools/test_layout.py).
+
 --simd: FP/SIMD/CRC32 as AArch64 inline asm (default on arm64 hosts) or portable C (default elsewhere).
 """
 import argparse
@@ -21,10 +26,13 @@ import sys
 import time
 from collections import Counter
 
+import capstone
 import unicorn as uc
 from unicorn import arm64_const as A
 
+import game_sites
 import layout
+import patches
 from analyze import eh_frame_extents, eh_frame_functions
 from lifter import Insn, Lifter, Unsupported, bits, emit_asm_batch, hx, sext
 from nso import Nso, R_AARCH64_JUMP_SLOT, R_AARCH64_RELATIVE, header
@@ -69,11 +77,13 @@ class Module:
         self.cache = {}
         self.stats = Counter()
         self.mu = None
+        self.cs = None  # (capstone, made on first use: writes_gpr)
         # the functions as compiled: discovery may split one into several C functions, a jump table spans all of it
         self.fdes = sorted((base + a, base + b) for a, b in eh_frame_extents(n) if b > a)
         self.fde_starts = [a for a, _ in self.fdes]
         self.jt_cache = {}
         self.setjmps = self.setjmp_targets()
+        self.sites, self.patches = {}, {}  # (main: tools/game_sites.py, tools/patches.py)
 
     def in_text(self, a):
         return self.lo <= a < self.hi and a % 4 == 0
@@ -313,6 +323,17 @@ class Module:
 
     # ------------------------------------------------------------ functions
 
+    def writes_gpr(self, a, rn):
+        """True if the instruction at a writes general register rn (Xn or Wn). Its low 5 bits don't tell: they are
+        also the register a store stores (`stp s9, s8, [sp, #0x80]`) and FP/SIMD destinations."""
+        if self.cs is None:
+            self.cs = capstone.Cs(capstone.CS_ARCH_ARM64, capstone.CS_MODE_ARM)
+            self.cs.detail = True
+        ins = next(self.cs.disasm(struct.pack('<I', self.word(a)), a), None)
+        if ins is None:
+            return True  # (undecoded: stop there, as for a write)
+        return any(ins.reg_name(r) in (f'x{rn}', f'w{rn}') for r in ins.regs_access()[1])
+
     def computed_target(self, br_pc, entry):
         """True if the br register comes from address arithmetic (a table) rather than a load."""
         rn = bits(self.word(br_pc), 5, 5)
@@ -321,7 +342,7 @@ class Module:
             w = self.word(a)
             if self.lift(a).kind not in ('op', 'asm'):
                 return False
-            if (w & 31) == rn:
+            if self.writes_gpr(a, rn):
                 if (w & 0x1F000000) == 0x0B000000:  # ADD/SUB (shifted or extended register)
                     return True
                 if (w & 0x9F000000) == 0x10000000:  # ADR
@@ -389,14 +410,35 @@ class Module:
         raise Unsupported(k)
 
     def emit_function(self, entry, end, labels, tables, hle):
-        out = [f'void {fname(entry)}(Cpu *c) {{']
         if entry in hle:
-            out.append(f'    {sanitize(hle[entry])}(c);')
-            out.append('}')
-            return out
-        out.append(f'    FN_ENTER({hx(entry)});')
-        batch = []
+            self._refs = set()
+            return [f'void {fname(entry)}(Cpu *c) {{', f'    {sanitize(hle[entry])}(c);', '}']
+        # Jump tables are emulated (jump_table), so their cases are known; one whose emulation missed some still
+        # reaches the right instruction through the all-instruction fallback: a label on every instruction and a
+        # switch over all of them. With an unresolved table ('all') that is the function's normal path. Otherwise
+        # it lives in a cold copy of the function (<name>_r), entered on a miss only: in the function itself it
+        # split every instruction into its own block and made LLVM's register coalescer take minutes per function.
         refs = set()
+        if not tables or 'all' in tables.values():
+            out = self._emit_body(entry, end, labels, tables, refs, 'plain')
+        else:
+            out = [f'static void {fname(entry)}_r(Cpu *c);']
+            out += self._emit_body(entry, end, labels, tables, refs, 'fast')
+            out += self._emit_body(entry, end, labels, tables, refs, 'resume')
+        self._refs = refs
+        return out
+
+    def _emit_body(self, entry, end, labels, tables, refs, mode):
+        """One C function for entry..end. mode: 'plain' (the all-instruction fallback inside when it has tables),
+        'fast' (a table miss goes on in <name>_r) or 'resume' (<name>_r: from c->pc, through that fallback)."""
+        if mode == 'resume':
+            # (optnone: optimized, its switch made the copy as slow to build as the function used to be, and it is
+            # never run in practice. Unoptimized, its frame can reach ~250 KB: guest threads have 256 MB host stacks)
+            head = f'__attribute__((cold, noinline, optnone)) static void {fname(entry)}_r(Cpu *c) {{'
+            out = [head, '    goto L_dispatch;']
+        else:
+            out = [f'void {fname(entry)}(Cpu *c) {{', f'    FN_ENTER({hx(entry)});']
+        batch = []
 
         def flush():
             if batch:
@@ -411,20 +453,19 @@ class Module:
             refs.add(t)
             return f'__attribute__((musttail)) return {fname(t)}(c);'
 
-        # Functions with jump tables also get the all-instruction fallback: a table whose emulation
-        # missed some cases then still reaches the right instruction instead of aborting.
-        all_labels = bool(tables)
+        all_labels = mode == 'resume' or (mode == 'plain' and bool(tables))
         if all_labels:
             labels = set(range(entry, end, 4))
+        miss = f'__attribute__((musttail)) return {fname(entry)}_r(c);' if mode == 'fast' else 'goto L_dispatch;'
         last = None
         for a in range(entry, end, 4):
             ins = self.lift(a)
             if a in labels:
                 flush()
                 out.append(f'L_{a:x}:;')
-            if a in PATCHES:  # hand-written replacement for one instruction (tools/patches.py)
+            if a in self.patches:  # hand-written replacement for one instruction (tools/patches.py)
                 flush()
-                out.append('    ' + PATCHES[a](self, a))
+                out.append('    ' + self.patches[a](self, a))
                 last = 'op'
                 continue
             k = ins.kind
@@ -467,7 +508,7 @@ class Module:
                 if jt:
                     cases = ' '.join(f'case {hx(t)}: {jump(t)}' for t in jt)
                     out.append(f'    switch ({ins.target}) {{ {cases} default: break; }}')
-                    out.append(f'    c->pc = {ins.target}; goto L_dispatch;')
+                    out.append(f'    c->pc = {ins.target}; {miss}')
                     continue
                 out.append(f'    c->pc = {ins.target}; __attribute__((musttail)) return rt_dispatch(c);')
             elif k == 'ret':
@@ -482,11 +523,7 @@ class Module:
             out.append(f'    switch (c->pc) {{ {cases} default: break; }}')
             out.append('    __attribute__((musttail)) return rt_dispatch(c);')
         out.append('}')
-        self._refs = refs
         return out
-
-
-from patches import PATCHES
 
 
 def write_if_changed(path, text):
@@ -565,9 +602,19 @@ def discover(m, starts):
     return entries, rounds
 
 
-def generate(name, nso, base, outdir, opts):
+def main_sites(nso, base, opts):
+    """(version, sites) of a main module (tools/game_sites.py); none with --no-sites"""
+    if opts.no_sites:
+        return '', {}
+    return game_sites.for_module(nso, base, opts.any_version, lambda s: print(s, file=sys.stderr))
+
+
+def generate(name, nso, base, outdir, opts, sites=None):
     t0 = time.time()
     m = Module(name, nso, base, opts.simd)
+    if name == 'main':
+        m.sites = sites if sites is not None else main_sites(m.nso, base, opts)[1]
+        m.patches = patches.table(m.sites) if m.sites else {}
     starts = m.boundaries()
     hle = {}
     if opts.hle and os.path.exists(opts.hle):
@@ -652,6 +699,8 @@ def main():
     ap.add_argument('--chunk-bytes', type=int, default=1500000)  # and about this much C (even compile times)
     ap.add_argument('--big-fn', type=int, default=100000)  # bytes of C from which a function gets its own file
     ap.add_argument('--limit', type=int, default=0)
+    ap.add_argument('--any-version', action='store_true')  # (a main module of a version not supported yet)
+    ap.add_argument('--no-sites', action='store_true')  # (made-up modules, tools/test_layout.py: no sites, no patches)
     ap.add_argument('--simd', choices=('asm', 'c'),
                     default='asm' if platform.machine().lower() in ('arm64', 'aarch64') else 'c')
     args = ap.parse_args()
@@ -663,7 +712,10 @@ def main():
             exefs, outdir = args.input, args.paths[0]
             lay = layout.checked(exefs)
             layout.show(lay)
-            layout.write(lay, outdir)
+            main_base = next(b for n, b, *_ in lay if n == 'main')
+            version, sites = main_sites(Nso(os.path.join(exefs, 'main')), main_base, args)
+            print(f'  game version {version}, {len(sites)} sites')
+            layout.write(lay, outdir, (version, sites))
             if args.name == 'all':
                 present = {n for n, *_ in lay}
                 for n in layout.LOAD_ORDER:  # a module gone from the exefs: its old C would still be built in
@@ -672,7 +724,8 @@ def main():
                 hle = args.hle
                 for n, base, size, build_id in lay:
                     args.hle = hle if n != 'main' else None
-                    generate(n, os.path.join(exefs, n), base, os.path.join(outdir, n), args)
+                    generate(n, os.path.join(exefs, n), base, os.path.join(outdir, n), args,
+                             sites if n == 'main' else None)
             return
         lay = {n: (b, i) for n, b, s, i in layout.read(args.paths[0])}
         if args.name not in lay:
@@ -681,7 +734,7 @@ def main():
         if header(args.input)['build_id'] != build_id:
             raise layout.LayoutError(f'{args.input} is not the {args.name} that {args.paths[0]} was made from')
         generate(args.name, args.input, base, args.paths[1], args)
-    except layout.LayoutError as e:
+    except (layout.LayoutError, game_sites.SiteError) as e:
         sys.exit(f'gen.py: {e}')
 
 

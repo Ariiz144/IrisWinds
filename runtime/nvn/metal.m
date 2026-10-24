@@ -587,6 +587,8 @@ void backend_reset(void) {
     LOG("[metal] reboot: %d textures released (%d left alive, %.0f MB)\n", n, g_tex_live, g_tex_live_bytes / 1048576.0);
 }
 
+void backend_heap_set(uint64_t size) { (void)size; }  // (Vulkan on Linux maps GPU memory there)
+
 void backend_guest_memory_reset(void) {
     if (!queue) return;
     g_guest_buffer = [dev newBufferWithBytesNoCopy:(void *)HEAP_BASE length:HEAP_MAX
@@ -1055,6 +1057,8 @@ void backend_present(NvnTexture *t) {
     fnprof_frame(total_frames);
     extern void reboot_test_frame(uint64_t frame);  // runtime/main.c (SAVAGEWIND_REBOOT_AT)
     reboot_test_frame(total_frames);
+    extern void test_warp_frame(uint64_t frame);  // runtime/services/test_warp.c (SAVAGEWIND_TEST_TIME)
+    test_warp_frame(total_frames);
     static long shot_every = -1;
     if (shot_every < 0) { const char *e = getenv("SAVAGEWIND_SCREENSHOT_EVERY"); shot_every = e ? atol(e) : 0; }
     extern bool g_debug_frame;

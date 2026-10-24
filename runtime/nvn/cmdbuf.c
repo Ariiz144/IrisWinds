@@ -495,9 +495,9 @@ PLAIN(nvnCommandBufferSetLineWidth, CMD_SET_LINE_WIDTH)
 PLAIN(nvnCommandBufferSetPointSize, CMD_SET_POINT_SIZE)
 PLAIN(nvnCommandBufferSetSampleMask, CMD_SET_SAMPLE_MASK)
 PLAIN(nvnCommandBufferSetRenderEnable, CMD_SET_RENDER_ENABLE)
-NVN(nvnCommandBufferSetRenderEnableConditional) { (void)c; }
+NVN(nvnCommandBufferSetRenderEnableConditional) { (void)c; UNIMPLEMENTED_ONCE("SetRenderEnableConditional"); }
 PLAIN(nvnCommandBufferSetDepthClamp, CMD_SET_DEPTH_CLAMP)
-NVN(nvnCommandBufferSetRasterizerDiscard) { (void)c; }
+NVN(nvnCommandBufferSetRasterizerDiscard) { (void)c; UNIMPLEMENTED_ONCE("SetRasterizerDiscard"); }
 NVN(nvnCommandBufferSetConservativeRasterEnable) { (void)c; }
 NVN(nvnCommandBufferSetConservativeRasterDilate) { (void)c; }
 NVN(nvnCommandBufferSetSubpixelPrecisionBias) { (void)c; }
@@ -683,7 +683,7 @@ PLAIN(nvnCommandBufferSignalEvent, CMD_SIGNAL_EVENT)
 PLAIN(nvnCommandBufferWaitEvent, CMD_WAIT_EVENT)
 PLAIN(nvnCommandBufferReportCounter, CMD_REPORT_COUNTER)
 NVN(nvnCommandBufferReportValue) { (void)c; UNIMPLEMENTED_ONCE("ReportValue"); }
-NVN(nvnCommandBufferResetCounter) { (void)c; UNIMPLEMENTED_ONCE("ResetCounter"); }  // (BOTW: before its sun occlusion query)
+PLAIN(nvnCommandBufferResetCounter, CMD_RESET_COUNTER)  // (BOTW: before its sun occlusion query)
 NVN(nvnCommandBufferCallCommands) { record_copy(c, CMD_CALL, 2, (uint32_t)A(1) * 8); }
 NVN(nvnCommandBufferCopyCommands) { record_copy(c, CMD_CALL, 2, (uint32_t)A(1) * 8); }
 NVN(nvnCommandBufferInsertDebugMarker) { (void)c; }

@@ -188,7 +188,10 @@ def movz_x0(v): return MOVZ_X0 | (v << 5)
 # table whose adr base is the first case right after the br, its index bounds-checked by a cmp with a tbnz in between
 # and its base loaded before the loop; then a 16-bit table whose base is the loop head, before the br. G has a byte
 # table too, but H calls into G's middle, so G must be split there: the case that falls in the other piece is entered
-# by a tail call.
+# by a tail call. K is the table of issue #22 (BOTW's main, 1.9.0 0x70011b06e0): a byte table with an adr base and no
+# bounds check, and an `stp s9, s8` between the address math and the br. It can't be resolved; it must get the
+# all-instructions fallback (a store of s9 doesn't write x9), not a plain dispatch that can't reach its cases.
+STP_S9_S8_SP80 = 0x2D1023E9  # stp s9, s8, [sp, #0x80]
 JT_CODE = [
     'F', lambda pc, L: adrp(11, pc, L['TBL1']), lambda pc, L: add_lo12(11, 11, L['TBL1']),
     'F_LOOP', lambda pc, L: cbz(0, pc, L['F_EXIT']), mov_w(8, 1), cmp_w(8, 3),
@@ -209,6 +212,8 @@ JT_CODE = [
     'G_C1', movz_x0(6),
     'G_EXIT', RET, 'G_END',
     'H', lambda pc, L: b_(pc, L['G_MID'], BL), RET, 'H_END',
+    'K', lambda pc, L: adr(9, pc, L['K_C1']), ldrb_x(10, 11, 8), add_lsl2(9, 9, 10), STP_S9_S8_SP80, 'K_BR', br(9),
+    'K_C1', movz_x0(7), RET, 'K_END',
 ]
 # the cases of each table (labels, + 4 * instruction): what gen.py must find
 JT_CASES = {
@@ -261,7 +266,7 @@ def jump_table_module():
         entries = [(L[lab] + 4 * k - L[base]) // 4 for lab, k in JT_CASES[br_label]]
         struct.pack_into(f'<{len(entries)}{fmt}', ro, L[name] - ro_off, *entries)
     eh_at = ro_off + 0x100
-    eh = eh_frame(eh_at, [(L[f], L[f + '_END']) for f in 'FGH'])
+    eh = eh_frame(eh_at, [(L[f], L[f + '_END']) for f in 'FGHK'])
     ro[0x100:0x100 + len(eh)] = eh
     data_off = ro_off + len(ro)
     data = bytearray(0x1000)  # .dynamic: just DT_NULL
@@ -282,16 +287,21 @@ def jump_tables(root, check):
     base = layout.MODULES_LO
     L = {k: base + v for k, v in off.items()}
     m = gen.Module('sdk', path, base, 'c')
-    check(m.fdes == [(L[f], L[f + '_END']) for f in 'FGH'], f'eh_frame function ranges ({m.fdes})')
+    check(m.fdes == [(L[f], L[f + '_END']) for f in 'FGHK'], f'eh_frame function ranges ({m.fdes})')
     entries, rounds = gen.discover(m, m.boundaries())
-    check(sorted(entries) == sorted(L[k] for k in ('F', 'G', 'G_LOOP', 'G_MID', 'G_EXIT', 'H')),
+    check(sorted(entries) == sorted(L[k] for k in ('F', 'G', 'G_LOOP', 'G_MID', 'G_EXIT', 'H', 'K')),
           f'F stays one function, the adr bases inside it are labels; G is split at the call, then at its table\'s '
           f'case and its exit ({[hex(a) for a in sorted(entries)]})')
     cases = {br: [L[lab] + 4 * k for lab, k in want] for br, want in JT_CASES.items()}
     check(entries[L['F']][2] == {L['F_BR1']: sorted(cases['F_BR1']), L['F_BR2']: sorted(cases['F_BR2'])},
           f'F: both tables resolved ({entries[L["F"]][2]})')
     check(entries[L['G_MID']][2] == {L['G_BR']: sorted(cases['G_BR'])}, 'G: its table resolved from the split piece')
-    check(+m.stats == {'jumptables': 3}, f'indirect branch count ({dict(m.stats)})')
+    check(entries[L['K']][2] == {L['K_BR']: 'all'},
+          f'K: unresolved table, all-instructions fallback past the stp of s9 ({entries[L["K"]][2]})')
+    check(+m.stats == {'jumptables': 3, 'br_all_labels': 1}, f'indirect branch count ({dict(m.stats)})')
+    c = '\n'.join(m.emit_function(L['K'], *entries[L['K']], {}))
+    check(f'case {L["K_C1"]:#x}ull: goto L_{L["K_C1"]:x};' in c and 'goto L_dispatch;' in c,
+          'K: the br reaches its case through the all-instructions switch')
     c = '\n'.join(m.emit_function(L['F'], *entries[L['F']], {}))
     check(all(f'case {t:#x}ull: goto L_{t:x};' in c for t in cases['F_BR1'] + cases['F_BR2']), 'F: cases are gotos')
     c = '\n'.join(m.emit_function(L['G_MID'], *entries[L['G_MID']], {}))
@@ -372,12 +382,12 @@ def main():
         check(len(why) == 1 and 'past' in why[0], f'oversized layout refused: {why}')
         os.remove(os.path.join(t, 'sdk'))
         check(any('no sdk' in w for w in layout.problems(layout.compute(t))), 'layout without sdk refused')
-        r = run('gen.py', 'layout', t, os.path.join(t, 'out'), ok=False)
+        r = run('gen.py', 'layout', t, os.path.join(t, 'out'), '--no-sites', ok=False)
         check('no sdk' in r.stderr, 'gen.py layout refuses it too')
 
     # ---- gen.py all
     os.makedirs(os.path.join(gen, 'subsdk5'))  # (an earlier exefs's module: must go)
-    run('gen.py', 'all', exefs, gen, '--simd', 'c')
+    run('gen.py', 'all', exefs, gen, '--simd', 'c', '--no-sites')
     check(not os.path.exists(os.path.join(gen, 'subsdk5')), 'stale module folder removed')
     check(layout.read(os.path.join(gen, 'layout.txt')) == lay, 'layout.txt == layout.compute()')
     c = open(os.path.join(gen, 'layout.c')).read()
@@ -390,6 +400,9 @@ def main():
         chunk = open(os.path.join(gen, n, f'{n}_000.c')).read()
         check(all(f'void f_{a:x}(Cpu *c)' in chunk for a in want), f'{n}: functions named by address')
     check(f'game_module_count = {len(lay)};' in c, 'layout.c module count')
+    check('game_version[] = "";' in c and 'game_site_count = 0;' in c, 'layout.c without game sites (--no-sites)')
+    r = run('gen.py', 'layout', exefs, os.path.join(root, 'nosites'), ok=False)
+    check('not a version Savage Wind knows' in r.stderr, 'a main module of no known version: refused')
 
     # ---- gen.py <module> with layout.txt
     one = os.path.join(root, 'one')

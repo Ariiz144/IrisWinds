@@ -20,3 +20,6 @@ bool upscaler_available(int u);
 bool upscale_modes_available(void);  // (rendering below the window's size: needs render-target scaling)
 double upscale_mode_factor(int q);
 double upscale_factor(void);
+// Video > Shadow resolution: the width the game's shadow maps are made at from presented frame `frame` on (0: their
+// own size; vulkan/textures.c RS_SHADOW)
+unsigned shadow_map_size(unsigned long long frame);

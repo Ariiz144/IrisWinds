@@ -5,9 +5,12 @@
 // folder (runtime/services/fs.c, voice_redirect).
 #include "language.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
+#include "paths.h"
 #include "settings.h"
 #ifdef _WIN32
 #include <windows.h>
@@ -30,8 +33,25 @@ const TextLanguage g_text_languages[] = {
     {"Korean", "ko", "KRko"},
     {"Chinese (Simplified)", "zh-CN", "CNzh"},
     {"Chinese (Traditional)", "zh-TW", "TWzh"},
+    {"Thai", "th", "THth"},  // (1.9.0 on: language_text_count; last, so the others keep their place)
 };
 const int g_ntext_languages = sizeof g_text_languages / sizeof g_text_languages[0];
+
+// Thai came with 1.9.0 (Pack/Bootup_THth.pack and its fonts; the game takes the LanguageCode "th"): offered when the
+// game files have it. On 1.8.2 a Thai setting is kept but reads as Auto.
+static bool has_thai(void) {
+    char p[1200];
+    struct stat st;
+    snprintf(p, sizeof p, "%s/extracted/romfs/Pack/Bootup_THth.pack", rt_data_root());
+    return stat(p, &st) == 0;
+}
+
+int language_text_count(void) { return has_thai() ? g_ntext_languages : g_ntext_languages - 1; }
+
+int language_text_index(void) {
+    int i = g_settings.text_language;
+    return i > 0 && i < language_text_count() ? i : 0;
+}
 
 const VoiceLanguage g_voice_languages[] = {
     {"Same as text", NULL},
@@ -83,8 +103,8 @@ static const char *host_code(void) {
 }
 
 const char *language_text_code(void) {
-    int i = g_settings.text_language;
-    return i > 0 && i < g_ntext_languages ? g_text_languages[i].code : host_code();
+    int i = language_text_index();
+    return i > 0 ? g_text_languages[i].code : host_code();
 }
 
 static int booted_text = -1, booted_voice = -1;

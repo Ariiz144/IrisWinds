@@ -1,6 +1,7 @@
 // Loads the recompiled game code library (runtime/gamelib.h).
 #include "gamelib.h"
 
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -10,11 +11,39 @@
 #include <dlfcn.h>
 #endif
 
+#include "game_sites.h"
 #include "paths.h"
 #include "rt.h"
 
 static const GameLibTables *g_tables;
 static char g_error[256];
+
+GameSites g_site;
+const char *g_game_version = "";
+
+// g_site from the library's sites: every one runtime/game_sites.h names has to be there (the library and this build
+// come from the same tools/game_sites.py, or their GAMELIB_IDs would differ).
+static bool take_sites(const GameLibTables *t) {
+    static const struct {
+        const char *name;
+        size_t off;
+    } want[] = {
+#define GAME_SITE_ENTRY(n) {#n, offsetof(GameSites, n)},
+        GAME_SITES(GAME_SITE_ENTRY)
+#undef GAME_SITE_ENTRY
+    };
+    for (size_t i = 0; i < sizeof want / sizeof want[0]; i++) {
+        uint32_t k = 0;
+        while (k < *t->nsites && strcmp(t->sites[k].name, want[i].name)) k++;
+        if (k == *t->nsites) {
+            snprintf(g_error, sizeof g_error, "the game code has no address for %s", want[i].name);
+            return false;
+        }
+        *(uint64_t *)((char *)&g_site + want[i].off) = t->sites[k].addr;
+    }
+    g_game_version = t->version;
+    return true;
+}
 
 // The library's id file (<library>.id, written next to it by the build): its GAMELIB_ID, read without loading it.
 static bool id_matches(const char *lib) {
@@ -90,8 +119,9 @@ bool gamelib_load(const char *game_dir, char *why, size_t why_size) {
                 continue;
             }
             g_tables = open_lib(c[i]);
+            if (g_tables && !take_sites(g_tables)) g_tables = NULL;
             if (g_tables) {
-                LOG("[gamelib] %s\n", c[i]);
+                LOG("[gamelib] %s (game version %s, %u sites)\n", c[i], g_game_version, *g_tables->nsites);
                 for (uint32_t k = 0; k < *g_tables->nmodules; k++) {
                     const GameLibModule *m = &g_tables->modules[k];
                     LOG("[gamelib]   %-8s %llx-%llx %llu functions\n", m->name, (unsigned long long)m->base,

@@ -47,7 +47,20 @@ static uint32_t new_signaled_event(void) {
     return r;
 }
 
-#define UNHANDLED(iface) LOG("[am] %s cmd %u (unhandled, ok)\n", iface, req->cmd)
+// Logged the first time each: BOTW asks ICommonStateGetter 50 every frame (formatting and writing the line was ~1% of
+// the main thread).
+static void unhandled(const char *iface, uint32_t cmd) {
+    static pthread_mutex_t m = PTHREAD_MUTEX_INITIALIZER;
+    static struct { const char *iface; uint32_t cmd; } seen[64];
+    static int n;
+    pthread_mutex_lock(&m);
+    for (int i = 0; i < n; i++)
+        if (seen[i].cmd == cmd && !strcmp(seen[i].iface, iface)) { pthread_mutex_unlock(&m); return; }
+    if (n < 64) seen[n++] = (__typeof__(seen[0])){iface, cmd};
+    pthread_mutex_unlock(&m);
+    LOG("[am] %s cmd %u (unhandled, ok; logged once)\n", iface, cmd);
+}
+#define UNHANDLED(iface) unhandled(iface, req->cmd)
 
 static void common_state_getter(Service *s, IpcReq *req, IpcResp *resp) {
     (void)s;

@@ -7,6 +7,12 @@
 
 #include "gamelib.h"
 #include "paths.h"
+#include "nvn/maxwell/shader.h"
+#include "nvn/shader_archive.h"
+#ifndef __APPLE__
+#include "nvn/precompile.h"
+#include "nvn/vulkan/shaders.h"  // (the shader key log: --scan-shaders)
+#endif
 #include "romfs_build.h"
 #include "settings.h"
 #include "hle.h"
@@ -50,6 +56,8 @@ static void rtld_init_sdk(Cpu *c) { module_init(c, loader_module("sdk")); }
 static void rtld_init_main(Cpu *c) {
     for (int i = g_nmodules - 1; i >= 0; i--)
         if (strcmp(g_modules[i].name, "sdk")) module_init(c, &g_modules[i]);
+    extern void rt_title_menu_prepare(void);  // runtime/ui/game_options.mm: tables the constructors filled
+    rt_title_menu_prepare();
 }
 static void rtld_fini_main(Cpu *c) {
     LOG("nnMain returned\n");
@@ -196,6 +204,90 @@ static void romfs_progress(uint64_t done, uint64_t total) {
     fprintf(stderr, "\r[romfs] %llu / %llu MB", (unsigned long long)(done >> 20), (unsigned long long)(total >> 20));
 }
 
+// --scan-shaders: what runtime/nvn/shader_archive.c finds in the game's RomFS image (a check of the enumeration the
+// shader precompilation uses).
+static int scan_shaders(const char *root) {
+    char image[1100], why[256] = "";
+    snprintf(image, sizeof image, "%s/romfs.bin", root);
+    SaSet set;
+    uint64_t t0 = plat_now_ns();
+    if (!shader_archive_scan(image, &set, NULL, NULL, why, sizeof why)) { fprintf(stderr, "[shaders] %s\n", why); return 1; }
+    int n[6] = {0}, prog[3] = {0};
+    for (int i = 0; i < set.nshaders; i++) n[set.shaders[i].stage]++;
+    for (int i = 0; i < set.nprograms; i++) prog[set.programs[i].cs >= 0 ? 2 : 0]++;
+    fprintf(stderr, "[shaders] %llu files (%llu MB) in %.1f s: %d archives, %d programs (%d compute), %d shaders: %d vertex, "
+            "%d fragment, %d compute\n", (unsigned long long)set.files, (unsigned long long)(set.bytes >> 20),
+            (plat_now_ns() - t0) / 1e9, set.nsources, set.nprograms, prog[2], set.nshaders, n[STAGE_VERTEX], n[STAGE_FRAGMENT],
+            n[STAGE_COMPUTE]);
+#ifndef __APPLE__
+    {   // the shader key log of earlier sessions (SAVAGEWIND_CACHE_DIR): which of the shaders the game drew are in the
+        // archives found, and the vertex attribute kinds they were drawn with, by archive and attribute
+        VkKeyLogEntry *e;
+        int n = vk_keylog_read(&e), found[6] = {0}, all[6] = {0};
+        int (*kinds)[32][5] = calloc((size_t)set.nsources + 1, sizeof *kinds);
+        for (int i = 0; i < n; i++) {
+            if (e[i].stage > 5) continue;
+            all[e[i].stage]++;
+            int k = shader_archive_find(&set, e[i].code);
+            if (k >= 0) found[e[i].stage]++;
+            if (e[i].stage != STAGE_VERTEX) continue;
+            uint32_t in = k >= 0 ? vk_sph_inputs(set.shaders[k].code, STAGE_VERTEX) : 0;
+            for (int a = 0; a < 32; a++)
+                if ((in >> a) & 1 && e[i].key.attr_kind[a] < 5) kinds[k >= 0 ? set.shaders[k].source : set.nsources][a][e[i].key.attr_kind[a]]++;
+        }
+        if (n)
+            fprintf(stderr, "[shaders] key log: %d shader keys; found in the archives: vertex %d of %d, fragment %d of %d, compute %d of %d\n",
+                    n, found[STAGE_VERTEX], all[STAGE_VERTEX], found[STAGE_FRAGMENT], all[STAGE_FRAGMENT], found[STAGE_COMPUTE], all[STAGE_COMPUTE]);
+        for (int src = 0; src <= set.nsources && n; src++)
+            for (int a = 0; a < 32; a++) {
+                int *c = kinds[src][a];
+                if (c[1] + c[2] + c[3] + c[4])
+                    fprintf(stderr, "  attribute %2d: float %d, int %d, uint %d, int->float %d, uint->float %d  %s\n", a, c[0], c[1], c[2], c[3], c[4],
+                            src < set.nsources ? set.sources[src] : "(not in the archives)");
+            }
+        free(kinds);
+        free(e);
+    }
+#endif
+    if (getenv("SAVAGEWIND_SCAN_LIST")) {
+        int *per = calloc((size_t)set.nsources, sizeof *per);
+        for (int i = 0; i < set.nshaders; i++) per[set.shaders[i].source]++;
+        for (int i = 0; i < set.nsources; i++) if (per[i] || getenv("SAVAGEWIND_SCAN_LIST")[0] == '2') fprintf(stderr, "  %5d %s\n", per[i], set.sources[i]);
+        free(per);
+    }
+    shader_archive_free(&set);
+    return 0;
+}
+
+#ifndef __APPLE__
+// --precompile-shaders: the shader precompilation without the start screen (runtime/nvn/precompile.h). The pipelines
+// need the Vulkan device: a window is made for it (SAVAGEWIND_PRECOMPILE_NO_PIPELINES=1: translations and SPIR-V
+// only, no window).
+static void *precompile_progress(void *arg) {
+    ShaderPrecompile *p = arg;
+    while (atomic_load(&p->state) < SP_DONE) {
+        fprintf(stderr, "\r[precompile] %3d%%", (int)(shader_precompile_progress(p) * 100));
+        SDL_Delay(500);
+    }
+    return NULL;
+}
+
+static int precompile_shaders(const char *root) {
+    extern void ui_window_init(void);  // (the Vulkan device, for the pipelines; SAVAGEWIND_HIDDEN keeps the window hidden)
+    if (!getenv("SAVAGEWIND_PRECOMPILE_NO_PIPELINES")) ui_window_init();
+    char image[1100];
+    snprintf(image, sizeof image, "%s/romfs.bin", root);
+    static ShaderPrecompile p;
+    pthread_t t;
+    pthread_create(&t, NULL, precompile_progress, &p);
+    bool ok = shader_precompile_run(&p, image);
+    pthread_join(t, NULL);
+    fprintf(stderr, "\n[precompile] %s: %d shaders, %d translations (%d made, %d cached, %d failed) in %.1f s%s%s\n",
+            ok ? "done" : "stopped", p.shaders, p.keys, p.made, p.cached, p.failed, p.seconds, ok ? "" : ": ", ok ? "" : p.why);
+    return ok ? 0 : 1;
+}
+#endif
+
 static int build_romfs_image(const char *root) {
     char dir[1100], out[1100], why[256] = "";
     snprintf(dir, sizeof dir, "%s/romfs", root);
@@ -224,11 +316,13 @@ int main(int argc, char **argv) {
     bool skip_launcher = getenv("SAVAGEWIND_NO_LAUNCHER") || getenv("SAVAGEWIND_INPUT");  // tests boot straight in
     bool config = false;
     static char arg_root[1024];
-    bool build_romfs = false;
+    bool build_romfs = false, scan = false, precompile = false;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--play")) skip_launcher = true;
         else if (!strcmp(argv[i], "--config")) config = true;
         else if (!strcmp(argv[i], "--build-romfs")) build_romfs = true;
+        else if (!strcmp(argv[i], "--scan-shaders")) scan = true;
+        else if (!strcmp(argv[i], "--precompile-shaders")) precompile = true;
         else if (argv[i][0] != '-' && !realpath(argv[i], arg_root)) root = argv[i];  // (relative to where we started)
         else if (argv[i][0] != '-') root = arg_root;
     }
@@ -237,6 +331,12 @@ int main(int argc, char **argv) {
 #endif
     rt_paths_init();  // the data root becomes the working directory (runtime/paths.h)
     if (build_romfs) return build_romfs_image(root);
+    if (scan) return scan_shaders(root);
+#ifndef __APPLE__
+    if (precompile) return precompile_shaders(root);
+#else
+    (void)precompile;
+#endif
     // A plain start goes straight into the game once the game files are set up and the game code built from them
     // matches this build; the start screen only when there is something to set up, or when asked for.
     int mode = config ? LAUNCHER_CONFIG : skip_launcher || launcher_game_ready(root) ? LAUNCHER_NONE : LAUNCHER_SETUP;
