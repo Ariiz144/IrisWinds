@@ -166,7 +166,7 @@ void renderer_set_shadow_size(uint32_t n) {  // (never past what the GPU can mak
 uint64_t renderer_present_count(void);
 static float rs_want(const TexBackend *b, int axis) {  // the scale a texture of b's group is wanted at now
     if (b->rs_group != RS_SHADOW) return g_rs[b->rs_group][axis];
-    return b->guest_w && g_shadow_size ? (float)g_shadow_size / (float)b->guest_w : 1.0f;  // (square)
+    return b->guest_w && g_shadow_size > b->guest_w ? (float)g_shadow_size / (float)b->guest_w : 1.0f;  // (square)
 }
 static bool rs_stale(const TexBackend *b) {
     return b->rs_group && (b->sx != rs_want(b, 0) || b->sy != rs_want(b, 1));
@@ -414,7 +414,7 @@ static void destroy_image(TexBackend *b) {
 // registered with an object it finalized, copies of NVNtexture objects, command buffers recorded before it made its
 // frame's render targets again in the same memory), so they all take the same image. An image no texture holds any
 // more waits a few frames for the next texture made there, then goes.
-#define PARK_FRAMES 2
+#define PARK_FRAMES 4
 #define KEY_BUCKETS 4096
 static TexBackend *g_keyed[KEY_BUCKETS];
 static uint32_t key_bucket(uint64_t addr) { return (uint32_t)((addr >> 9) * 0x9E3779B97F4A7C15ull >> 40) & (KEY_BUCKETS - 1); }
@@ -614,10 +614,15 @@ void backend_texture_destroyed(NvnTexture *t) {
 static void *g_tex_scratch = NULL;
 static size_t g_tex_scratch_cap = 0;
 static void *tex_scratch_alloc(size_t sz) {
+    if (!sz) sz = 16;
     if (sz > g_tex_scratch_cap) {
         free(g_tex_scratch);
         g_tex_scratch_cap = (sz + 0xFFFF) & ~0xFFFF;
         g_tex_scratch = malloc(g_tex_scratch_cap);
+        if (!g_tex_scratch) {
+            g_tex_scratch_cap = 0;
+            return NULL;
+        }
     }
     return g_tex_scratch;
 }
@@ -645,15 +650,14 @@ static uint64_t full_hash_budget, full_hash_budget_frame;
 static uint64_t hash_full(const uint8_t *p, uint64_t n) {
     uint64_t h0 = 0x9E3779B97F4A7C15ull ^ n, h1 = 0xC2B2AE3D27D4EB4Full, h2 = 0x165667B19E3779F9ull, h3 = 0x27D4EB2F165667C5ull;
     uint64_t i = 0;
-    const uint64_t *p64 = (const uint64_t *)p;
-    uint64_t n_blocks = n / 32;
-    for (uint64_t b = 0; b < n_blocks; b++, p64 += 4) {
-        h0 = (h0 ^ p64[0]) * 0x100000001B3ull; h0 ^= h0 >> 29;
-        h1 = (h1 ^ p64[1]) * 0x100000001B3ull; h1 ^= h1 >> 29;
-        h2 = (h2 ^ p64[2]) * 0x100000001B3ull; h2 ^= h2 >> 29;
-        h3 = (h3 ^ p64[3]) * 0x100000001B3ull; h3 ^= h3 >> 29;
+    for (; i + 32 <= n; i += 32) {
+        uint64_t v[4];
+        memcpy(v, p + i, 32);
+        h0 = (h0 ^ v[0]) * 0x100000001B3ull; h0 ^= h0 >> 29;
+        h1 = (h1 ^ v[1]) * 0x100000001B3ull; h1 ^= h1 >> 29;
+        h2 = (h2 ^ v[2]) * 0x100000001B3ull; h2 ^= h2 >> 29;
+        h3 = (h3 ^ v[3]) * 0x100000001B3ull; h3 ^= h3 >> 29;
     }
-    i = n_blocks * 32;
     uint64_t h = h0 ^ (h1 * 0x9E3779B97F4A7C15ull) ^ (h2 * 0xC2B2AE3D27D4EB4Full) ^ (h3 * 0x165667B19E3779F9ull);
     for (; i < n; i++) h = (h ^ p[i]) * 0x100000001B3ull;
     return h ^ (h >> 31);
@@ -816,6 +820,7 @@ static void upload_levels(NvnTexture *t, TexBackend *b, uint32_t level_mask) {
             if (b->astc_bw) {  // blocks -> linear block rows -> RGBA8 texels
                 const uint8_t *src = (const uint8_t *)(uintptr_t)t->addr + layer * layer_size + l.offset;
                 uint8_t *blocks = tex_scratch_alloc((uint64_t)l.wb * l.hb * 16);
+                if (!blocks) continue;
                 if (linear) for (uint32_t y = 0; y < l.hb; y++) memcpy(blocks + (uint64_t)y * l.wb * 16, src + (uint64_t)y * t->stride, l.wb * 16);
                 else tegra_deswizzle(src, blocks, l.wb, l.hb, 1, 16, l.block_height_log2, l.block_depth_log2);
                 VkSpan s = vk_transient((uint64_t)l.w * l.h * 4, 16);
@@ -833,6 +838,7 @@ static void upload_levels(NvnTexture *t, TexBackend *b, uint32_t level_mask) {
             uint32_t out_row = expand ? l.wb * 4 : row;
             VkSpan s = vk_transient((uint64_t)out_row * l.hb * l.d, 16);
             uint8_t *lin = expand ? tex_scratch_alloc(sz) : s.ptr;
+            if (!lin) continue;
             const uint8_t *src = (const uint8_t *)(uintptr_t)t->addr + layer * layer_size + l.offset;
             if (linear) {
                 for (uint32_t y = 0; y < l.hb; y++) memcpy(lin + (uint64_t)y * row, src + (uint64_t)y * (t->stride ? t->stride : row), row);

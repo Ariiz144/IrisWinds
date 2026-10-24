@@ -90,7 +90,7 @@ int framepace_target(void) {
     if (forced == -2) forced = env_int("SAVAGEWIND_FPS", -1);
     extern bool movie_paced(void);
     if (movie == -2) movie = env_int("SAVAGEWIND_MOVIE_FPS", movie_paced() ? 0 : -1);  // (-1: the movie's own frame rate)
-    if (menu == -2) menu = env_int("SAVAGEWIND_MENU_FPS", 0);
+    if (menu == -2) menu = env_int("SAVAGEWIND_MENU_FPS", 30);
     if (event == -2) event = env_int("SAVAGEWIND_EVENT_FPS", 0);
     int fps = forced >= 0 ? forced : g_settings.fps_limit;
     if (fps < 0) fps = FPS_DEFAULT;

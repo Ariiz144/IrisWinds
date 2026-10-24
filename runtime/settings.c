@@ -26,7 +26,7 @@ Settings g_settings = {
     .fullscreen = false,
     .window_w = 1280,
     .window_h = 720,
-    .shadow_res = SHADOW_FAST,
+    .shadow_res = SHADOW_CONSOLE,
     .volume = 1.0f,
     .reverb = true,
     .movie_audio = true,
@@ -124,7 +124,7 @@ void settings_load(void) {
         else if (!strcmp(key, "precompile_shaders")) g_settings.precompile_shaders = atoi(val) != 0;
         else if (!strcmp(key, "shadow_resolution"))  // (fast / console / high / ultra / extreme)
             g_settings.shadow_res = !strcmp(val, "extreme") ? SHADOW_EXTREME : !strcmp(val, "ultra") ? SHADOW_ULTRA
-                                  : !strcmp(val, "high") ? SHADOW_HIGH : !strcmp(val, "console") ? SHADOW_CONSOLE : SHADOW_FAST;
+                                  : !strcmp(val, "high") ? SHADOW_HIGH : SHADOW_CONSOLE;
         else if (!strcmp(key, "text_language")) {  // (a region language: USen, EUes, ...; auto)
             g_settings.text_language = 0;
             for (int i = 1; i < g_ntext_languages; i++)
@@ -219,9 +219,9 @@ void settings_save(void) {
                                                 g_settings.button_icons : ICONS_AUTO]);
     fprintf(f, "async_shaders = %d\n", g_settings.async_shaders);
     fprintf(f, "precompile_shaders = %d\n", g_settings.precompile_shaders);
-    static const char *const shadow[SHADOW_COUNT] = {"fast", "console", "high", "ultra", "extreme"};
+    static const char *const shadow[SHADOW_COUNT] = {"console", "high", "ultra", "extreme"};
     int sr = g_settings.shadow_res;
-    fprintf(f, "shadow_resolution = %s\n", shadow[sr >= 0 && sr < SHADOW_COUNT ? sr : SHADOW_FAST]);
+    fprintf(f, "shadow_resolution = %s\n", shadow[sr >= 0 && sr < SHADOW_COUNT ? sr : SHADOW_CONSOLE]);
     int tl = g_settings.text_language, vl = g_settings.voice_language;
     fprintf(f, "text_language = %s\n", tl > 0 && tl < g_ntext_languages ? g_text_languages[tl].folder : "auto");
     fprintf(f, "voice_language = %s\n", vl > 0 && vl < g_nvoice_languages ? g_voice_languages[vl].folder : "text");

@@ -16,9 +16,9 @@ enum { UPSCALE_OFF = 0, UPSCALE_METALFX = 1 /* macOS */, UPSCALE_FSR1 = 2 /* AMD
 // quality modes, AMD's scale factors (per axis): Ultra Quality 1.3, Quality 1.5, Balanced 1.7, Performance 2.0
 enum { UPQ_ULTRA = 0, UPQ_QUALITY = 1, UPQ_BALANCED = 2, UPQ_PERFORMANCE = 3, UPQ_COUNT };
 enum { AA_OFF = 0, AA_SMAA = 1 };
-// Shadow resolution (Video > Shadow resolution; runtime/nvn/output_scale.c shadow_map_size):
-// Fast (512x512) for Iris Xe performance boost, Console (896x896), High (2048), Ultra (4096), Extreme (8192)
-enum { SHADOW_FAST = 0 /* 512 */, SHADOW_CONSOLE = 1 /* 896 */, SHADOW_HIGH = 2 /* 2048 */, SHADOW_ULTRA = 3 /* 4096 */, SHADOW_EXTREME = 4 /* 8192 */, SHADOW_COUNT };
+// Shadow resolution (Video > Shadow resolution; runtime/nvn/output_scale.c shadow_map_size): the sun's shadow maps at
+// the console's size (BOTW: 896 x 896) or made bigger, for sharper shadows at some GPU time.
+enum { SHADOW_CONSOLE = 0, SHADOW_HIGH = 1 /* 2048 */, SHADOW_ULTRA = 2 /* 4096 */, SHADOW_EXTREME = 3 /* 8192 */, SHADOW_COUNT };
 enum { PERF_OFF = 0, PERF_FPS = 1, PERF_FULL = 2 };
 // Frame rate (Video > Frame rate; runtime/hle/framepace.c): frames per second, 0 = no limit. The game's clock is the
 // same at every rate.

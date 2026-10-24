@@ -97,9 +97,9 @@ void output_scale_screen(double sw, double sh, int iw, int ih, OutScale *o) {
     o->vw *= k; o->vh *= k;
 }
 
-// Fast 512 (Iris Xe boost); Console: the game's own size (BOTW: 896 x 896 per cascade); High 2048, Ultra 4096, Extreme 8192.
+// Console: the game's own size (BOTW: 896 x 896 per cascade); High 2048, Ultra 4096, Extreme 8192.
 unsigned shadow_map_size(unsigned long long frame) {
-    static const unsigned size[SHADOW_COUNT] = {512, 0, 2048, 4096, 8192};
+    static const unsigned size[SHADOW_COUNT] = {0, 2048, 4096, 8192};
     static int n = -1;
     static unsigned long long at[8];
     static unsigned w[8];
@@ -108,7 +108,7 @@ unsigned shadow_map_size(unsigned long long frame) {
         for (const char *e = getenv("SAVAGEWIND_SHADOW_AT"); e && *e && n < 8;) {
             char name[16] = "";
             if (sscanf(e, "%llu:%15[^,]", &at[n], name) != 2) break;
-            w[n++] = !strcmp(name, "fast") ? 512 : !strcmp(name, "console") ? 0 : !strcmp(name, "high") ? 2048 : !strcmp(name, "ultra") ? 4096
+            w[n++] = (!strcmp(name, "console") || !strcmp(name, "fast")) ? 0 : !strcmp(name, "high") ? 2048 : !strcmp(name, "ultra") ? 4096
                    : !strcmp(name, "extreme") ? 8192 : (unsigned)atoi(name);
             e = strchr(e, ',');
             if (e) e++;

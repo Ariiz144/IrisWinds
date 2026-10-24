@@ -102,8 +102,6 @@ static inline uint64_t gob_offset(uint32_t xb, uint32_t y, uint32_t z, uint32_t 
     return off;
 }
 
-typedef struct { uint64_t a, b; } TegraWord128;
-
 static void copy_surface(const uint8_t *src, uint8_t *dst, uint32_t wb, uint32_t hb, uint32_t d, uint32_t bpb,
                          uint32_t bh_log2, uint32_t bd_log2, bool to_linear) {
     uint32_t row_bytes = wb * bpb;
@@ -134,14 +132,9 @@ static void copy_surface(const uint8_t *src, uint8_t *dst, uint32_t wb, uint32_t
                 uint32_t x_sector = ((xi >> 5) << 8) | (((xi >> 4) & 1) << 5) | (xi & 0x0F);
                 uint64_t o = row_base + (uint64_t)gob_x * block_size + y_sector + x_sector;
 
-                if (row_bytes - x >= 16) {
-                    if (to_linear) *(TegraWord128 *)(lin + x) = *(const TegraWord128 *)(src + o);
-                    else *(TegraWord128 *)(dst + o) = *(const TegraWord128 *)(lin_src + x);
-                } else {
-                    uint32_t n = row_bytes - x;
-                    if (to_linear) memcpy(lin + x, src + o, n);
-                    else memcpy(dst + o, lin_src + x, n);
-                }
+                uint32_t n = row_bytes - x < 16 ? row_bytes - x : 16;
+                if (to_linear) memcpy(lin + x, src + o, n);
+                else memcpy(dst + o, lin_src + x, n);
             }
         }
     }
