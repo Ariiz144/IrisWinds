@@ -7,6 +7,7 @@ typedef struct {
     double scene_sx, scene_sy; // the 3D scene's render targets' scale (vulkan/textures.c RS_SCENE)
     double shape;              // window aspect / 16:9 when the camera is widened, else 1
     double vx, vy, vw, vh;     // where the image is drawn in the window (pixels)
+    double crop[4];            // the part of the image drawn there (uv origin, size): its 16:9 middle in menus
 } OutScale;
 
 // dw x dh: the window's drawable size in pixels
@@ -20,3 +21,6 @@ bool upscaler_available(int u);
 bool upscale_modes_available(void);  // (rendering below the window's size: needs render-target scaling)
 double upscale_mode_factor(int q);
 double upscale_factor(void);
+// Video > Shadow resolution: the width the game's shadow maps are made at from presented frame `frame` on (0: their
+// own size; vulkan/textures.c RS_SHADOW)
+unsigned shadow_map_size(unsigned long long frame);

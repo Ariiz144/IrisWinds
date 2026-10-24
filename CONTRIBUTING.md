@@ -16,9 +16,21 @@ Nothing owned by Nintendo may ever be committed or attached to an issue or pull 
 - no game assets of any kind: textures, models, shaders, music, text, level files - also not "just one file for
   testing"
 - no links to any of these, and no instructions for dumping or decrypting them
+- no code, headers or documentation copied from decompilation projects (such as ZeldaRET): Savage Wind's code is
+  written from what we find in our own copy of the game, and the game's code itself is only ever recompiled on the
+  player's machine
 
 Pull requests that include Nintendo files can't be merged and will be closed. Screenshots and short clips of the
 game in bug reports are fine.
+
+## Moderation
+
+Savage Wind has no Discord or other community channels: GitHub is the only place for it. It's one person's project
+with the help of contributors, and every contribution is reviewed and tested by the maintainer before it goes into
+`test`.
+
+Issues, pull requests and comments that share, link to or ask for copies of the game, keys, firmware or dumping and
+decryption tools are removed. An account that does it again is blocked.
 
 ## Which branch to work on
 
@@ -35,7 +47,9 @@ game in bug reports are fine.
 Open a GitHub issue with:
 
 - your platform (Windows / Linux), hardware (CPU, GPU) and window size
-- the game version (the `main` build id that `python tools/sw_probe.py` prints; 1.8.2 is the one supported)
+- the Savage Wind version: a release (e.g. 0.2.0-alpha.2), or the `test` commit you built
+- the game version (the `main` build id that `python tools/sw_probe.py` prints; 1.9.0 is the one supported. 1.8.2 still runs, but a
+  bug seen on it is only fixed if it also happens on 1.9.0)
 - what you did, what happened, and what you expected
 - a screenshot or short clip if it's visual
 - for crashes: the log the app prints to the terminal (run it from a terminal to capture it)
@@ -43,7 +57,7 @@ Open a GitHub issue with:
 ## Building
 
 See the README's "Building from source", [docs/BUILD-windows.md](docs/BUILD-windows.md) for Windows and
-[docs/linux.md](docs/linux.md) for Linux. In short: put your own 1.8.2 files in `extracted/`, `make gen` once to
+[docs/linux.md](docs/linux.md) for Linux. In short: put your own 1.9.0 files in `extracted/`, `make gen` once to
 recompile the game code from them, then `make -j`.
 
 ## Project layout

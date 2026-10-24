@@ -349,6 +349,8 @@ bool rt_fault_watch(uint64_t fa, uint64_t pc) {
                     node ? "node" : "head", (unsigned long long)(fa - (node ? node_lo : g_watch_lo)), nm,
                     !strcmp(nm, "savagewind") ? " rt_fault_watch+" : "+", (unsigned long long)off,
                     kernel_current_thread_handle());
+            extern void kernel_log_guest_chain(void);
+            kernel_log_guest_chain();
         }
     } else if (fa >= g_watch_lo && fa < g_watch_hi) {
         static uint64_t seen[256];  // one line per host pc (the module offset maps to f_<addr> with nm)
@@ -362,6 +364,8 @@ bool rt_fault_watch(uint64_t fa, uint64_t pc) {
             seen[nseen++] = pc;
             fprintf(stderr, "[watch] +%#llx of %llx by %s+%llx\n", (unsigned long long)(fa - g_watch_lo),
                     (unsigned long long)g_watch_lo, nm, (unsigned long long)off);
+            extern void kernel_log_guest_chain(void);
+            kernel_log_guest_chain();  // (the guest calls that led there: lr and frame records)
         }
     }
     plat_protect(page, PLAT_PAGE, PLAT_PROT_RW);

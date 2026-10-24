@@ -502,27 +502,52 @@ static void tab_display(void) {
         g_settings.fullscreen = fs;
         g_want_window_apply.store(true);
     }
-    {   // Window size (runtime/window_size.c): the sizes the display can show, grouped by shape
+    {   // Window size (runtime/window_size.c): the sizes the display can show, its own first, then grouped by shape
         WinSize list[WINSIZE_MAX];
-        static char names_buf[WINSIZE_MAX][32];
+        static char names_buf[WINSIZE_MAX][64];
         const char *names[WINSIZE_MAX];
         int n = winsize_list(list, g_settings.fullscreen), cur = 0, def = 0;
         WinSize e = winsize_effective(g_settings.fullscreen), d = winsize_default(g_settings.fullscreen);
         WinSize desk = winsize_desktop();
         for (int i = 0; i < n; i++) {
-            winsize_name(list[i], names_buf[i], sizeof names_buf[i]);
+            winsize_name(list[i], tr("native"), names_buf[i], sizeof names_buf[i]);
             names[i] = names_buf[i];
             if (list[i].w == e.w && list[i].h == e.h) cur = i;
             if (list[i].w == d.w && list[i].h == d.h) def = i;
         }
         char desc[600];
         snprintf(desc, sizeof desc, tr("The size of the game's window, or of the screen in fullscreen. Only the sizes your "
-                                       "display can show, grouped by shape (the game itself stays 16:9, with bars on "
-                                       "wider screens).\n\nYour display: %d x %d."), desk.w, desk.h);
-        if (opt_choice("Window size", &cur, names, n, def, desc, false)) {
+                                       "display can show: its own first, then grouped by shape. A shape wider than 16:9 "
+                                       "is filled with Fill wide screens on; any other keeps 16:9 with bars.\n\nYour display: %d x %d."), desk.w, desk.h);
+        if (opt_choice("Window size", &cur, names, n, def, desc)) {  // (past either end: the other one)
             g_settings.window_w = list[cur].w, g_settings.window_h = list[cur].h;
             g_want_window_apply.store(true);
         }
+    }
+    {   // Fill wide screens (runtime/nvn/output_scale.c rt_persp)
+        bool wv = g_settings.wide_view;
+        if (opt_toggle("Fill wide screens", &wv, true,
+                       "On a window or screen wider than 16:9 (21:9, 32:9) the game shows more to the sides instead "
+                       "of black bars. The HUD stays 16:9 in the middle; the pause menu, the map and the start "
+                       "screen are shown 16:9."))
+            g_settings.wide_view = wv;
+    }
+    {   // Field of view (runtime/nvn/output_scale.c rt_persp)
+        static const int fov[] = FOV_CHOICES;
+        enum { NV = sizeof fov / sizeof fov[0] };
+        static char names_buf[NV][16];
+        const char *names[NV];
+        int cur = 0, def = 0;
+        for (int i = 0; i < NV; i++) {
+            snprintf(names_buf[i], sizeof names_buf[i], "%d%%", fov[i]);
+            names[i] = names_buf[i];
+            if (fov[i] == g_settings.fov) cur = i;
+            if (fov[i] == 100) def = i;
+        }
+        if (opt_choice("Field of view", &cur, names, NV, def,
+                       "How much of the world the camera shows in play: 100% is the game's own. Cutscenes and "
+                       "conversations keep theirs.", false))
+            g_settings.fov = fov[cur];
     }
     {   // Frame rate (runtime/hle/framepace.c)
         static const int fps[] = FPS_CHOICES;
@@ -538,8 +563,8 @@ static void tab_display(void) {
         }
         std::string desc = tr("How many pictures a second the game draws. The game itself runs at the same speed at "
                               "every rate (the console runs it at 30). Higher rates need a faster computer. Menus, "
-                              "cutscenes and conversations run at 30, as on the console. Off: as many as the computer "
-                              "can draw.");
+                              "cutscenes and conversations use it too, and videos play at their own speed. Off: as "
+                              "many as the computer can draw.");
         int hz = (int)lroundf(winsize_refresh_rate());
         if (hz > 0) {
             char line[200];
@@ -548,6 +573,23 @@ static void tab_display(void) {
             desc += std::string("\n\n") + line;
         }
         if (opt_choice("Frame rate", &cur, names, NF, def, desc.c_str(), false)) g_settings.fps_limit = fps[cur];
+    }
+    {   // VSync (settings.h VSYNC_*: runtime/nvn/vulkan/device.c, runtime/hle/framepace.c)
+        static const char *const names[VSYNC_COUNT] = {"On", "Fast", "Adaptive", "Off"};
+        std::string desc = tr("On: no tearing; the game waits for the display. With G-SYNC or FreeSync the display "
+                              "waits for the game instead: each frame shows as soon as it's ready, and the frame rate "
+                              "stays a little under the display's refresh rate. Fast: no tearing and no waiting: each "
+                              "refresh shows the newest frame. Adaptive: as On, but a frame that comes late shows at "
+                              "once and may tear. Off: each frame shows at once: the least delay, but it tears.");
+        float hz = winsize_refresh_rate();
+        if (hz >= 30) {
+            char line[200];
+            snprintf(line, sizeof line,
+                     tr("With On and Adaptive, the frame rate on this display goes up to about %d FPS."),
+                     (int)lroundf(hz - hz * hz / 3600));
+            desc += std::string("\n\n") + line;
+        }
+        opt_choice("VSync", &g_settings.vsync, names, VSYNC_COUNT, VSYNC_DEFAULT, desc.c_str(), false);
     }
     static const char *const perf_names[] = {"Off", "FPS", "Full"};
     opt_choice("Performance overlay", &g_settings.perf_overlay, perf_names, 3, PERF_OFF,
@@ -616,11 +658,31 @@ static void tab_display(void) {
     opt_choice("Anti-aliasing", &g_settings.antialias, aa, 2, AA_OFF,
                "Smooths jagged edges of the game image before it is scaled to the window. SMAA: finds the edges and "
                "blends only along them, so textures stay sharp. Most useful with an upscaler.");
+#ifndef __APPLE__
+    {   // Anisotropic filtering and sharpening (Vulkan: vulkan/textures.c sampler_aniso, vulkan/exec.c scene_post)
+        static const char *const aniso[] = {"Off", "2x", "4x", "8x", "16x"};
+        opt_choice("Anisotropic filtering", &g_settings.anisotropy, aniso, 5, 0,
+                   "Keeps the textures of ground, paths and walls sharp where you look along them into the distance. "
+                   "Off: the game's own filtering, as on the console. 16x is the sharpest and costs very little on a PC "
+                   "graphics card.", false);
+        static const char *const sharp[] = {"Off", "10%", "20%", "30%", "40%", "50%", "60%", "70%", "80%", "90%", "100%"};
+        opt_choice("Sharpening (AMD CAS)", &g_settings.sharpening, sharp, 11, 0,
+                   "AMD FidelityFX CAS sharpens the 3D image after the upscaler (or at the window's resolution with the "
+                   "upscaler off), before the HUD is drawn over it: edges get crisper without halos. Most useful with "
+                   "AMD FSR 1.", false);
+    }
+#endif
     opt_toggle("Asynchronous shaders", &g_settings.async_shaders, false,
                "Off: the game waits for each new shader to compile, a short stutter the first time an effect "
                "appears, and everything is drawn. On: no waiting, but what needs a shader still compiling is skipped "
                "meanwhile: effects pop in late, and pictures the game draws only once (the save file's screenshot) "
                "can come out as garbage.");
+    // shadow resolution (its own block)
+    static const char *shadow[] = {"Console (896)", "High (2048)", "Ultra (4096)", "Extreme (8192)"};
+    opt_choice("Shadow resolution", &g_settings.shadow_res, shadow, SHADOW_COUNT, SHADOW_CONSOLE,
+               "The size of the maps the sun's shadows are drawn from. Console: the game's own, 896 x 896. High (2048), "
+               "Ultra (4096) and Extreme (8192) give sharper shadow edges (Link, trees, buildings) for more GPU time "
+               "and video memory (Ultra: about 100 MB, Extreme: about 400 MB).");
     opt_end();
 }
 
@@ -656,7 +718,8 @@ static void tab_language(bool in_game) {
     snprintf(d2, sizeof d2, tr("The language the characters speak. Same as text: the voices the game picks for the text "
                                "language (Japanese for Korean and Chinese, English for the other languages it has no "
                                "voices for). Any other: those voices with any text language.%s"), later);
-    opt_choice("Text", &g_settings.text_language, tnames, g_ntext_languages, 0, d1, false);
+    int text = language_text_index();  // (of the languages the game files have: Thai from 1.9.0 on)
+    if (opt_choice("Text", &text, tnames, language_text_count(), 0, d1, false)) g_settings.text_language = text;
     opt_choice("Voices", &g_settings.voice_language, vnames, g_nvoice_languages, 0, d2, false);
     if (in_game && language_pending() &&
         opt_button("Restart now", "Starts the game again with these languages. Progress since your last save is lost.")) {

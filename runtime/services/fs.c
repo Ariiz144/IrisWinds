@@ -10,7 +10,9 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <zlib.h>
 
+#include "../game_sites.h"
 #include "../hle.h"
 #include "../ipc.h"
 #include "../language.h"
@@ -38,6 +40,11 @@ typedef struct { uint64_t off, size; char *path; uint32_t meta; } RomFile;
 static RomFile *rom_files;
 static int rom_nfiles;
 static uint64_t rom_data_off;
+// Redirected voice files that got bigger than the game's own (voice_redirect), for rstb_patch
+typedef struct { const char *path; uint64_t grow; } GrownFile;
+static GrownFile *grown;
+static int ngrown;
+static uint8_t *rstb_blob;  // the patched ResourceSizeTable served from memory (rstb_patch)
 
 // Reboot: the next boot builds its own index / overlay when the game opens the RomFS again.
 RT_ON_RESET(fs_reset) {
@@ -47,7 +54,8 @@ RT_ON_RESET(fs_reset) {
     }
     for (int i = 0; i < npatches; i++) free(patches[i].data);  // (ov_meta and the extended table are among these)
     for (int i = 0; i < rom_nfiles; i++) free(rom_files[i].path);
-    free(ov), free(rom_files);
+    free(ov), free(rom_files), free(grown), free(rstb_blob);
+    grown = NULL, ngrown = 0, rstb_blob = NULL;
     ov = NULL, ov_n = ov_cap = 0;
     ov_meta = NULL, ov_meta_off = ov_meta_size = ov_end = 0;
     npatches = 0;
@@ -280,10 +288,120 @@ static void voice_redirect(int fd, const uint8_t *fmeta, uint64_t foff, uint64_t
         if (!hit) continue;
         uint8_t *meta = meta_copy(fd, fmeta, foff, fsz);
         memcpy(meta + rom_files[i].meta + 8, fmeta + (*hit)->meta + 8, 16);  // (data offset, size)
+        if ((*hit)->size > rom_files[i].size) {
+            grown = realloc(grown, sizeof *grown * (ngrown + 1));
+            grown[ngrown++] = (GrownFile){p, (*hit)->size - rom_files[i].size};
+        }
         n++;
     }
     free(chosen);
     LOG("[fs] voices: %d files play %s's voices\n", n, vf);
+}
+
+// The game sets aside memory for a resource by its path's entry in System/Resource/ResourceSizeTable (the RSTB: the
+// file's size plus room for what it builds from it, ~850 bytes for a voice bank). A redirected bank bigger than the
+// path's own file then runs out: the 0xa8-byte object that parses it (after the 'BARS' check) gets no memory and the
+// game writes through the null pointer ("accessing 0x10": pt-BR text with Japanese voices, at the title screen, where
+// it loads the Demo*.bars banks). So the RSTB the game reads is a copy whose entries for those paths grow by as much
+// as their data did (and a little: the room varies with alignment), served from memory like Version.txt. Its format:
+// Yaz0 over "RSTB", u32 CRC count, u32 name count, {crc32(path), size} sorted by crc32, then {char[128], size}.
+static uint8_t *yaz0_unpack(const uint8_t *d, size_t n, size_t *out_n) {
+    if (n < 16 || memcmp(d, "Yaz0", 4)) return NULL;
+    size_t size = (size_t)d[4] << 24 | (size_t)d[5] << 16 | (size_t)d[6] << 8 | d[7], s = 16, w = 0;
+    uint8_t *o = malloc(size ? size : 1);
+    while (w < size && s < n) {
+        uint8_t code = d[s++];
+        for (int b = 0; b < 8 && w < size && s < n; b++) {
+            if (code & (0x80 >> b)) { o[w++] = d[s++]; continue; }
+            if (s + 1 >= n) break;
+            size_t dist = (size_t)((d[s] & 0xF) << 8 | d[s + 1]) + 1, cnt = d[s] >> 4;
+            s += 2;
+            if (!cnt) cnt = s < n ? (size_t)d[s++] + 0x12 : 0;
+            else cnt += 2;
+            if (dist > w) { free(o); return NULL; }  // (damaged)
+            for (size_t i = 0; i < cnt && w < size; i++, w++) o[w] = o[w - dist];
+        }
+    }
+    if (w < size) { free(o); return NULL; }
+    *out_n = size;
+    return o;
+}
+
+// Yaz0 with literal bytes only (a 0xFF flag before every 8): what the game's decoder reads, no search needed
+static uint8_t *yaz0_pack_literal(const uint8_t *d, size_t n, size_t *out_n) {
+    uint8_t *o = malloc(16 + n + (n + 7) / 8), *w = o;
+    memcpy(w, "Yaz0", 4);
+    w[4] = (uint8_t)(n >> 24), w[5] = (uint8_t)(n >> 16), w[6] = (uint8_t)(n >> 8), w[7] = (uint8_t)n;
+    memset(w + 8, 0, 8);
+    w += 16;
+    for (size_t i = 0; i < n; i += 8) {
+        size_t k = n - i < 8 ? n - i : 8;
+        *w++ = 0xFF;
+        memcpy(w, d + i, k);
+        w += k;
+    }
+    *out_n = (size_t)(w - o);
+    return o;
+}
+
+static void rstb_patch(int fd, const uint8_t *fmeta, uint64_t foff, uint64_t fsz) {
+    static const char rstb_path[] = "System/Resource/ResourceSizeTable.product.srsizetable";
+    if (!ngrown) return;
+    int k = 0;
+    while (k < rom_nfiles && strcmp(rom_files[k].path, rstb_path)) k++;
+    char host[1200];
+    if (k == rom_nfiles) { LOG("[fs] voices: no %s, %d bigger banks left as they are\n", rstb_path, ngrown); return; }
+    if (overlay_file(rstb_path, host, sizeof host)) {
+        LOG("[fs] voices: the overlay folder replaces the ResourceSizeTable: %d bigger banks left to it\n", ngrown);
+        return;
+    }
+    size_t zn = rom_files[k].size, n = 0;
+    uint8_t *z = malloc(zn), *d = NULL;
+    if (pread(fd, z, zn, (off_t)rom_files[k].off) == (ssize_t)zn) d = yaz0_unpack(z, zn, &n);
+    free(z);
+    uint32_t ncrc = 0, nname = 0;
+    if (d && n >= 12) memcpy(&ncrc, d + 4, 4), memcpy(&nname, d + 8, 4);
+    if (!d || memcmp(d, "RSTB", 4) || 12 + (uint64_t)ncrc * 8 + (uint64_t)nname * 132 > n) {
+        LOG("[fs] voices: ResourceSizeTable not as expected, %d bigger banks left as they are\n", ngrown);
+        free(d);
+        return;
+    }
+    int changed = 0;
+    uint64_t added = 0;
+    for (int g = 0; g < ngrown; g++) {
+        uint32_t grow = (uint32_t)((grown[g].grow + 31) & ~31ull) + 32, *size = NULL;
+        for (uint32_t i = 0; i < nname && !size; i++)  // (names first: paths whose crc32 collides)
+            if (!strncmp((const char *)d + 12 + ncrc * 8 + i * 132, grown[g].path, 128))
+                size = (uint32_t *)(d + 12 + ncrc * 8 + i * 132 + 128);
+        uint32_t crc = (uint32_t)crc32(0, (const Bytef *)grown[g].path, (uInt)strlen(grown[g].path));
+        for (uint32_t lo = 0, hi = ncrc; !size && lo < hi;) {
+            uint32_t mid = (lo + hi) / 2, c;
+            memcpy(&c, d + 12 + mid * 8, 4);
+            if (c == crc) size = (uint32_t *)(d + 12 + mid * 8 + 4);
+            else if (c < crc) lo = mid + 1;
+            else hi = mid;
+        }
+        if (!size) continue;  // (no entry: the game sizes it from the file, the dialogue streams)
+        uint32_t v;
+        memcpy(&v, size, 4);
+        v += grow;
+        memcpy(size, &v, 4);
+        changed++;
+        added += grow;
+    }
+    size_t bn = 0;
+    free(rstb_blob);
+    rstb_blob = yaz0_pack_literal(d, n, &bn);
+    free(d);
+    meta_copy(fd, fmeta, foff, fsz);
+    uint64_t rel = ov_end - rom_data_off, size = bn;
+    memcpy(ov_meta + rom_files[k].meta + 8, &rel, 8);
+    memcpy(ov_meta + rom_files[k].meta + 0x10, &size, 8);
+    if (ov_n == ov_cap) { ov_cap = ov_cap ? ov_cap * 2 : 256; ov = realloc(ov, sizeof *ov * ov_cap); }
+    ov[ov_n++] = (Overlay){ov_end, size, NULL, -1, rstb_blob};
+    ov_end = (ov_end + size + 0xF) & ~0xFull;
+    LOG("[fs] voices: %d files bigger than the game's own, %d ResourceSizeTable entries grown (%llu KB in all)\n",
+        ngrown, changed, (unsigned long long)(added >> 10));
 }
 
 static void rom_index(int fd) {
@@ -359,6 +477,7 @@ static void rom_index(int fd) {
         ov_end = (ov_end + size + 0xF) & ~0xFull;
         break;
     }
+    rstb_patch(fd, fmeta, foff, fsz);
     if (ov_n) LOG("[fs] overlay: %d romfs files replaced\n", ov_n);
     if (ov_meta) { patches[npatches++] = (Patch){ov_meta_off, ov_meta_size, ov_meta}; }
     add_new_files(fd, h, dmeta, dsz, fsz);
@@ -368,11 +487,11 @@ static void rom_index(int fd) {
     LOG("[fs] romfs index: %d files\n", rom_nfiles);
 }
 
-// The title screen's version line: main 1.8.2 formats System/Version.txt with "Ver.%s" (0x71014b854e in the Ghidra
-// project, read by FUN_7100d4b57c and FUN_7100d4bca0); "%s" leaves just "Savage Wind <version>". Called once main is
-// loaded; anything else at that address is left alone.
+// The title screen's version line: main formats System/Version.txt with "Ver.%s" (title_version_format; 1.8.2
+// 0x71014b854e in the Ghidra project, read by FUN_7100d4b57c and FUN_7100d4bca0); "%s" leaves just "Savage Wind
+// <version>". Called once main is loaded; anything else at that address is left alone.
 void fs_title_version_patch(void) {
-    char *fmt = (char *)(uintptr_t)0x70014b854eull;
+    char *fmt = (char *)(uintptr_t)g_site.title_version_format;
     if (memcmp(fmt, "Ver.%s", 7)) { LOG("[fs] title version: \"Ver.%%s\" not found, left as is\n"); return; }
     memcpy(fmt, "%s", 3);
 }
@@ -479,7 +598,10 @@ static Service *open_romfs_storage(void) {
 
 // ------------------------------------------------------------------ host-directory filesystem
 typedef struct { char root[1024]; } HostFs;
-typedef struct { int fd; char path[1100]; } HostFile;
+typedef struct { int fd; char path[1100]; uint8_t *patched; uint64_t patched_size; } HostFile;
+// (test only) runtime/services/test_warp.c: game_data.sav read with some values rewritten (SAVAGEWIND_TEST_WARP...)
+bool test_warp_active(void);
+void test_warp_patch(uint8_t *data, uint64_t size);
 typedef struct { DIR *d; char path[1024]; int mode; } HostDir;
 
 static const char *in_path(IpcReq *req, int i) {
@@ -507,7 +629,13 @@ static void file(Service *s, IpcReq *req, IpcResp *resp) {
         IpcBuf *b = out_buf(req, 0);
         if ((uint64_t)size > b->size) size = (int64_t)b->size;
         kernel_watch_write("file read", b->addr, (uint64_t)size);
-        ssize_t n = pread(f->fd, (void *)(uintptr_t)b->addr, (size_t)size, off);
+        ssize_t n;
+        if (f->patched) {  // (test warp)
+            n = off >= 0 && (uint64_t)off < f->patched_size ? (ssize_t)((uint64_t)size < f->patched_size - (uint64_t)off ? (uint64_t)size : f->patched_size - (uint64_t)off) : 0;
+            memcpy((void *)(uintptr_t)b->addr, f->patched + off, (size_t)n);
+        } else {
+            n = pread(f->fd, (void *)(uintptr_t)b->addr, (size_t)size, off);
+        }
         if (strstr(f->path, "savedata")) {
             LOG("[save] read %s off %lld size %lld -> guest %llx\n", f->path, (long long)off, (long long)size, (unsigned long long)b->addr);
         }
@@ -521,6 +649,8 @@ static void file(Service *s, IpcReq *req, IpcResp *resp) {
         if (strstr(f->path, "savedata"))
             LOG("[save] write %s off %lld size %lld <- guest %llx\n", f->path, (long long)off, (long long)size, (unsigned long long)a->addr);
         if (pwrite(f->fd, (void *)(uintptr_t)a->addr, (size_t)size, off) < 0) resp->result = errno_result();
+        free(f->patched);  // (the game saved: its own data from now on)
+        f->patched = NULL;
         break;
     }
     case 2: fsync(f->fd); break;
@@ -634,6 +764,18 @@ static void filesystem(Service *s, IpcReq *req, IpcResp *resp) {
         HostFile *f = calloc(1, sizeof *f);
         f->fd = fd;
         strlcpy(f->path, p, sizeof f->path);
+        size_t pl = strlen(p);
+        if (pl >= 13 && !strcmp(p + pl - 13, "game_data.sav") && test_warp_active()) {
+            struct stat sb;
+            if (!fstat(fd, &sb) && sb.st_size > 0 && (f->patched = malloc((size_t)sb.st_size)) &&
+                pread(fd, f->patched, (size_t)sb.st_size, 0) == (ssize_t)sb.st_size) {
+                f->patched_size = (uint64_t)sb.st_size;
+                test_warp_patch(f->patched, f->patched_size);
+            } else {
+                free(f->patched);
+                f->patched = NULL;
+            }
+        }
         ipc_return_object(resp, service_new("IFile", file, f));
         break;
     }

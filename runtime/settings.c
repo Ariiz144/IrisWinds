@@ -26,8 +26,16 @@ Settings g_settings = {
     .upscale_quality = UPQ_QUALITY,
     .mouse_camera = true,
     .mouse_sens = MOUSE_SENS_DEFAULT,
+    .motion_sens = 1.0f,
+    .stick_deadzone = {STICK_DEADZONE_DEFAULT, STICK_DEADZONE_DEFAULT},
     .fps_limit = FPS_DEFAULT,
+    .precompile_shaders = true,
+    .vsync = VSYNC_DEFAULT,
+    .wide_view = true,
+    .fov = 100,
 };
+
+static const char *const k_vsync[VSYNC_COUNT] = {"on", "fast", "adaptive", "off"};  // (VSYNC_*: the ini's words)
 
 // settings_version 2 (2026-10-19): the upscaler's mode, the window size and the 300% mouse default. Older files: their
 // "resolution" (the internal resolution, removed) gives the upscaler's mode, and a mouse sensitivity at the old
@@ -37,6 +45,8 @@ Settings g_settings = {
 // nobody drops below the window's resolution unasked, except version-1 files whose internal resolution was a share of
 // the display (75%, 50%, 25%: they keep FSR 1 at the nearest mode).
 #define SETTINGS_VERSION 3
+
+static const char *const k_icons[ICONS_COUNT] = {"auto", "keyboard", "xbox", "playstation", "nintendo"};
 
 static const char *const k_quality[UPQ_COUNT] = {"ultra_quality", "quality", "balanced", "performance"};
 
@@ -53,7 +63,10 @@ void settings_load(void) {
     while (fgets(line, sizeof line, f)) {
         char key[64];
         char val[128];
-        if (sscanf(line, " %63[^= ] = %127[^\n]", key, val) < 1) continue;
+        val[0] = 0;
+        if (sscanf(line, " %63[^= ] = %127[^\r\n]", key, val) < 1) continue;
+        for (size_t n = strlen(val); n && (val[n - 1] == ' ' || val[n - 1] == '\t'); n--) val[n - 1] = 0;  // (a file
+        // edited by hand: Notepad's CRLF line ends and stray spaces would make the names below not match)
         if (!strcmp(key, "fullscreen")) g_settings.fullscreen = atoi(val) != 0;
         else if (!strcmp(key, "volume")) g_settings.volume = (float)atof(val);
         else if (!strcmp(key, "reverb")) g_settings.reverb = atoi(val) != 0;
@@ -61,6 +74,10 @@ void settings_load(void) {
         else if (!strcmp(key, "show_fps")) g_settings.perf_overlay = atoi(val) ? PERF_FPS : PERF_OFF;  // (older files)
         else if (!strcmp(key, "perf_overlay")) g_settings.perf_overlay = !strcmp(val, "full") ? PERF_FULL : !strcmp(val, "fps") ? PERF_FPS : PERF_OFF;
         else if (!strcmp(key, "frame_rate")) g_settings.fps_limit = !strcmp(val, "off") ? 0 : atoi(val);  // (fps / off)
+        else if (!strcmp(key, "vsync")) {
+            for (int i = 0; i < VSYNC_COUNT; i++)
+                if (!strcmp(val, k_vsync[i])) g_settings.vsync = i;
+        }
         else if (!strcmp(key, "settings_version")) version = atoi(val);
         else if (!strcmp(key, "resolution")) snprintf(old_res, sizeof old_res, "%s", val);  // (version 1)
         else if (!strcmp(key, "upscaler"))  // (metalfx / fsr1: this OS's spatial upscaler; fsr3 / dlss: not yet)
@@ -75,11 +92,37 @@ void settings_load(void) {
                 g_settings.window_w = w, g_settings.window_h = h;
         }
         else if (!strcmp(key, "antialias")) g_settings.antialias = !strcmp(val, "off") ? AA_OFF : AA_SMAA;  // ("fxaa": SMAA now)
+        else if (!strcmp(key, "anisotropy")) {  // (game, 2x .. 16x)
+            int a = atoi(val);
+            g_settings.anisotropy = a >= 16 ? 4 : a >= 8 ? 3 : a >= 4 ? 2 : a >= 2 ? 1 : 0;
+        }
+        else if (!strcmp(key, "sharpening")) {  // (percent, in steps of 10)
+            int p = atoi(val);
+            g_settings.sharpening = p < 0 ? 0 : p > 100 ? 10 : (p + 5) / 10;
+        }
         else if (!strcmp(key, "dpad_move")) g_settings.dpad_move = atoi(val) != 0;
+        else if (!strcmp(key, "left_stick_deadzone")) g_settings.stick_deadzone[0] = (float)atof(val) / 100;  // (percent)
+        else if (!strcmp(key, "right_stick_deadzone")) g_settings.stick_deadzone[1] = (float)atof(val) / 100;
         else if (!strcmp(key, "mouse_camera")) g_settings.mouse_camera = atoi(val) != 0;
         else if (!strcmp(key, "mouse_sensitivity")) g_settings.mouse_sens = (float)atof(val);
         else if (!strcmp(key, "mouse_invert_y")) g_settings.mouse_invert_y = atoi(val) != 0;
+        else if (!strcmp(key, "motion_sensitivity")) g_settings.motion_sens = (float)atof(val);
+        else if (!strcmp(key, "motion_invert")) {  // (off, up_down, left_right, both)
+            g_settings.motion_invert = !strcmp(val, "both") ? MOTION_INVERT_UD | MOTION_INVERT_LR :
+                                       !strcmp(val, "up_down") ? MOTION_INVERT_UD :
+                                       !strcmp(val, "left_right") ? MOTION_INVERT_LR : 0;
+        }
+        else if (!strcmp(key, "button_icons")) {
+            for (int i = 0; i < ICONS_COUNT; i++)
+                if (!strcmp(val, k_icons[i])) g_settings.button_icons = i;
+        }
         else if (!strcmp(key, "async_shaders")) g_settings.async_shaders = atoi(val) != 0;
+        else if (!strcmp(key, "precompile_shaders")) g_settings.precompile_shaders = atoi(val) != 0;
+        else if (!strcmp(key, "wide_view")) g_settings.wide_view = atoi(val) != 0;
+        else if (!strcmp(key, "field_of_view")) g_settings.fov = atoi(val);  // (percent)
+        else if (!strcmp(key, "shadow_resolution"))  // (console / high / ultra / extreme)
+            g_settings.shadow_res = !strcmp(val, "extreme") ? SHADOW_EXTREME : !strcmp(val, "ultra") ? SHADOW_ULTRA
+                                  : !strcmp(val, "high") ? SHADOW_HIGH : SHADOW_CONSOLE;
         else if (!strcmp(key, "text_language")) {  // (a region language: USen, EUes, ...; auto)
             g_settings.text_language = 0;
             for (int i = 1; i < g_ntext_languages; i++)
@@ -125,6 +168,11 @@ void settings_load(void) {
         g_settings.fps_limit = best;
     }
     if (!(g_settings.mouse_sens >= 0.1f && g_settings.mouse_sens <= 10.0f)) g_settings.mouse_sens = MOUSE_SENS_DEFAULT;
+    if (!(g_settings.motion_sens >= 0.1f && g_settings.motion_sens <= 10.0f)) g_settings.motion_sens = 1.0f;
+    if (g_settings.fov < 50 || g_settings.fov > 200) g_settings.fov = 100;
+    for (int i = 0; i < 2; i++)
+        if (!(g_settings.stick_deadzone[i] >= 0 && g_settings.stick_deadzone[i] <= 0.5f))
+            g_settings.stick_deadzone[i] = STICK_DEADZONE_DEFAULT;
     LOG("[settings] loaded %s\n", SETTINGS_FILE);
 }
 
@@ -142,6 +190,8 @@ void settings_save(void) {
         fprintf(f, "frame_rate = %d\n", g_settings.fps_limit);
     else
         fprintf(f, "frame_rate = off\n");
+    int vs = g_settings.vsync >= 0 && g_settings.vsync < VSYNC_COUNT ? g_settings.vsync : VSYNC_DEFAULT;
+    fprintf(f, "vsync = %s\n", k_vsync[vs]);
     fprintf(f, "volume = %.2f\n", g_settings.volume);
     fprintf(f, "reverb = %d\n", g_settings.reverb);
     fprintf(f, "movie_audio = %d\n", g_settings.movie_audio);
@@ -151,11 +201,28 @@ void settings_save(void) {
     fprintf(f, "upscaler = %s\n", u >= 0 && u < UPSCALE_COUNT ? ups[u] : "off");
     fprintf(f, "upscaler_quality = %s\n", k_quality[uq >= 0 && uq < UPQ_COUNT ? uq : UPQ_QUALITY]);
     fprintf(f, "antialias = %s\n", g_settings.antialias == AA_SMAA ? "smaa" : "off");
+    int an = g_settings.anisotropy;
+    if (an >= 1 && an <= 4) fprintf(f, "anisotropy = %dx\n", 1 << an);
+    else fprintf(f, "anisotropy = game\n");
+    fprintf(f, "sharpening = %d\n", g_settings.sharpening * 10);
     fprintf(f, "dpad_move = %d\n", g_settings.dpad_move);
+    fprintf(f, "left_stick_deadzone = %.0f\n", g_settings.stick_deadzone[0] * 100);
+    fprintf(f, "right_stick_deadzone = %.0f\n", g_settings.stick_deadzone[1] * 100);
     fprintf(f, "mouse_camera = %d\n", g_settings.mouse_camera);
     fprintf(f, "mouse_sensitivity = %.2f\n", g_settings.mouse_sens);
     fprintf(f, "mouse_invert_y = %d\n", g_settings.mouse_invert_y);
+    fprintf(f, "motion_sensitivity = %.2f\n", g_settings.motion_sens);
+    static const char *const inv[4] = {"off", "up_down", "left_right", "both"};
+    fprintf(f, "motion_invert = %s\n", inv[g_settings.motion_invert & 3]);
+    fprintf(f, "button_icons = %s\n", k_icons[g_settings.button_icons >= 0 && g_settings.button_icons < ICONS_COUNT ?
+                                                g_settings.button_icons : ICONS_AUTO]);
     fprintf(f, "async_shaders = %d\n", g_settings.async_shaders);
+    fprintf(f, "precompile_shaders = %d\n", g_settings.precompile_shaders);
+    static const char *const shadow[SHADOW_COUNT] = {"console", "high", "ultra", "extreme"};
+    int sr = g_settings.shadow_res;
+    fprintf(f, "shadow_resolution = %s\n", shadow[sr >= 0 && sr < SHADOW_COUNT ? sr : SHADOW_CONSOLE]);
+    fprintf(f, "wide_view = %d\n", g_settings.wide_view);
+    fprintf(f, "field_of_view = %d\n", g_settings.fov);
     int tl = g_settings.text_language, vl = g_settings.voice_language;
     fprintf(f, "text_language = %s\n", tl > 0 && tl < g_ntext_languages ? g_text_languages[tl].folder : "auto");
     fprintf(f, "voice_language = %s\n", vl > 0 && vl < g_nvoice_languages ? g_voice_languages[vl].folder : "text");

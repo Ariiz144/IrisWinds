@@ -6,7 +6,7 @@
 // the title menu's amiibo settings) asks with the game's own dialog: desktop or the Savage Wind start screen.
 //
 // The game side (tools/patches.py): the screen builds one row per entry of a static option table each time it opens
-// (entries through 0x7001cccda0 / count 0x7001cccd98, row order through 0x7001cccdb0 / count 0x7001cccda8). The
+// (g_site.opt_table: its count, entries, row count and row order; 1.8.2 0x7001cccd98..0x7001cccdb0). The
 // first time it opens, the table is pointed at a copy with this file's entries after the game's 14; each opening then
 // gets the row order of the page asked for. Rows of these entries have their value, texts and A handled here. A page
 // change closes the screen; the title menu's update (rt_opt_title_tick) or the pause System page's Options state
@@ -30,6 +30,7 @@
 extern "C" {
 #include "../input_bind.h"
 #include "../language.h"
+#include "../game_sites.h"
 #include "../nvn/output_scale.h"
 #include "../settings.h"
 #include "../window_size.h"
@@ -47,18 +48,22 @@ void wr8(uint64_t a, uint8_t v) { *(volatile uint8_t *)(uintptr_t)a = v; }
 void wr32(uint64_t a, uint32_t v) { *(volatile uint32_t *)(uintptr_t)a = v; }
 void wr64(uint64_t a, uint64_t v) { *(volatile uint64_t *)(uintptr_t)a = v; }
 
-const uint64_t OPT_COUNT = 0x7001cccd98, OPT_ENTRIES = 0x7001cccda0, OPT_ROWS = 0x7001cccda8, OPT_ORDER = 0x7001cccdb0;
-const uint64_t SCREEN_MGR = 0x7001cd5c38;  // ScreenMgr *: +0x28 screen count, +0x30 screen pointers by id
+// (the game version's addresses: runtime/game_sites.h)
+#define OPT_COUNT (g_site.opt_table)
+#define OPT_ENTRIES (g_site.opt_table + 8)
+#define OPT_ROWS (g_site.opt_table + 0x10)
+#define OPT_ORDER (g_site.opt_table + 0x18)
+#define SCREEN_MGR (g_site.screen_mgr)  // ScreenMgr *: +0x28 screen count, +0x30 screen pointers by id
 const uint32_t SCREEN_OPTIONS = 0x34;
-const uint32_t MENU_OPTIONS_ACTIVE = 0x6a;  // title menu +0x363c while its Options button's screen is up
+const uint32_t MENU_OPTIONS_ACTIVE = 0x6a;  // title menu [title_options_state] while its Options button's screen is up
 const uint32_t SCREEN_DIALOG = 0x39, TITLE_AMIIBO_BUTTON = 0x6c;
-const uint64_t DIALOG_ANSWER = 0x7001c4b308;  // the dialog's answer (FUN_7100d46068 takes it)
+#define DIALOG_ANSWER (g_site.dialog_answer)  // the dialog's answer (1.8.2 FUN_7100d46068 takes it)
 const uint32_t DIALOG_NO_ANSWER = 0xd;
 const int GAME_ENTRIES = 14;
-// the game's entries (game data flag names): 1 CameraUpDownReverse, 2 CameraRLReverse, 7 StickSensitivity,
-// 9 AmiiboItemOnOff, 11 / 12 VoiceLanguage (a button or a level, one per platform), 13 DisplaySpecialMode (Toy-Con
-// VR Goggles)
-const uint32_t GAME_CAMERA_Y = 1, GAME_CAMERA_X = 2, GAME_CAMERA_SENSITIVITY = 7, GAME_AMIIBO = 9,
+// the game's entries (game data flag names): 1 CameraUpDownReverse, 2 CameraRLReverse, 4 GyroOnOff (motion aiming),
+// 7 StickSensitivity, 9 AmiiboItemOnOff, 11 / 12 VoiceLanguage (a button or a level, one per platform),
+// 13 DisplaySpecialMode (Toy-Con VR Goggles)
+const uint32_t GAME_CAMERA_Y = 1, GAME_CAMERA_X = 2, GAME_GYRO = 4, GAME_CAMERA_SENSITIVITY = 7, GAME_AMIIBO = 9,
                GAME_VOICE_BUTTON = 11, GAME_VOICE_LEVEL = 12, GAME_VR = 13;
 const uint32_t MSG_BASE = 9000;  // this file's message ids: MSG_BASE + item * 256 + part (the game's are 0000-0100)
 enum { MSG_TITLE = 0, MSG_DESC = 1, MSG_BUTTON = 2, MSG_VALUE = 16 };
@@ -92,6 +97,7 @@ struct Item {
     const char *(*desc_fn)(const Item &);        // a description made when shown (NULL: desc)
     void (*reset)(const Item &);                 // "reset to defaults" when it isn't set(def)
     bool (*value_off)(const Item &, int v);      // KIND_CHOICE: value v can't be picked yet (shown greyed)
+    bool wrap;                                   // KIND_CHOICE: a step past either end goes to the other one
 };
 
 std::vector<Item> g_items;
@@ -129,12 +135,26 @@ std::vector<int> g_shown;   // per item: the value shown instead of get(), one t
 const char16_t GREY = 3;    // (the game's message colour for greyed values)
 const char *const k_modes[] = {"Ultra Quality", "Quality", "Balanced", "Performance"};
 const char *const k_aa[] = {"Off", "SMAA"};
+const char *const k_aniso[] = {"Off", "2x", "4x", "8x", "16x"};  // (settings anisotropy 0..4)
+const char *const k_shadow[] = {"Console (896)", "High (2048)", "Ultra (4096)", "Extreme (8192)"};  // (SHADOW_*)
+const char *const k_icons[] = {"Automatic", "Keyboard", "Xbox", "PlayStation", "Nintendo"};  // (ICONS_*)
 constexpr int k_fps[] = FPS_CHOICES;  // frame rate (0: Off, no limit)
+const char *const k_vsync[VSYNC_COUNT] = {"On", "Fast", "Adaptive", "Off"};  // (settings.h VSYNC_*)
 constexpr int FPS_DEFAULT_INDEX = 2;
 static_assert(k_fps[FPS_DEFAULT_INDEX] == FPS_DEFAULT);
 constexpr int k_sens[] = {10, 25, 50, 75, 100, 125, 150, 200, 250, 300, 400, 500, 600, 800, 1000};  // mouse sensitivity, %
 constexpr int SENS_DEFAULT = 9;  // (300%: MOUSE_SENS_DEFAULT)
 static_assert(k_sens[SENS_DEFAULT] == 300);
+constexpr int k_motion_sens[] = {25, 50, 75, 100, 125, 150, 200, 250, 300, 400};  // motion sensitivity, %
+constexpr int MOTION_SENS_DEFAULT = 3;
+static_assert(k_motion_sens[MOTION_SENS_DEFAULT] == 100);
+constexpr int k_fov[] = FOV_CHOICES;  // field of view, % of the game's own
+constexpr int FOV_DEFAULT_INDEX = 3;
+static_assert(k_fov[FOV_DEFAULT_INDEX] == 100);
+constexpr int k_deadzone[] = {0, 3, 5, 8, 10, 12, 15, 20, 25, 30, 40};  // stick dead zone, % of full tilt
+constexpr int DEADZONE_DEFAULT = 4;
+static_assert(k_deadzone[DEADZONE_DEFAULT] == (int)(STICK_DEADZONE_DEFAULT * 100 + 0.5f));
+const char *const k_invert[] = {"Off", "Up and down", "Left and right", "Both"};  // (MOTION_INVERT_* bits)
 #define N(a) (int)(sizeof(a) / sizeof((a)[0]))
 
 int nearest(const int *v, int n, float x) {
@@ -158,6 +178,14 @@ Item choice(int page, const char *title, const char *desc, int (*count)(const It
     Item it = toggle(page, title, desc, get, set, def);
     it.kind = KIND_CHOICE, it.count = count, it.label = label;
     return it;
+}
+
+// KIND_CHOICE: the values the game's row has. A wrapping choice has two more, 0 and count + 1, one past each end:
+// stepping onto one stores the value at the other end (value v is the game's v + 1)
+int game_count(const Item &it) { return it.kind != KIND_CHOICE ? 2 : it.count(it) + (it.wrap ? 2 : 0); }
+int game_value(const Item &it, int g) {
+    int n = it.count(it);
+    return it.wrap ? (g - 1 + n) % n : g;
 }
 
 Item button(int page, const char *title, const char *desc, const char *text, int action, int arg) {
@@ -216,7 +244,7 @@ void build_items(void) {
     v.push_back(button(P_MAIN, "Gameplay", "Mini-map, HUD, jump button and more.", "Open", A_PAGE, P_GAMEPLAY));
     v.push_back(button(P_MAIN, "Video", "Screen, resolution and image quality.", "Open", A_PAGE, P_VIDEO));
     v.push_back(button(P_MAIN, "Audio", "Volume and sound effects.", "Open", A_PAGE, P_AUDIO));
-    v.push_back(button(P_MAIN, "Controls", "Camera, d-pad and mouse.", "Open", A_PAGE, P_CONTROLS));
+    v.push_back(button(P_MAIN, "Controls", "Camera, motion, d-pad, mouse and button icons.", "Open", A_PAGE, P_CONTROLS));
     v.push_back(button(P_MAIN, "Keyboard (buttons)", "Which key does each button.", "Open", A_PAGE, P_KEYS));
     v.push_back(button(P_MAIN, "Keyboard (sticks)", "Keys for the sticks and for walking.", "Open", A_PAGE, P_STICKS));
     v.push_back(button(P_MAIN, "Controller", "Which controller button does each button.", "Open", A_PAGE, P_PAD));
@@ -234,10 +262,10 @@ void build_items(void) {
                          return winsize_items(list);
                      },
                      [](const Item &, int x) {
-                         static char buf[48];
+                         static char buf[64];
                          WinSize list[WINSIZE_MAX];
                          int n = winsize_items(list);
-                         winsize_name(list[x < n ? x : 0], buf, sizeof buf);
+                         winsize_name(list[x < n ? x : 0], tr("native"), buf, sizeof buf);
                          return (const char *)buf;
                      },
                      [](const Item &) { return winsize_index(winsize_effective(g_settings.fullscreen)); },
@@ -258,7 +286,20 @@ void build_items(void) {
         g_settings.window_w = g_settings.window_h = 0;
         menu_request_window_apply();
     };
+    ws.wrap = true;
     v.push_back(ws);
+    v.push_back(toggle(P_VIDEO, "Fill wide screens", "Shows more to the sides on screens wider than 16:9, instead of bars.",
+                       [](const Item &) { return (int)g_settings.wide_view; },
+                       [](const Item &, int x) { g_settings.wide_view = x; }, 1));
+    v.push_back(choice(P_VIDEO, "Field of view", "How much the camera shows in play. Cutscenes keep their own.",
+                       [](const Item &) { return N(k_fov); },
+                       [](const Item &, int x) {
+                           static std::string str;
+                           str = pct(k_fov[x]);
+                           return str.c_str();
+                       },
+                       [](const Item &) { return nearest(k_fov, N(k_fov), (float)g_settings.fov); },
+                       [](const Item &, int x) { g_settings.fov = k_fov[x]; }, FOV_DEFAULT_INDEX));
     Item fps = choice(P_VIDEO, "Frame rate", "",
                       [](const Item &) { return N(k_fps); }, fps_label,
                       [](const Item &) {
@@ -275,6 +316,13 @@ void build_items(void) {
         return (const char *)buf;
     };
     v.push_back(fps);
+    // VSync (settings.h VSYNC_*; the present mode: runtime/nvn/vulkan/device.c), next to the frame rate it caps. (One
+    // line for all its values: the game reads a row's description when the cursor comes to it, not when it changes.)
+    v.push_back(choice(P_VIDEO, "VSync", "On suits G-SYNC and FreeSync. Fast: no tearing and no waiting.",
+                       [](const Item &) { return (int)VSYNC_COUNT; },
+                       [](const Item &, int x) { return tr(k_vsync[x]); },
+                       [](const Item &) { return g_settings.vsync; },
+                       [](const Item &, int x) { g_settings.vsync = x; }, VSYNC_DEFAULT));
     v.push_back(choice(P_VIDEO, "Performance overlay", "Frame rate and system load in a corner. Also F10.",
                        [](const Item &) { return N(k_perf); }, [](const Item &, int x) { return tr(k_perf[x]); },
                        [](const Item &) { return g_settings.perf_overlay; },
@@ -304,9 +352,31 @@ void build_items(void) {
                        [](const Item &) { return N(k_aa); }, [](const Item &, int x) { return tr(k_aa[x]); },
                        [](const Item &) { return g_settings.antialias; },
                        [](const Item &, int x) { g_settings.antialias = x; }, AA_OFF));
+#ifndef __APPLE__
+    // Anisotropic filtering and sharpening (Vulkan: vulkan/textures.c sampler_aniso, vulkan/exec.c scene_post)
+    v.push_back(choice(P_VIDEO, "Anisotropic filtering", "Sharper ground and paths at a distance. Off: as on the console.",
+                       [](const Item &) { return N(k_aniso); },
+                       [](const Item &, int x) { return x ? k_aniso[x] : tr("Off"); },
+                       [](const Item &) { return g_settings.anisotropy; },
+                       [](const Item &, int x) { g_settings.anisotropy = x; }, 0));
+    v.push_back(choice(P_VIDEO, "Sharpening (AMD CAS)", "Sharpens the 3D image, not the HUD. Most useful with FSR 1.",
+                       [](const Item &) { return 11; },
+                       [](const Item &, int x) {
+                           static std::string s;
+                           s = x ? pct(x * 10) : std::string(tr("Off"));
+                           return s.c_str();
+                       },
+                       [](const Item &) { return g_settings.sharpening; },
+                       [](const Item &, int x) { g_settings.sharpening = x; }, 0));
+#endif
     v.push_back(toggle(P_VIDEO, "Asynchronous shaders", "On: no stutter, but some effects appear late.",
                        [](const Item &) { return (int)g_settings.async_shaders; },
                        [](const Item &, int x) { g_settings.async_shaders = x; }, 0));
+    // shadow resolution (its own block)
+    v.push_back(choice(P_VIDEO, "Shadow resolution", "Sharper sun shadows. Higher costs more GPU time.",
+                       [](const Item &) { return N(k_shadow); }, [](const Item &, int x) { return tr(k_shadow[x]); },
+                       [](const Item &) { return g_settings.shadow_res; },
+                       [](const Item &, int x) { g_settings.shadow_res = x; }, SHADOW_CONSOLE));
 
     // Audio
     v.push_back(choice(P_AUDIO, "Volume", "The game's volume. 100% is its own level.",
@@ -329,6 +399,20 @@ void build_items(void) {
     v.push_back(toggle(P_CONTROLS, "D-pad as left stick", "The d-pad also moves like the left stick.",
                        [](const Item &) { return (int)g_settings.dpad_move; },
                        [](const Item &, int x) { g_settings.dpad_move = x; }, 0));
+    for (int s = 0; s < 2; s++)  // (runtime/hle/input.c dead_zone)
+        v.push_back(choice(P_CONTROLS, s ? "Right stick dead zone" : "Left stick dead zone",
+                           "How far the stick must move before it counts. Raise it if the stick drifts.",
+                           [](const Item &) { return N(k_deadzone); },
+                           [](const Item &, int x) {
+                               static std::string str;
+                               str = pct(k_deadzone[x]);
+                               return str.c_str();
+                           },
+                           s ? [](const Item &) { return nearest(k_deadzone, N(k_deadzone), g_settings.stick_deadzone[1] * 100); }
+                             : [](const Item &) { return nearest(k_deadzone, N(k_deadzone), g_settings.stick_deadzone[0] * 100); },
+                           s ? [](const Item &, int x) { g_settings.stick_deadzone[1] = k_deadzone[x] / 100.0f; }
+                             : [](const Item &, int x) { g_settings.stick_deadzone[0] = k_deadzone[x] / 100.0f; },
+                           DEADZONE_DEFAULT));
     v.push_back(toggle(P_CONTROLS, "Mouse camera", "The mouse turns the camera. Esc frees the cursor.",
                        [](const Item &) { return (int)g_settings.mouse_camera; },
                        [](const Item &, int x) { g_settings.mouse_camera = x; }, 1));
@@ -344,6 +428,35 @@ void build_items(void) {
     v.push_back(toggle(P_CONTROLS, "Invert mouse Y", "Only the mouse. The camera Y-axis option inverts both.",
                        [](const Item &) { return (int)g_settings.mouse_invert_y; },
                        [](const Item &, int x) { g_settings.mouse_invert_y = x; }, 0));
+    // motion controls (runtime/hle/motion.c; the game's own Motion Controls option turns motion aiming on and off)
+    v.push_back(choice(P_CONTROLS, "Motion sensitivity", "How far turning the controller turns the aim.",
+                       [](const Item &) { return N(k_motion_sens); },
+                       [](const Item &, int x) {
+                           static std::string s;
+                           s = pct(k_motion_sens[x]);
+                           return s.c_str();
+                       },
+                       [](const Item &) { return nearest(k_motion_sens, N(k_motion_sens), g_settings.motion_sens * 100); },
+                       [](const Item &, int x) { g_settings.motion_sens = k_motion_sens[x] / 100.0f; },
+                       MOTION_SENS_DEFAULT));
+    v.push_back(choice(P_CONTROLS, "Invert motion", "Turning the controller moves the other way: aiming and tilting.",
+                       [](const Item &) { return N(k_invert); },
+                       [](const Item &, int x) { return tr(k_invert[x]); },
+                       [](const Item &) { return g_settings.motion_invert & 3; },
+                       [](const Item &, int x) { g_settings.motion_invert = x; }, 0));
+    {   // the tilt key: held, the mouse tilts the controller (for motion puzzles without a gyroscope)
+        Item it = button(P_CONTROLS, bind_input_name(BIND_TILT),
+                         "Hold it and move the mouse to tilt the controller. Press A, then the new key.", nullptr,
+                         A_BIND_KEY, BIND_TILT);
+        it.label = bind_label;
+        v.push_back(it);
+    }
+    v.push_back(choice(P_CONTROLS, "Button icons",
+                       "The buttons the game's prompts show. Automatic: the device you used last.",
+                       [](const Item &) { return N(k_icons); },
+                       [](const Item &, int x) { return tr(k_icons[x]); },
+                       [](const Item &) { return g_settings.button_icons; },
+                       [](const Item &, int x) { g_settings.button_icons = x; }, ICONS_AUTO));
 
     // Keyboard and controller: one button per Switch input, showing what drives it; A waits for the new one
     auto bind = [&](int page, int action, int slot) {
@@ -364,9 +477,9 @@ void build_items(void) {
 
     // Language
     v.push_back(choice(P_LANGUAGE, "Text", "Texts and menus. Applies after a restart.",
-                       [](const Item &) { return g_ntext_languages; },
+                       [](const Item &) { return language_text_count(); },  // (Thai: 1.9.0 on)
                        [](const Item &, int x) { return tr(g_text_languages[x].name); },
-                       [](const Item &) { return g_settings.text_language; },
+                       [](const Item &) { return language_text_index(); },
                        [](const Item &, int x) { g_settings.text_language = x; }, 0));
     v.push_back(choice(P_LANGUAGE, "Voices", "The characters' voices. Applies after a restart.",
                        [](const Item &) { return g_nvoice_languages; },
@@ -403,17 +516,17 @@ bool install(void) {
         e.kind = (uint32_t)it.kind;
         e.title = m + MSG_TITLE, e.desc = m + MSG_DESC;
         e.first_value = m + MSG_VALUE;
-        e.last_value = m + MSG_VALUE + (it.kind == KIND_CHOICE ? it.count(it) - 1 : 1);
+        e.last_value = m + MSG_VALUE + game_count(it) - 1;
         e.button_off = e.button_on = m + MSG_BUTTON;
         g_entries.push_back(e);
     }
     for (auto &o : g_order) o.clear();
-    // the game's rows: camera ones on Controls; amiibo, the voice language (Language has the voices) and the VR
-    // goggles mode (no use on a PC screen) left out; the rest on Gameplay
+    // the game's rows: camera and motion aiming ones on Controls; amiibo, the voice language (Language has the voices)
+    // and the VR goggles mode (no use on a PC screen) left out; the rest on Gameplay
     for (uint32_t r = 0; r < rows; r++) {
         uint32_t e = ((const uint32_t *)(uintptr_t)order)[r];
         if (e == GAME_AMIIBO || e == GAME_VOICE_BUTTON || e == GAME_VOICE_LEVEL || e == GAME_VR) continue;
-        bool camera = e == GAME_CAMERA_Y || e == GAME_CAMERA_X || e == GAME_CAMERA_SENSITIVITY;
+        bool camera = e == GAME_CAMERA_Y || e == GAME_CAMERA_X || e == GAME_GYRO || e == GAME_CAMERA_SENSITIVITY;
         g_order[camera ? P_CONTROLS : P_GAMEPLAY].push_back(e);
     }
     for (size_t i = 0; i < g_items.size(); i++) g_order[g_items[i].page].push_back(GAME_ENTRIES + (uint32_t)i);
@@ -438,8 +551,8 @@ int clamp_value(const Item &it, int x) {
 
 void mark_all_rows(uint64_t screen) {
     if (!screen) return;
-    int n = (int)rd32(screen + 0x3698);
-    uint64_t rows = rd64(screen + 0x36a0);
+    int n = (int)rd32(screen + g_site.opt_screen_rows);
+    uint64_t rows = rd64(screen + g_site.opt_screen_rows + 8);
     for (int i = 0; i < n && i < 64 && rows; i++)
         if (uint64_t r = rd64(rows + 8 * i)) g_dirty.push_back(r);
 }
@@ -527,7 +640,7 @@ extern "C" void rt_opt_rows(void) {
     g_shown.assign(g_items.size(), -1);
     for (size_t i = 0; i < g_items.size(); i++) {  // (how many window sizes there are depends on the display)
         Entry &e = g_entries[GAME_ENTRIES + i];
-        if (g_items[i].kind == KIND_CHOICE) e.last_value = e.first_value + g_items[i].count(g_items[i]) - 1;
+        if (g_items[i].kind == KIND_CHOICE) e.last_value = e.first_value + game_count(g_items[i]) - 1;
     }
     wr64(OPT_ORDER, (uint64_t)(uintptr_t)o.data());
     wr32(OPT_ROWS, (uint32_t)o.size());
@@ -553,8 +666,8 @@ extern "C" int rt_opt_read(uint64_t row) {
     size_t idx = (size_t)(it - g_items.data());
     int x = clamp_value(*it, idx < g_shown.size() && g_shown[idx] >= 0 ? g_shown[idx] : it->get(*it));
     wr8(row + 0x54, x != 0);
-    wr32(row + 0x58, (uint32_t)x);
-    wr32(row + 0x5c, (uint32_t)(it->kind == KIND_CHOICE ? it->count(*it) - 1 : 1));
+    wr32(row + 0x58, (uint32_t)(x + (it->kind == KIND_CHOICE && it->wrap)));
+    wr32(row + 0x5c, (uint32_t)(game_count(*it) - 1));
     wr32(row + 0x60, 0);
     return 1;
 }
@@ -563,10 +676,15 @@ extern "C" int rt_opt_store(uint64_t row) {
     const Item *it = item_of_row(row);
     if (!it) return 0;
     size_t idx = (size_t)(it - g_items.data());
+    bool past_end = false;
     if (it->kind == KIND_TOGGLE) {
         it->set(*it, rd32(row + 0x54) & 0xff ? 1 : 0);
     } else if (it->kind == KIND_CHOICE) {
-        int x = clamp_value(*it, (int)rd32(row + 0x58));
+        int g = (int)rd32(row + 0x58), gn = game_count(*it);
+        g = g < 0 ? 0 : g >= gn ? gn - 1 : g;
+        past_end = it->wrap && (g == 0 || g == gn - 1);
+        int x = clamp_value(*it, game_value(*it, g));
+        if (past_end) wr32(row + 0x58, (uint32_t)(x + 1));  // (the row's next step goes on from there)
         bool off = it->value_off && it->value_off(*it, x);  // (shown, not stored)
         if (idx < g_shown.size()) g_shown[idx] = off ? x : -1;
         if (!off) it->set(*it, x);
@@ -575,6 +693,7 @@ extern "C" int rt_opt_store(uint64_t row) {
     }
     if (it->kind != KIND_BUTTON) settings_save();
     if (it->page == P_VIDEO) mark_all_rows(rd64(row));  // (the sizes offered follow Fullscreen, texts the upscaler)
+    if (past_end) g_dirty.push_back(row);                // (first: the row shows the value at the other end)
     return 1;
 }
 
@@ -602,9 +721,10 @@ extern "C" int rt_opt_msg(uint32_t id, uint64_t out) {
     if (part == MSG_TITLE) s = tr(it->title);
     else if (part == MSG_DESC) s = it->desc_fn ? it->desc_fn(*it) : tr(it->desc);
     else if (part == MSG_BUTTON) s = it->button ? tr(it->button) : it->label ? it->label(*it, -1) : "";
-    else if (part >= MSG_VALUE && it->kind == KIND_CHOICE && (int)(part - MSG_VALUE) < it->count(*it)) {
-        s = it->label(*it, (int)(part - MSG_VALUE));
-        grey = it->value_off && it->value_off(*it, (int)(part - MSG_VALUE));
+    else if (part >= MSG_VALUE && it->kind == KIND_CHOICE && (int)(part - MSG_VALUE) < game_count(*it)) {
+        int v = game_value(*it, (int)(part - MSG_VALUE));
+        s = it->label(*it, v);
+        grey = it->value_off && it->value_off(*it, v);
     }
     put_text(id, s, out, grey);
     return 1;
@@ -676,11 +796,72 @@ extern "C" void rt_opt_back(void) {
     }
 }
 
+// The title menu's Downloadable Content button (id 0x6d) is gone until Savage Wind has DLC: its eShop button opened the
+// shop applet, which isn't there, and the game waited for it forever (issue #19). Two parts, both through the game's
+// own means, so the menu behaves as it does when the game itself leaves buttons out (no save: no Continue):
+//  - which buttons the cursor can reach: the menu enables them at its start from static lists {u32 count, ids} (one
+//    per menu variant, in main's .bss, filled by a static constructor). The ones that hold 0x6d hold it last, so
+//    their count goes down by one, once the module's static constructors have run (rt_title_menu_prepare, called from
+//    runtime/main.c; the lists are found by their contents: title menu ids 0x69..0x6f, ascending).
+//  - what is drawn: the menu shows its buttons (the panes Pa_SaveFile_00..05) through the frame it sets on its
+//    button-count animation (Title_00_BtnNum), whose visibility curves show Quit and Downloadable Content
+//    (Pa_SaveFile_03 / _04) together in every frame. That animation's data, in the loaded layout archive, gets
+//    Pa_SaveFile_04's visibility keys set to hidden (title_hide_dlc, on every update: the archive is loaded again with
+//    the title screen; the animation's handle is at the Options state field - 0x24 in 1.8.2 and 1.9.0, its pai1 block
+//    at handle + 0x18).
+// It was the menu's last button, so there is no gap.
+const uint32_t TITLE_DLC_BUTTON = 0x6d;
+
+extern "C" void rt_title_menu_prepare(void) {
+    int n = 0;
+    for (uint64_t p = g_site.main_data; p + 0x10 <= g_site.main_end; p += 8) {
+        uint32_t count = rd32(p);
+        uint64_t ids = rd64(p + 8);
+        if (count < 2 || count > 7 || ids < 0x7000000000ull || ids + 4 * count > g_site.main_end || (ids & 3))  // (in main)
+            continue;
+        bool menu = true;
+        for (uint32_t i = 0; i < count && menu; i++) {
+            uint32_t id = rd32(ids + 4 * i);
+            menu = id >= 0x69 && id <= 0x6f && (i == 0 || id > rd32(ids + 4 * i - 4));
+        }
+        if (!menu || rd32(ids + 4 * (count - 1)) != TITLE_DLC_BUTTON) continue;
+        wr32(p, count - 1);
+        n++;
+    }
+    fprintf(stderr, "[options] title menu: Downloadable Content left out of %d button lists\n", n);
+}
+
+static void title_hide_dlc(uint64_t menu) {
+    uint64_t anim = rd64(menu + g_site.title_options_state - 0x24);
+    uint64_t pai = anim ? rd64(anim + 0x18) : 0;
+    if (!pai || memcmp((const void *)(uintptr_t)pai, "pai1", 4)) return;
+    uint32_t ncontent = *(volatile uint16_t *)(uintptr_t)(pai + 0xe), table = rd32(pai + 0x10);
+    for (uint32_t i = 0; i < ncontent && i < 64; i++) {
+        uint64_t c = pai + rd32(pai + table + 4 * i);
+        if (strncmp((const char *)(uintptr_t)c, "Pa_SaveFile_04", 28)) continue;
+        uint32_t ninfo = *(volatile uint8_t *)(uintptr_t)(c + 28);
+        for (uint32_t j = 0; j < ninfo; j++) {
+            uint64_t info = c + rd32(c + 32 + 4 * j);
+            if (memcmp((const void *)(uintptr_t)info, "FLVI", 4)) continue;
+            uint32_t ntarget = *(volatile uint8_t *)(uintptr_t)(info + 4);
+            for (uint32_t k = 0; k < ntarget; k++) {
+                uint64_t t = info + rd32(info + 8 + 4 * k);
+                uint32_t nkeys = *(volatile uint16_t *)(uintptr_t)(t + 4);
+                uint64_t keys = t + rd32(t + 8);
+                for (uint32_t q = 0; q < nkeys && q < 64; q++)  // step keys: {float frame, u16 value, u16}
+                    *(volatile uint16_t *)(uintptr_t)(keys + 8 * q + 4) = 0;
+            }
+        }
+        return;
+    }
+}
+
 // The title menu's update (menu = the screen): 1 = open the Options screen again now (it has gone, a page is due).
 // The quit question's answer is read here too.
 extern "C" int rt_opt_title_tick(uint64_t menu) {
     quit_poll();
-    if (rd32(menu + 0x363c) != MENU_OPTIONS_ACTIVE) {  // (the Options button isn't active: next opening, first page)
+    title_hide_dlc(menu);
+    if (rd32(menu + g_site.title_options_state) != MENU_OPTIONS_ACTIVE) {  // (the Options button isn't active: next opening, first page)
         g_reopen = g_switching = false;
         return 0;
     }
@@ -700,8 +881,8 @@ extern "C" int rt_opt_pause_tick(void) {
 extern "C" uint64_t rt_opt_screen(void) { return options_screen(); }
 
 // ---- Quit: the game's two-button dialog (screen 0x39, type 7) asks: desktop (upper button) or the start screen
-// (lower). Its buttons write their answer to 0x7001c4b308 (upper 0x5b: 0, lower 0x5a: 1; FUN_7100d46598) and leave
-// the dialog up; B closes it without an answer (rt_quit_dialog_back).
+// (lower). Its buttons write their answer to dialog_answer (1.8.2 0x7001c4b308; upper 0x5b: 0, lower 0x5a: 1;
+// FUN_7100d46598) and leave the dialog up; B closes it without an answer (rt_quit_dialog_back).
 
 // The title menu's amiibo settings button (Savage Wind has no amiibo support) is Quit
 extern "C" int rt_title_event(uint32_t id) { return id == TITLE_AMIIBO_BUTTON; }

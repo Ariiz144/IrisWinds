@@ -3,6 +3,7 @@
 #include <string.h>
 
 #include "../framepace.h"
+#include "../game_sites.h"
 #include "../kernel.h"
 #include "../perfmon.h"
 #include "nvn.h"
@@ -404,7 +405,12 @@ NVN(nvnMemoryPoolInitialize) {
     SET_HOST(A(0), p);
     RET(1);
 }
-NVN(nvnMemoryPoolFinalize) { free(HOST(NvnPool, A(0))); SET_HOST(A(0), 0); }
+NVN(nvnMemoryPoolFinalize) {
+    NvnPool *p = HOST(NvnPool, A(0));
+    if (p) cmdbuf_pool_gone(p->storage, p->storage + p->size);  // (the command lists recorded in it die with it)
+    free(p);
+    SET_HOST(A(0), 0);
+}
 NVN(nvnMemoryPoolSetDebugLabel) { (void)c; }
 NVN(nvnMemoryPoolMap) { RET(HOST(NvnPool, A(0))->storage); }
 NVN(nvnMemoryPoolGetBufferAddress) { RET(HOST(NvnPool, A(0))->storage); }  // GPU address == CPU address
@@ -721,7 +727,23 @@ NVN(nvnTextureGetStorageClass) { RET(0); }
 NVN(nvnTextureGetRawStorageClass) { RET(0); }
 NVN(nvnTextureGetSparseTileLayout) { RET(0); }
 NVN(nvnTextureGetZCullStorageSize) { RET(0); }
-NVN(nvnTextureCompare) { RET(A(0) == A(1)); }
+// Whether two textures are the same texture for the hardware (shape, format, swizzle, storage): NVN compares the
+// objects' state, not their addresses. agl builds a texture's NVNtexture again whenever its data is set and keeps
+// the texture pool slot when the new one compares equal (its slot holder, 0x7000ec33f0 in 1.9.0). BOTW's cuttable
+// trees take that slot id once for the trunk material (0x7000f75dcc) and set the data again later on another
+// thread; comparing addresses gave each rebuild a new slot and freed the old one, which the trunks went on binding
+// after the allocator gave it to other textures (#16: an exposure step as the cut profile threw trees across the sky).
+NVN(nvnTextureCompare) {
+    const NvnTexture *a = nvn_texture_host(A(0)), *b = nvn_texture_host(A(1));
+    if (a == b) { RET(a || A(0) == A(1)); return; }  // (copies of one texture; or two objects never initialized)
+    if (!a || !b) { RET(0); return; }
+    RET(a->target == b->target && a->format == b->format && a->flags == b->flags && a->width == b->width &&
+        a->height == b->height && a->depth == b->depth && a->levels == b->levels && a->samples == b->samples &&
+        a->ds_mode == b->ds_mode && !memcmp(a->swizzle, b->swizzle, sizeof a->swizzle) && a->stride == b->stride &&
+        a->addr == b->addr && a->pool == b->pool && a->pool_offset == b->pool_offset &&
+        a->layout.layers == b->layout.layers && a->layout.block_height_log2 == b->layout.block_height_log2 &&
+        a->layout.block_depth_log2 == b->layout.block_depth_log2);
+}
 NVN(nvnTextureFlushTexels) { (void)c; }
 NVN(nvnTextureInvalidateTexels) { (void)c; }
 
@@ -1045,15 +1067,15 @@ NVN(nvnWindowGetNumTextures) { RET(WIN->num); }
 NVN(nvnWindowGetNumActiveTextures) { RET(WIN->active); }
 NVN(nvnWindowSetNumActiveTextures) { WIN->active = (int)A(1); }
 NVN(nvnWindowGetPresentInterval) { RET(WIN->interval); }
-// BOTW's frame loop (sead GameFrameworkNx, main 0x700101287c) sets the interval here every frame (lr 0x7001012a34,
-// x19 = the framework). It times each frame ([fw+0x250], 19.2 MHz system ticks, from the frame's start to the end of
-// its calc and draw) and goes to interval 3 (20 fps) after three frames in a row over 1.9 vsyncs (31.7 ms), back to
-// 2 after a few fast ones; [fw+0x234] is the highest interval it may pick (3).
+// BOTW's frame loop (sead GameFrameworkNx, 1.8.2 main 0x700101287c) sets the interval here every frame (lr
+// frame_loop_interval_ret, 1.8.2 0x7001012a34; x19 = the framework). It times each frame ([fw+0x250], 19.2 MHz system
+// ticks, from the frame's start to the end of its calc and draw) and goes to interval 3 (20 fps) after three frames in
+// a row over 1.9 vsyncs (31.7 ms), back to 2 after a few fast ones; [fw+0x234] is the highest interval it may pick (3).
 // SAVAGEWIND_LOG_FRAMETIME=<ms>: frames whose game time is over that, and every change of interval (tests).
 // SAVAGEWIND_MAX_INTERVAL=2: the game never picks 3, so its step per frame is fixed and a scripted run takes the same
 // path every time (benchmarks; with 3 allowed, the path depends on the frame times). The default while Savage Wind
 // paces the frames and sets the game's clock (runtime/hle/framepace.c): the interval no longer sets either.
-#define FRAME_LOOP_LR 0x7001012a34ull
+#define FRAME_LOOP_LR g_site.frame_loop_interval_ret
 NVN(nvnWindowSetPresentInterval) {
     int want = (int)A(1);
     if (c->x[30] == FRAME_LOOP_LR) {

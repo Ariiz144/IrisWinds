@@ -9,7 +9,9 @@
 #include <string.h>
 
 #include "vk.h"
+#include "../../settings.h"
 #include "../astc.h"
+#include "../glyphs.h"
 #include "../renderer.h"
 
 // ================================================================== formats
@@ -150,24 +152,38 @@ static bool format_supports(VkFormat f, VkFormatFeatureFlags want) {
 //             HUD and menus are drawn sharp at any window size
 //   RS_SCENE  the 3D scene's targets (1600x900 docked, and their fractions): the internal resolution, the window's
 //             with the upscaler off, smaller by the upscaler's factor with it on (exec.c upscales at the composite)
-static float g_rs[3][2] = {{1, 1}, {1, 1}, {1, 1}};
+//   RS_SHADOW shadow maps (BOTW's sun cascades: D16 896x896x3): Video > Shadow resolution, a width (2048 to 8192) they
+//             are made at instead of the game's; never smaller than the game's (output_scale.c shadow_map_size)
+static float g_rs[4][2] = {{1, 1}, {1, 1}, {1, 1}, {1, 1}};
+static uint32_t g_shadow_size;
 void renderer_get_scale(float *sx, float *sy) { *sx = g_rs[RS_OUT][0]; *sy = g_rs[RS_OUT][1]; }
 void renderer_set_scale(float sx, float sy) { g_rs[RS_OUT][0] = sx; g_rs[RS_OUT][1] = sy; }
 void renderer_get_scene_scale(float *sx, float *sy) { *sx = g_rs[RS_SCENE][0]; *sy = g_rs[RS_SCENE][1]; }
 void renderer_set_scene_scale(float sx, float sy) { g_rs[RS_SCENE][0] = sx; g_rs[RS_SCENE][1] = sy; }
+void renderer_set_shadow_size(uint32_t n) {  // (never past what the GPU can make: Extreme is 8192)
+    g_shadow_size = n < g_vk.props.limits.maxImageDimension2D ? n : g_vk.props.limits.maxImageDimension2D;
+}
 uint64_t renderer_present_count(void);
+static float rs_want(const TexBackend *b, int axis) {  // the scale a texture of b's group is wanted at now
+    if (b->rs_group != RS_SHADOW) return g_rs[b->rs_group][axis];
+    return b->guest_w && g_shadow_size > b->guest_w ? (float)g_shadow_size / (float)b->guest_w : 1.0f;  // (square)
+}
 static bool rs_stale(const TexBackend *b) {
-    return b->rs_group && (b->sx != g_rs[b->rs_group][0] || b->sy != g_rs[b->rs_group][1]);
+    return b->rs_group && (b->sx != rs_want(b, 0) || b->sy != rs_want(b, 1));
 }
 
 // Which scale a texture takes (RS_*): the game's screen-sized targets are 16:9 2D images or 2D arrays (BOTW renders
 // some half-size passes into layers of 800x450x2 arrays) with the compressible flag (render targets) or the display
-// flag. Everything else keeps its guest size: shadow maps, LUTs, cubemaps, the small odd-sized steps of the bloom and
+// flag; shadow maps are square depth render targets, 512 or more (BOTW's sun cascades; its 192x192 depth target is no
+// shadow map). Everything else keeps its guest size: LUTs, cubemaps, the small odd-sized steps of the bloom and
 // exposure chains (sampled with normalized coordinates, they work at any size). SAVAGEWIND_NO_SCALE=1: none scaled.
 static uint8_t tex_scale_group(const NvnTexture *t) {
     static int on = -1;
     if (on < 0) on = getenv("SAVAGEWIND_NO_SCALE") == NULL;
     if (!on) return RS_NONE;
+    if ((t->target == 1 || t->target == 4) && t->samples <= 1 && (t->flags & 8) && renderer_format_is_depth(t->format) &&
+        t->width == t->height && t->width >= 512)
+        return RS_SHADOW;
     if ((t->target != 1 && t->target != 4) || t->samples > 1 || !(t->flags & 9) || t->width < 32 || t->height < 16) return RS_NONE;
     float a = (float)t->width / (float)t->height;
     if (a < 1.74f || a > 1.81f) return RS_NONE;
@@ -261,8 +277,9 @@ void vk_collect_dead(void) {
 static void create_image(NvnTexture *t, TexBackend *b) {
     VkFmt mf = fmt_of(t->format);
     b->scalable = b->rs_group != RS_NONE;
-    b->sx = g_rs[b->rs_group][0];
-    b->sy = g_rs[b->rs_group][1];
+    b->guest_w = t->width;
+    b->sx = rs_want(b, 0);
+    b->sy = rs_want(b, 1);
     uint32_t tw = t->width ? t->width : 1, th = t->height ? t->height : 1;
     if (b->scalable) {
         tw = (uint32_t)lroundf(tw * b->sx); th = (uint32_t)lroundf(th * b->sy);
@@ -448,7 +465,10 @@ SLOT_LIST(images, TexBackend, all)           // every image (an in-place reboot 
 SLOT_LIST(idle, TexBackend, idle)            // images no texture holds
 SLOT_LIST(holders, NvnTexture, backend_slot) // textures holding an image
 
+static uint64_t g_kept_bytes;
+
 static void free_backend(TexBackend *b) {
+    if (b->kept) g_kept_bytes -= b->kept_bytes;
     keyed_remove(b);
     idle_remove(b);
     images_remove(b);
@@ -457,10 +477,46 @@ static void free_backend(TexBackend *b) {
     free(b);
 }
 
+// Images the GPU drew have no copy in guest memory, and BOTW makes some of them again later and samples them without
+// drawing them again, as on the console, where the texels stay in that memory: the save dialog's 256x144 picture
+// (blitted from the final image the first time the dialog opens) came back black when the dialog was opened again.
+// Past PARK_FRAMES such an image is kept, with a hash of the guest memory under it, up to KEEP_BUDGET bytes (the oldest
+// go first); a texture made there again takes it back if that memory is unchanged (else the CPU reused it: a new image).
+// SAVAGEWIND_NO_KEEP_IMAGES=1: freed after PARK_FRAMES, as before.
+#define KEEP_MAX_IMAGE (16ull << 20)
+#define KEEP_BUDGET (192ull << 20)
+static uint64_t hash_full(const uint8_t *p, uint64_t n);
+static uint64_t storage_size(const NvnTexture *t);
+
+static bool keep_ok(TexBackend *b, uint64_t *bytes) {
+    static int off = -1;
+    if (off < 0) off = getenv("SAVAGEWIND_NO_KEEP_IMAGES") != NULL;
+    if (off || !b->gpu_owned || !b->image || !b->mem || !b->guest_size || b->key_addr < GUEST_LO || b->key_addr + b->guest_size > GUEST_HI)
+        return false;
+    VmaAllocationInfo ai;
+    vmaGetAllocationInfo(g_vk.vma, b->mem, &ai);
+    *bytes = ai.size;
+    return ai.size <= KEEP_MAX_IMAGE;
+}
+
 static void idle_expire(void) {  // (gpu lock held)
-    uint64_t now = renderer_present_count();
-    for (int i = g_nidle - 1; i >= 0; i--)
-        if (now - g_idle[i]->idle_frame > PARK_FRAMES) free_backend(g_idle[i]);
+    uint64_t now = renderer_present_count(), bytes;
+    for (int i = g_nidle - 1; i >= 0; i--) {
+        TexBackend *b = g_idle[i];
+        if (b->kept || now - b->idle_frame <= PARK_FRAMES) continue;
+        if (!keep_ok(b, &bytes)) { free_backend(b); continue; }
+        b->kept = true;
+        b->kept_bytes = bytes;
+        b->kept_hash = hash_full((const uint8_t *)(uintptr_t)b->key_addr, b->guest_size);
+        g_kept_bytes += bytes;
+    }
+    while (g_kept_bytes > KEEP_BUDGET) {
+        TexBackend *old = NULL;
+        for (int i = 0; i < g_nidle; i++)
+            if (g_idle[i]->kept && (!old || g_idle[i]->idle_frame < old->idle_frame)) old = g_idle[i];
+        if (!old) break;
+        free_backend(old);
+    }
 }
 
 static void release_backend(NvnTexture *t) {  // (gpu lock held)
@@ -470,6 +526,7 @@ static void release_backend(NvnTexture *t) {  // (gpu lock held)
     t->backend = NULL;
     if (--b->refs > 0) return;
     if (!b->key_addr || !b->image) { free_backend(b); return; }
+    b->guest_size = storage_size(t);
     b->idle_frame = renderer_present_count();
     idle_add(b);
 }
@@ -511,6 +568,20 @@ static TexBackend *tex_backend(NvnTexture *t) {
         idle_expire();
     }
     b = t->addr ? keyed_find(t) : NULL;
+    if (b && b->kept) {  // (idle_expire) its contents, unless the CPU wrote that memory meanwhile
+        bool same = b->guest_size == storage_size(t) && hash_full((const uint8_t *)(uintptr_t)b->key_addr, b->guest_size) == b->kept_hash;
+        static int nlog = -1;
+        if (nlog < 0) nlog = getenv("SAVAGEWIND_LOG_KEPT") ? 20 : 0;
+        if (nlog > 0) {
+            nlog--;
+            LOG("[vk] kept image of #%llu %ux%u fmt %#x at %llx %s after %llu frames\n", (unsigned long long)t->debug_id, t->width,
+                t->height, t->format, (unsigned long long)t->addr, same ? "taken back" : "dropped (memory changed)",
+                (unsigned long long)(renderer_present_count() - b->idle_frame));
+        }
+        g_kept_bytes -= b->kept_bytes;
+        b->kept = false;
+        if (!same) { free_backend(b); b = NULL; }
+    }
     if (b && rs_stale(b)) { destroy_image(b); create_image(t, b); }
     if (!b) {
         b = calloc(1, sizeof *b);
@@ -752,6 +823,13 @@ static void upload_levels(NvnTexture *t, TexBackend *b, uint32_t level_mask) {
             } else {
                 tegra_deswizzle(src, lin, l.wb, l.hb, l.d, fi->bpb, l.block_height_log2, l.block_depth_log2);
             }
+            if (lv == 0 && layer == 0 && t->format == 0x49 && t->pool &&  // (the game's button glyphs: device icons)
+                glyphs_apply(t->addr, t->pool->storage, t->pool->storage + t->pool->size, t->format, t->width,
+                             t->height, lin, l.wb, l.hb))
+                b->glyph_gen = glyphs_generation();
+            if (lv == 0 && layer == 0 && t->format == 0x01 && !linear &&  // (the HUD's button textures, likewise)
+                glyphs_apply_layout(t->format, l.w, l.h, lin, row))
+                b->glyph_gen = glyphs_generation();
             if (t->target == 2 && lv == 0 && getenv("SAVAGEWIND_DUMP_TEX3D")) {  // (debugging) 3D texels as uploaded
                 char path[128];
                 snprintf(path, sizeof path, "build/tex3d_%llu_%ux%ux%u_f%x.raw", (unsigned long long)t->debug_id, l.w, l.h, l.d,
@@ -899,6 +977,7 @@ TexBackend *vk_tex(NvnTexture *t, bool for_render) {
     if (!for_render && !b->gpu_owned && vk_trace_tex(t))  // (CPU-owned: guest memory is uploaded when it changed)
         vk_trace_event(t, 1, NULL, 0, "use: CPU-owned, uploaded %d dynamic %d", b->uploaded, b->dynamic);
     if (b->pending_rgba) upload_pending(b);
+    if (b->glyph_gen && b->glyph_gen != glyphs_generation()) upload_levels(t, b, 1);  // (button icons: other device)
     // Levels nvnTextureWriteTexels filled go up now, also into an image the GPU draws into: BOTW writes level 0 of its
     // 32x32x32 noise that way and then renders the smaller levels from it (the noise stayed black: GPU-owned images
     // never read guest memory again).
@@ -1016,6 +1095,25 @@ static VkImageViewType view_type_for(int textype) {
 static const VkComponentMapping IDENTITY = {VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
                                             VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY};
 
+// The component mapping a sampled colour texture is read with: its view's NVN swizzle (or the texture's), and alpha 1
+// for formats that have none.
+VkComponentMapping vk_sample_swizzle(NvnTexture *t, const NvnTextureView *v) {
+    VkComponentMapping sw = IDENTITY;
+    const uint8_t *s = v && (v->setmask & 8) ? v->swizzle : t->swizzle;
+    uint8_t c[4];
+    for (int i = 0; i < 4; i++) c[i] = s[i] <= 5 ? s[i] : (uint8_t)(2 + i);
+    if (c[0] || c[1] || c[2] || c[3]) {  // never set: identity
+        if (fmt_of(t->format).alpha_one)
+            for (int i = 0; i < 4; i++) if (c[i] == 5) c[i] = 1;
+        // NVN swizzle 0 zero, 1 one, 2..5 r,g,b,a == VkComponentSwizzle - 1
+        sw = (VkComponentMapping){(VkComponentSwizzle)(c[0] + 1), (VkComponentSwizzle)(c[1] + 1), (VkComponentSwizzle)(c[2] + 1),
+                                  (VkComponentSwizzle)(c[3] + 1)};
+    } else if (fmt_of(t->format).alpha_one) {
+        sw.a = VK_COMPONENT_SWIZZLE_ONE;
+    }
+    return sw;
+}
+
 // render: attachment view (one level, one layer). Otherwise a sampled view of type want_textype (TEXTYPE_*),
 // with the NVN component swizzle, converting between compatible types the way renderer.m does.
 VkImageView vk_view(NvnTexture *t, const NvnTextureView *v, bool has_view, bool render, int want_textype) {
@@ -1046,20 +1144,7 @@ VkImageView vk_view(NvnTexture *t, const NvnTextureView *v, bool has_view, bool 
     }
     VkImageAspectFlags aspect = b->aspect & VK_IMAGE_ASPECT_DEPTH_BIT ? VK_IMAGE_ASPECT_DEPTH_BIT : b->aspect;
     VkComponentMapping sw = IDENTITY;
-    if (!(b->aspect & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) && b->samples == 1) {
-        const uint8_t *s = v && (v->setmask & 8) ? v->swizzle : t->swizzle;
-        uint8_t c[4];
-        for (int i = 0; i < 4; i++) c[i] = s[i] <= 5 ? s[i] : (uint8_t)(2 + i);
-        if (c[0] || c[1] || c[2] || c[3]) {  // never set: identity
-            if (fmt_of(t->format).alpha_one)
-                for (int i = 0; i < 4; i++) if (c[i] == 5) c[i] = 1;
-            // NVN swizzle 0 zero, 1 one, 2..5 r,g,b,a == VkComponentSwizzle - 1
-            sw = (VkComponentMapping){(VkComponentSwizzle)(c[0] + 1), (VkComponentSwizzle)(c[1] + 1), (VkComponentSwizzle)(c[2] + 1),
-                                      (VkComponentSwizzle)(c[3] + 1)};
-        } else if (fmt_of(t->format).alpha_one) {
-            sw.a = VK_COMPONENT_SWIZZLE_ONE;
-        }
-    }
+    if (!(b->aspect & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) && b->samples == 1) sw = vk_sample_swizzle(t, v);
     VkImageViewType want = view_type_for(want_textype);
     VkImageViewType have = b->base_type;
     if (b->samples > 1) return vk_dummy_view(want_textype);  // multisampled images can't be sampled as 2D
@@ -1128,8 +1213,59 @@ static VkCompareOp compare_op(uint32_t f) {
     }
 }
 
+// Video > Anisotropic filtering (g_settings.anisotropy): 0 keeps the game's own max anisotropy (the console's look);
+// 2x .. 16x override it on texture samplers that filter linearly between mip levels or within one (ground, walls,
+// paths at a distance). Left alone: point-filtered samplers (pixel-exact data, some UI), samplers without mipmaps (the
+// UI, render targets read back), ones clamped to one mip level (BOTW reads its bloom and blur chains that way) and
+// depth-comparison ones (shadow maps).
+static float sampler_aniso(const NvnSamplerDesc *d) {
+    float game = d->max_aniso > 1 ? fminf(d->max_aniso, 16) : 1;
+    int a = g_settings.anisotropy;
+    if (a <= 0 || a > 4 || !g_vk.feat_aniso) return game;
+    if (d->compare_mode || d->mag_filter != 1 || (d->min_filter != 3 && d->min_filter != 5)) return game;
+    if (d->lod_max - d->lod_min < 0.5f) return game;
+    return fminf((float)(1 << a), g_vk.props.limits.maxSamplerAnisotropy);
+}
+
+// One VkSampler per distinct setting (pool entries repeat the same few hundred), so a change of the anisotropy makes
+// new ones without destroying samplers that submitted work may still use.
+static struct { NvnSamplerDesc key; VkSampler s; } *g_samplers;
+static int g_nsamplers, g_cap_samplers;
+static pthread_mutex_t g_sampler_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static VkSampler sampler_create(const NvnSamplerDesc *d, float aniso);
+
 VkSampler vk_sampler(NvnSamplerDesc *d) {
-    if (d->backend) return (VkSampler)d->backend;
+    float an = sampler_aniso(d);
+    if (d->backend && d->backend_aniso == an) return (VkSampler)d->backend;
+    NvnSamplerDesc key = *d;
+    key.backend = NULL;
+    key.backend_aniso = an;
+    pthread_mutex_lock(&g_sampler_lock);
+    VkSampler s = VK_NULL_HANDLE;
+    for (int i = 0; i < g_nsamplers && !s; i++)
+        if (!memcmp(&g_samplers[i].key, &key, sizeof key)) s = g_samplers[i].s;
+    if (!s) {
+        s = sampler_create(d, an);
+        if (g_nsamplers == g_cap_samplers) {
+            g_cap_samplers = g_cap_samplers ? g_cap_samplers * 2 : 256;
+            g_samplers = realloc(g_samplers, g_cap_samplers * sizeof *g_samplers);
+        }
+        g_samplers[g_nsamplers].key = key;
+        g_samplers[g_nsamplers++].s = s;
+        static int log = -1;
+        if (log < 0) log = getenv("SAVAGEWIND_LOG_SAMPLERS") != NULL;
+        if (log) LOG("[sampler] #%d min %u mag %u wrap %u %u cmp %u lod %.2f..%.2f bias %.2f aniso game %.0f -> %.0f\n",
+                     g_nsamplers, d->min_filter, d->mag_filter, d->wrap[0], d->wrap[1], d->compare_mode, d->lod_min,
+                     d->lod_max, d->lod_bias, d->max_aniso, an);
+    }
+    pthread_mutex_unlock(&g_sampler_lock);
+    d->backend = (void *)s;
+    d->backend_aniso = an;
+    return s;
+}
+
+static VkSampler sampler_create(const NvnSamplerDesc *d, float aniso) {
     VkSamplerCreateInfo si = {.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
     si.magFilter = d->mag_filter == 1 ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
     uint32_t mf = d->min_filter;
@@ -1153,7 +1289,7 @@ VkSampler vk_sampler(NvnSamplerDesc *d) {
     if (mf <= 1) si.maxLod = si.minLod + 0.25f;  // not mipmapped: stay on the base level
     if (si.maxLod < si.minLod) si.maxLod = si.minLod;
     si.mipLodBias = d->lod_bias;
-    if (d->max_aniso > 1) { si.anisotropyEnable = VK_TRUE; si.maxAnisotropy = fminf(d->max_aniso, 16); }
+    if (aniso > 1) { si.anisotropyEnable = VK_TRUE; si.maxAnisotropy = aniso; }
     static float lodmin = -1;
     if (lodmin < 0) lodmin = getenv("SAVAGEWIND_LOD_MIN") ? (float)atof(getenv("SAVAGEWIND_LOD_MIN")) : 0;
     if (lodmin > 0 && mf > 1) si.minLod = fmaxf(si.minLod, lodmin);
@@ -1178,7 +1314,6 @@ VkSampler vk_sampler(NvnSamplerDesc *d) {
     }
     VkSampler s;
     VK_CHECK(vkCreateSampler(g_vk.dev, &si, NULL, &s));
-    d->backend = (void *)s;
     return s;
 }
 

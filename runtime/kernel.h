@@ -25,6 +25,7 @@ struct KThread {
     uint64_t entry, tlr, id;
     uint32_t handle;
     int prio, core;
+    int base_prio;  // the priority the game set; prio may be better while a better thread waits for its mutex (g_klock)
     bool cancel, in_sync_wait;
     // wait state (protected by g_klock)
     WaitKind wait_kind;

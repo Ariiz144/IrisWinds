@@ -15,6 +15,7 @@
 #include "imgui.h"
 extern "C" {
 #include "../language.h"
+#include "../paths.h"
 }
 
 namespace {
@@ -53,11 +54,14 @@ const Entry zh_hans[] = {
 const Entry zh_hant[] = {
 #include "i18n/zh-Hant.inc"
     {nullptr, nullptr}};
+const Entry th[] = {
+#include "i18n/th.inc"
+    {nullptr, nullptr}};
 #undef T
 
 struct Table { const char *lang; const Entry *entries; };
 const Table tables[] = {{"es", es}, {"fr", fr}, {"de", de}, {"it", it}, {"nl", nl}, {"ru", ru}, {"pt", pt},
-                        {"ja", ja}, {"ko", ko}, {"zh-Hans", zh_hans}, {"zh-Hant", zh_hant}};
+                        {"ja", ja}, {"ko", ko}, {"zh-Hans", zh_hans}, {"zh-Hant", zh_hant}, {"th", th}};
 
 struct Lang {
     const char *code;  // LanguageCode prefix (language_text_code)
@@ -65,7 +69,8 @@ struct Lang {
 };
 // (most specific first)
 const Lang langs[] = {{"es", "es"}, {"fr", "fr"}, {"de", "de"}, {"it", "it"}, {"nl", "nl"}, {"ru", "ru"},
-                      {"pt", "pt"}, {"ja", "ja"}, {"ko", "ko"}, {"zh-TW", "zh-Hant"}, {"zh", "zh-Hans"}};
+                      {"pt", "pt"}, {"ja", "ja"}, {"ko", "ko"}, {"zh-Hant", "zh-Hant"}, {"zh-Hans", "zh-Hans"},
+                      {"zh", "zh-Hans"}, {"th", "th"}};
 
 std::mutex lock;
 const char *cur_ui = "en";
@@ -171,6 +176,13 @@ static const char *const zh_hant_fonts[] = {"C:/Windows/Fonts/msjh.ttc", "C:/Win
                                             "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
                                             "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc", "/System/Library/Fonts/PingFang.ttc", nullptr};
 
+// Thai: Noto Sans Thai, shipped (third_party/fonts/NotoSansThai, OFL: neither Fira Sans nor the CJK fonts have Thai), then
+// the system's
+static const char *const th_fonts[] = {"C:/Windows/Fonts/LeelawUI.ttf", "C:/Windows/Fonts/tahoma.ttf",
+                                       "/usr/share/fonts/truetype/noto/NotoSansThai-Regular.ttf",
+                                       "/usr/share/fonts/noto/NotoSansThai-Regular.ttf",
+                                       "/System/Library/Fonts/Supplemental/Ayuthaya.ttf", nullptr};
+
 // (Noto Sans CJK .ttc: face 0 is Japanese, 1 Korean, 2 Simplified, 3 Traditional Chinese)
 static int ttc_face(const char *path, const char *lang) {
     if (!strstr(path, "NotoSansCJK")) return 0;
@@ -181,8 +193,12 @@ bool ui_merge_fallback_font(ImFontAtlas *atlas, float size, const ImFontConfig *
     const char *lang = ui_lang();
     const char *const *fonts = !strcmp(lang, "ru") ? cyrillic_fonts : !strcmp(lang, "ja") ? ja_fonts
                              : !strcmp(lang, "ko") ? ko_fonts : !strcmp(lang, "zh-Hans") ? zh_hans_fonts
-                             : !strcmp(lang, "zh-Hant") ? zh_hant_fonts : nullptr;
+                             : !strcmp(lang, "zh-Hant") ? zh_hant_fonts : !strcmp(lang, "th") ? th_fonts : nullptr;
     if (!fonts) return false;
+    static char shipped[1100];
+    if (fonts == th_fonts && !rt_resource("NotoSansThai-Medium.ttf", "third_party/fonts/NotoSansThai/NotoSansThai-Medium.ttf",
+                                          shipped, sizeof shipped))
+        shipped[0] = 0;
     // only the glyphs the language's texts use (a CJK font's full range would not fit an atlas texture), in both cases:
     // option labels are drawn upper-cased (tr_upper), with capitals the texts themselves may never use
     static ImVector<ImWchar> ranges;
@@ -198,15 +214,16 @@ bool ui_merge_fallback_font(ImFontAtlas *atlas, float size, const ImFontConfig *
         ranges.clear();
         b.BuildRanges(&ranges);
     }
-    for (int i = 0; fonts[i]; i++) {
-        FILE *f = fopen(fonts[i], "rb");
+    for (int i = -1; i < 0 || fonts[i]; i++) {
+        const char *path = i < 0 ? (fonts == th_fonts ? shipped : "") : fonts[i];  // (-1: a shipped font)
+        FILE *f = *path ? fopen(path, "rb") : nullptr;
         if (!f) continue;
         fclose(f);
         ImFontConfig cfg = base ? *base : ImFontConfig();
         cfg.MergeMode = true;
-        cfg.FontNo = ttc_face(fonts[i], lang);
+        cfg.FontNo = ttc_face(path, lang);
         cfg.FontDataOwnedByAtlas = true;
-        atlas->AddFontFromFileTTF(fonts[i], size, &cfg, ranges.Data);
+        atlas->AddFontFromFileTTF(path, size, &cfg, ranges.Data);
         return true;
     }
     return false;

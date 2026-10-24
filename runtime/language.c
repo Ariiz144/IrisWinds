@@ -5,9 +5,12 @@
 // folder (runtime/services/fs.c, voice_redirect).
 #include "language.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
+#include "paths.h"
 #include "settings.h"
 #ifdef _WIN32
 #include <windows.h>
@@ -28,10 +31,28 @@ const TextLanguage g_text_languages[] = {
     {"Portuguese (Brazil)", "pt-BR", "USpt"},
     {"Japanese", "ja", "JPja"},
     {"Korean", "ko", "KRko"},
-    {"Chinese (Simplified)", "zh-CN", "CNzh"},
-    {"Chinese (Traditional)", "zh-TW", "TWzh"},
+    // (the switch's own codes, as the game compares them: it has zh-Hans / zh-Hant in its table, not zh-CN / zh-TW)
+    {"Chinese (Simplified)", "zh-Hans", "CNzh"},
+    {"Chinese (Traditional)", "zh-Hant", "TWzh"},
+    {"Thai", "th", "THth"},  // (1.9.0 on: language_text_count; last, so the others keep their place)
 };
 const int g_ntext_languages = sizeof g_text_languages / sizeof g_text_languages[0];
+
+// Thai came with 1.9.0 (Pack/Bootup_THth.pack and its fonts; the game takes the LanguageCode "th"): offered when the
+// game files have it. On 1.8.2 a Thai setting is kept but reads as Auto.
+static bool has_thai(void) {
+    char p[1200];
+    struct stat st;
+    snprintf(p, sizeof p, "%s/extracted/romfs/Pack/Bootup_THth.pack", rt_data_root());
+    return stat(p, &st) == 0;
+}
+
+int language_text_count(void) { return has_thai() ? g_ntext_languages : g_ntext_languages - 1; }
+
+int language_text_index(void) {
+    int i = g_settings.text_language;
+    return i > 0 && i < language_text_count() ? i : 0;
+}
 
 const VoiceLanguage g_voice_languages[] = {
     {"Same as text", NULL},
@@ -58,7 +79,7 @@ static const char *code_for_locale(const char *loc) {
     if (!strncmp(l, "fr", 2)) return "fr";
     if (!strncmp(l, "pt", 2)) return "pt-BR";  // (the only Portuguese the game has)
     if (!strncmp(l, "zh", 2))
-        return strstr(l, "Hant") || strstr(l, "TW") || strstr(l, "HK") || strstr(l, "MO") ? "zh-TW" : "zh-CN";
+        return strstr(l, "Hant") || strstr(l, "TW") || strstr(l, "HK") || strstr(l, "MO") ? "zh-Hant" : "zh-Hans";
     static const char *const two[] = {"de", "it", "nl", "ru", "ja", "ko"};
     for (int i = 0; i < 6; i++) if (!strncmp(l, two[i], 2)) return two[i];
     return "en-US";
@@ -83,8 +104,8 @@ static const char *host_code(void) {
 }
 
 const char *language_text_code(void) {
-    int i = g_settings.text_language;
-    return i > 0 && i < g_ntext_languages ? g_text_languages[i].code : host_code();
+    int i = language_text_index();
+    return i > 0 ? g_text_languages[i].code : host_code();
 }
 
 static int booted_text = -1, booted_voice = -1;

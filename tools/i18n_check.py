@@ -20,7 +20,7 @@ SOURCES = sorted(glob.glob(os.path.join(ROOT, 'runtime/ui/*.mm'))) + [
     os.path.join(ROOT, 'runtime/language.c'),
     os.path.join(ROOT, 'runtime/hle/bindings.c'),
 ]
-SKIP_LINE = re.compile(r'\b(LOG|fprintf|printf|getenv|strcmp|strncmp|strstr|fopen|file_exists|mkdir|unlink|rt_resource|'
+SKIP_LINE = re.compile(r'\b(LOG|fprintf|printf|getenv|strcmp|strncmp|memcmp|strstr|fopen|file_exists|mkdir|unlink|rt_resource|'
                        r'PushID|BeginChild|BeginTable|BeginPopup|OpenPopup|IsPopupOpen|InvisibleButton|GetID|Begin)\s*\(|'
                        r'#include|#define|SAVAGEWIND_|//')
 
@@ -77,7 +77,7 @@ def looks_like_text(s, in_tr=False):
         return False
     if in_tr and '/' not in s and '\\' not in s:  # (a word passed to tr() is text, however short)
         return True
-    if re.fullmatch(r'[\w./\\:-]+\.(ttf|ttc|bfttf|pack|bin|txt|ini|png|dll|so|dylib|nso|npdm|mp4|webm)', s):
+    if re.fullmatch(r'[\w./\\:%-]+\.(ttf|ttc|bfttf|pack|bin|txt|ini|png|dll|so|dylib|nso|npdm|mp4|webm)', s):
         return False
     if re.fullmatch(r'[a-z0-9_./-]+', s):  # identifiers, ini keys, folder names
         return False
