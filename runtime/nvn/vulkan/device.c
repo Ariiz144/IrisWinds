@@ -247,13 +247,12 @@ static void create_device(void) {
 #ifdef __linux__
     g_vk.radv = drv.driverID == VK_DRIVER_ID_MESA_RADV;
 #endif
-    // AMD's and Intel's Windows drivers showed only a black window from Alpha 3 on (the start screen too; RX 6600,
-    // RX 6800, RX 9060 XT / 9070 XT, ROG Ally, a Celeron: issues #85, #96), where Alpha 2 drew. Alpha 3 turned three
-    // things on there: maintenance5, graphics pipeline libraries and attachment feedback loops. Those drivers get
-    // Alpha 2's setup again: none of the three. SAVAGEWIND_VK_M5=1 / _GPL=1 / _FEEDBACK_LOOP=1 turn one back on;
-    // SAVAGEWIND_VK_LEGACY=1 gives any GPU that setup (tests).
-    bool win_legacy = drv.driverID == VK_DRIVER_ID_AMD_PROPRIETARY || drv.driverID == VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS ||
-                      getenv("SAVAGEWIND_VK_LEGACY");
+    // SAVAGEWIND_VK_LEGACY=1: Alpha 2's setup, none of maintenance5, graphics pipeline libraries and attachment
+    // feedback loops (SAVAGEWIND_VK_M5=1 / _GPL=1 / _FEEDBACK_LOOP=1 turn one back on). The 0.3.1 hotfix made it the
+    // default on AMD's and Intel's Windows drivers, for a black window from Alpha 3 on (#85); that was their shader
+    // caches, from another release or another setup (an RX 9070 XT and a ROG Ally run with all three once the caches
+    // are cleared), which each release and setup now keeps apart. Without the three the ROG Ally ran at 12 fps.
+    bool win_legacy = getenv("SAVAGEWIND_VK_LEGACY");
     if (win_legacy) LOG("[vk] %s: maintenance5, pipeline libraries and feedback loops left off\n", drv.driverName);
     bool fault = has_ext(ep, ne, VK_EXT_DEVICE_FAULT_EXTENSION_NAME);  // device-lost diagnostics (vk_device_fault_report)
     if (fault) ext[n_ext++] = VK_EXT_DEVICE_FAULT_EXTENSION_NAME;
