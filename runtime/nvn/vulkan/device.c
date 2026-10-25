@@ -31,6 +31,7 @@ static atomic_bool ui_ready;
 static VkDebugUtilsMessengerEXT messenger;
 uint64_t g_addr_report_lo, g_addr_report_hi;  // (SAVAGEWIND_VK_ADDR_REPORT)
 uint64_t renderer_present_count(void);
+static bool g_cs_ext;  // VK_EXT_swapchain_colorspace: HDR10 swapchains can be made (the HDR section below)
 
 // ================================================================== instance / device
 static VKAPI_ATTR VkBool32 VKAPI_CALL debug_cb(VkDebugUtilsMessageSeverityFlagBitsEXT sev, VkDebugUtilsMessageTypeFlagsEXT type,
@@ -61,6 +62,16 @@ static void create_instance(void) {
     const char *ext[24];
     uint32_t n_ext = 0;
     for (Uint32 i = 0; i < n_sdl && n_ext < 14; i++) ext[n_ext++] = sdl_ext[i];
+    {   // the HDR10 colour space of an HDR swapchain (Video > HDR) comes with VK_EXT_swapchain_colorspace
+        uint32_t nie = 0;
+        vkEnumerateInstanceExtensionProperties(NULL, &nie, NULL);
+        VkExtensionProperties *ie = calloc(nie ? nie : 1, sizeof *ie);
+        vkEnumerateInstanceExtensionProperties(NULL, &nie, ie);
+        for (uint32_t i = 0; i < nie && !g_cs_ext; i++)
+            if (!strcmp(ie[i].extensionName, VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME)) g_cs_ext = true;
+        if (g_cs_ext) ext[n_ext++] = VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME;
+        free(ie);
+    }
     bool validate = getenv("SAVAGEWIND_VK_VALIDATION") != NULL;
     // (debugging) SAVAGEWIND_VK_ADDR_REPORT=<lo>-<hi> (hex GPU addresses): every bind and unbind of GPU memory in that
     // range ("[vkaddr]"), to name what a device fault's address was
@@ -728,6 +739,138 @@ static VkPresentModeKHR present_mode(char *have, size_t cap) {
     return VK_PRESENT_MODE_FIFO_KHR;  // the one every surface has
 }
 
+// ================================================================== HDR (Video > HDR)
+// While Windows HDR is on, the desktop is composed in HDR and an SDR swapchain is shown as SDR content: dim, with dull
+// colours, on many displays (issue #95). So while it is on for the window's display (SDL's HDR state of the window) or
+// Video > HDR is On, the swapchain is HDR10 (BT.2020 primaries, PQ): everything is still drawn into 8-bit images as
+// before (g_vk.sc_images are those then), and vk_frame_end writes the frame into the swapchain image in one pass:
+// sRGB-encoded to linear (gamma 2.2, as SDR displays show it; SAVAGEWIND_HDR_SRGB=1: the piecewise sRGB curve), BT.709
+// to BT.2020, scaled to SDR white (the brightness Windows gives SDR content on that display, which SDL reports;
+// hdr_paper_white in the ini fixes it), PQ-encoded. Off, or where the display can't take it: SDR as before.
+static bool g_hdr;                    // the swapchain is HDR10
+static bool hdr_failed;               // HDR was wanted when it was made, but the display has no HDR10 format
+static float g_hdr_white = 200;       // nits SDR white is shown at
+static VkFormat hdr_format;
+static VkImage hdr_sc_images[8];      // the swapchain's own images while g_hdr
+static VkImageView hdr_sc_views[8];
+static VmaAllocation hdr_mem[8];      // g_vk.sc_images' memory while g_hdr
+static uint32_t hdr_count;
+static VkDescriptorSetLayout hdr_dsl;
+static VkPipelineLayout hdr_layout;
+static VkPipeline hdr_pipe;
+static VkDescriptorPool hdr_pool;
+static VkDescriptorSet hdr_sets[8];
+
+// Video > HDR as it stands now: whether the swapchain should be HDR10, and SDR white's nits
+static bool hdr_wanted(float *white) {
+    SDL_PropertiesID p = SDL_GetWindowProperties(window);
+    bool on = SDL_GetBooleanProperty(p, SDL_PROP_WINDOW_HDR_ENABLED_BOOLEAN, false);
+    float w = SDL_GetFloatProperty(p, SDL_PROP_WINDOW_SDR_WHITE_LEVEL_FLOAT, 0) * 80;  // (scRGB: 1.0 is 80 nits)
+    if (g_settings.hdr == HDR_ON) on = true;
+    if (g_settings.hdr == HDR_OFF) on = false;
+    *white = g_settings.hdr_white ? (float)g_settings.hdr_white : w >= 80 ? w : 200;
+    return on && g_cs_ext;
+}
+
+static const char k_hdr_vs[] =
+    "#version 450\n"
+    "void main() { vec2 p = vec2((gl_VertexIndex << 1) & 2, gl_VertexIndex & 2); gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0); }\n";
+static const char k_hdr_fs[] =
+    "#version 450\n"
+    "layout(set = 0, binding = 0) uniform sampler2D src;\n"
+    "layout(push_constant) uniform P { float white; float srgb; } pc;\n"
+    "layout(location = 0) out vec4 o;\n"
+    "void main() {\n"
+    "    vec3 c = clamp(texelFetch(src, ivec2(gl_FragCoord.xy), 0).rgb, 0.0, 1.0);\n"
+    "    vec3 l = pc.srgb > 0.5 ? mix(c / 12.92, pow((c + 0.055) / 1.055, vec3(2.4)), step(0.04045, c)) : pow(c, vec3(2.2));\n"
+    "    const mat3 to2020 = mat3(0.6274, 0.0691, 0.0164, 0.3293, 0.9195, 0.0880, 0.0433, 0.0114, 0.8956);\n"
+    "    vec3 y = pow(clamp(to2020 * l * (pc.white / 10000.0), 0.0, 1.0), vec3(0.1593017578125));\n"
+    "    o = vec4(pow((0.8359375 + 18.8515625 * y) / (1.0 + 18.6875 * y), vec3(78.84375)), 1.0);\n"
+    "}\n";
+
+static bool hdr_pipeline(VkFormat fmt) {
+    if (hdr_pipe && fmt == hdr_format) return true;
+    if (hdr_pipe) vkDestroyPipeline(g_vk.dev, hdr_pipe, NULL), hdr_pipe = VK_NULL_HANDLE;
+    if (!hdr_dsl) {
+        VkDescriptorSetLayoutBinding b = {0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL};
+        VkDescriptorSetLayoutCreateInfo di = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 1,
+                                              .pBindings = &b};
+        VK_CHECK(vkCreateDescriptorSetLayout(g_vk.dev, &di, NULL, &hdr_dsl));
+        VkPushConstantRange pr = {VK_SHADER_STAGE_FRAGMENT_BIT, 0, 8};
+        VkPipelineLayoutCreateInfo li = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1,
+                                         .pSetLayouts = &hdr_dsl, .pushConstantRangeCount = 1, .pPushConstantRanges = &pr};
+        VK_CHECK(vkCreatePipelineLayout(g_vk.dev, &li, NULL, &hdr_layout));
+        VkDescriptorPoolSize ps = {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 8};
+        VkDescriptorPoolCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 8,
+                                         .poolSizeCount = 1, .pPoolSizes = &ps};
+        VK_CHECK(vkCreateDescriptorPool(g_vk.dev, &pi, NULL, &hdr_pool));
+        VkDescriptorSetLayout l8[8] = {hdr_dsl, hdr_dsl, hdr_dsl, hdr_dsl, hdr_dsl, hdr_dsl, hdr_dsl, hdr_dsl};
+        VkDescriptorSetAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorPool = hdr_pool,
+                                          .descriptorSetCount = 8, .pSetLayouts = l8};
+        VK_CHECK(vkAllocateDescriptorSets(g_vk.dev, &ai, hdr_sets));
+    }
+    VkShaderModule vs = vk_compile_glsl(k_hdr_vs, STAGE_VERTEX, "hdr.vert"), fs = vk_compile_glsl(k_hdr_fs, STAGE_FRAGMENT, "hdr.frag");
+    if (vs && fs) {
+        VkPipelineShaderStageCreateInfo st[2] = {
+            {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = vs, .pName = "main"},
+            {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = fs, .pName = "main"}};
+        VkPipelineVertexInputStateCreateInfo vi = {.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+        VkPipelineInputAssemblyStateCreateInfo ia = {.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+                                                     .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST};
+        VkPipelineViewportStateCreateInfo vp = {.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, .viewportCount = 1,
+                                                .scissorCount = 1};
+        VkPipelineRasterizationStateCreateInfo rs = {.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+                                                     .polygonMode = VK_POLYGON_MODE_FILL, .cullMode = VK_CULL_MODE_NONE, .lineWidth = 1};
+        VkPipelineMultisampleStateCreateInfo ms = {.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+                                                   .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT};
+        VkPipelineColorBlendAttachmentState ba = {.colorWriteMask = 0xF};
+        VkPipelineColorBlendStateCreateInfo cb = {.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+                                                  .attachmentCount = 1, .pAttachments = &ba};
+        VkDynamicState dyn[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+        VkPipelineDynamicStateCreateInfo ds = {.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, .dynamicStateCount = 2,
+                                               .pDynamicStates = dyn};
+        VkPipelineRenderingCreateInfo rc = {.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, .colorAttachmentCount = 1,
+                                            .pColorAttachmentFormats = &fmt};
+        VkGraphicsPipelineCreateInfo gi = {.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = &rc, .stageCount = 2,
+                                           .pStages = st, .pVertexInputState = &vi, .pInputAssemblyState = &ia,
+                                           .pViewportState = &vp, .pRasterizationState = &rs, .pMultisampleState = &ms,
+                                           .pColorBlendState = &cb, .pDynamicState = &ds, .layout = hdr_layout};
+        if (vkCreateGraphicsPipelines(g_vk.dev, VK_NULL_HANDLE, 1, &gi, NULL, &hdr_pipe) != VK_SUCCESS) hdr_pipe = VK_NULL_HANDLE;
+    }
+    if (vs) vkDestroyShaderModule(g_vk.dev, vs, NULL);
+    if (fs) vkDestroyShaderModule(g_vk.dev, fs, NULL);
+    hdr_format = fmt;
+    if (!hdr_pipe) LOG("[vk] HDR output pass unavailable: SDR\n");
+    return hdr_pipe != VK_NULL_HANDLE;
+}
+
+// The 8-bit images drawn into while the swapchain is HDR10 (and their views), gone with the swapchain they served
+static void hdr_release(void) {
+    for (uint32_t i = 0; i < hdr_count; i++) {
+        vkDestroyImageView(g_vk.dev, hdr_sc_views[i], NULL);
+        vmaDestroyImage(g_vk.vma, g_vk.sc_images[i], hdr_mem[i]);
+    }
+    hdr_count = 0;
+}
+
+static void hdr_make_images(uint32_t n, VkExtent2D ext) {
+    for (uint32_t i = 0; i < n; i++) {
+        hdr_sc_images[i] = g_vk.sc_images[i];  // (the swapchain's)
+        VkImageViewCreateInfo vi = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = hdr_sc_images[i],
+                                    .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = hdr_format,
+                                    .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+        VK_CHECK(vkCreateImageView(g_vk.dev, &vi, NULL, &hdr_sc_views[i]));
+        VkImageCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D,
+                                .format = VK_FORMAT_B8G8R8A8_UNORM, .extent = {ext.width, ext.height, 1}, .mipLevels = 1,
+                                .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
+                                .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                                         VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT};
+        VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+        VK_CHECK(vmaCreateImage(g_vk.vma, &ci, &ai, &g_vk.sc_images[i], &hdr_mem[i], NULL));
+    }
+    hdr_count = n;
+}
+
 static void create_swapchain(void) {
     VkSurfaceCapabilitiesKHR caps;
     VK_CHECK(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(g_vk.phys, g_vk.surface, &caps));
@@ -744,6 +887,15 @@ static void create_swapchain(void) {
     VkSurfaceFormatKHR sf = fmts[0];
     for (uint32_t i = 0; i < nf; i++)
         if (fmts[i].format == VK_FORMAT_B8G8R8A8_UNORM && fmts[i].colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) { sf = fmts[i]; break; }
+    VkSurfaceFormatKHR draw = sf;  // what the frame is drawn into (the swapchain's format, or the 8-bit images' in HDR)
+    bool hdr = hdr_wanted(&g_hdr_white), hdr_found = false;
+    for (uint32_t i = 0; hdr && i < nf && !hdr_found; i++)
+        if ((fmts[i].format == VK_FORMAT_A2B10G10R10_UNORM_PACK32 || fmts[i].format == VK_FORMAT_A2R10G10B10_UNORM_PACK32) &&
+            fmts[i].colorSpace == VK_COLOR_SPACE_HDR10_ST2084_EXT && hdr_pipeline(fmts[i].format))
+            sf = fmts[i], hdr_found = true;
+    hdr_failed = hdr && !hdr_found;
+    if (hdr && !hdr_found) LOG("[vk] HDR wanted, but this display offers no HDR10 swapchain format: SDR\n");
+    if (hdr_found) draw.format = VK_FORMAT_B8G8R8A8_UNORM;
     uint32_t count = caps.minImageCount + 1;
     if (caps.maxImageCount && count > caps.maxImageCount) count = caps.maxImageCount;
     if (count > 8) count = 8;
@@ -767,19 +919,33 @@ static void create_swapchain(void) {
         winsize_refresh_rate());
     VK_CHECK(vkCreateSwapchainKHR(g_vk.dev, &ci, NULL, &g_vk.swapchain));
     for (uint32_t i = 0; i < g_vk.sc_count; i++) vkDestroyImageView(g_vk.dev, g_vk.sc_views[i], NULL);
+    hdr_release();
     if (old) vkDestroySwapchainKHR(g_vk.dev, old, NULL);
-    g_vk.sc_format = sf.format;
+    g_vk.sc_format = draw.format;
     g_vk.sc_extent = ext;
     g_vk.sc_mode = wanted_present_mode();  // (what was asked: a change of Video > VSync makes it again)
     g_vk.sc_count = 8;
     vkGetSwapchainImagesKHR(g_vk.dev, g_vk.swapchain, &g_vk.sc_count, g_vk.sc_images);
+    g_hdr = hdr_found;
+    if (g_hdr) hdr_make_images(g_vk.sc_count, ext);
     for (uint32_t i = 0; i < g_vk.sc_count; i++) {
         VkImageViewCreateInfo vi = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = g_vk.sc_images[i],
-                                    .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = sf.format,
+                                    .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = draw.format,
                                     .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
         VK_CHECK(vkCreateImageView(g_vk.dev, &vi, NULL, &g_vk.sc_views[i]));
+        if (!g_hdr) continue;
+        VkDescriptorImageInfo ii = {vk_default_sampler(false), g_vk.sc_views[i], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+        VkWriteDescriptorSet w = {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = hdr_sets[i], .dstBinding = 0,
+                                  .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                                  .pImageInfo = &ii};
+        vkUpdateDescriptorSets(g_vk.dev, 1, &w, 0, NULL);
     }
+    if (g_hdr) LOG("[vk] HDR10 output (%s), SDR white at %.0f nits\n",
+                   g_settings.hdr == HDR_ON ? "Video > HDR is On" : "Windows HDR is on for this display", g_hdr_white);
 }
+
+// While the swapchain is HDR10: the frame drawn into image i (8-bit, sRGB-encoded) written into the swapchain's image
+static void hdr_write(VkCommandBuffer cb, uint32_t i);
 
 // ================================================================== present timing
 // SAVAGEWIND_LOG_PRESENT=<frames> (tests): every <frames> presents, a "[present]" line with how evenly the frames went
@@ -1029,6 +1195,31 @@ static void image_barrier(VkCommandBuffer cb, VkImage img, VkImageLayout from, V
     vkCmdPipelineBarrier2(cb, &di);
 }
 
+static void hdr_write(VkCommandBuffer cb, uint32_t i) {
+    image_barrier(cb, g_vk.sc_images[i], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    image_barrier(cb, hdr_sc_images[i], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    VkRenderingAttachmentInfo ca = {.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = hdr_sc_views[i],
+                                    .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                                    .loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE, .storeOp = VK_ATTACHMENT_STORE_OP_STORE};
+    VkRenderingInfo ri = {.sType = VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = {{0, 0}, g_vk.sc_extent}, .layerCount = 1,
+                          .colorAttachmentCount = 1, .pColorAttachments = &ca};
+    vkCmdBeginRendering(cb, &ri);
+    VkViewport vp = {0, 0, (float)g_vk.sc_extent.width, (float)g_vk.sc_extent.height, 0, 1};
+    VkRect2D sc = {{0, 0}, g_vk.sc_extent};
+    vkCmdSetViewport(cb, 0, 1, &vp);
+    vkCmdSetScissor(cb, 0, 1, &sc);
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, hdr_pipe);
+    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, hdr_layout, 0, 1, &hdr_sets[i], 0, NULL);
+    static int srgb = -1;
+    if (srgb < 0) srgb = getenv("SAVAGEWIND_HDR_SRGB") != NULL;
+    float pc[2] = {g_hdr_white, (float)srgb};
+    vkCmdPushConstants(cb, hdr_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof pc, pc);
+    vkCmdDraw(cb, 3, 1, 0, 0);
+    vkCmdEndRendering(cb);
+    vk_dyn_forget();
+    image_barrier(cb, hdr_sc_images[i], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+}
+
 uint64_t g_present_split[6];  // (VK_PROF) acquire, end pass, draw + menu, submit, present, slot wait
 typedef struct { uint32_t image; VkSemaphore acquired; bool ok; } Frame;
 static Frame cur_frame;
@@ -1044,8 +1235,11 @@ bool vk_frame_begin(const float clear[4]) {
     uint64_t tp = SDL_GetTicksNS();
     vk_present_idle();  // (the swapchain is externally synchronized: no acquire while the present thread presents)
     g_present_split[4] += SDL_GetTicksNS() - tp;
+    float white;  // (Windows HDR turned on or off, the window moved to another display, Video > HDR changed)
+    bool hdr = hdr_wanted(&white);
+    if (g_hdr) g_hdr_white = white;
     if (!g_vk.swapchain || (uint32_t)w != g_vk.sc_extent.width || (uint32_t)h != g_vk.sc_extent.height ||
-        atomic_exchange(&pres_stale, 0) || g_vk.sc_mode != wanted_present_mode())
+        atomic_exchange(&pres_stale, 0) || g_vk.sc_mode != wanted_present_mode() || hdr != (g_hdr || hdr_failed))
         recreate_swapchain();
     if (!g_vk.swapchain) return false;
     static int trace = -1;
@@ -1129,7 +1323,8 @@ void vk_frame_end(const char *shot_path) {
     vkCmdEndRendering(cb);
     VkSpan shot = {0};
     if (shot_path) save_window_image(cb, &shot);
-    image_barrier(cb, g_vk.sc_images[cur_frame.image], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+    if (g_hdr) hdr_write(cb, cur_frame.image);
+    else image_barrier(cb, g_vk.sc_images[cur_frame.image], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
     uint32_t img = cur_frame.image;
     if (!done_sem[img]) done_sem[img] = binary_semaphore();
     uint64_t seq = vk_pending_seq();

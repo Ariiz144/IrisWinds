@@ -30,6 +30,9 @@ enum { PERF_OFF = 0, PERF_FPS = 1, PERF_FULL = 2 };
 // Adaptive the frame rate stays a little under the display's refresh rate (runtime/hle/framepace.c).
 enum { VSYNC_ON = 0, VSYNC_FAST = 1, VSYNC_ADAPTIVE = 2, VSYNC_OFF = 3, VSYNC_COUNT };
 #define VSYNC_DEFAULT VSYNC_FAST
+// Video > HDR: Auto presents in HDR10 while Windows HDR is on for the window's monitor, On always (where the display
+// takes it), Off never (an SDR picture, which Windows shows dim and dull while its HDR is on)
+enum { HDR_AUTO = 0, HDR_ON = 1, HDR_OFF = 2, HDR_COUNT };
 typedef struct {
     bool fullscreen;
     int window_w, window_h;  // Video > Window size, pixels (0: not chosen; runtime/window_size.c)
@@ -56,6 +59,8 @@ typedef struct {
     bool precompile_shaders;  // setting the game files up also precompiles every shader (runtime/nvn/precompile.h)
     int shadow_res;      // SHADOW_*: shadow maps at the console's size or bigger
     bool wide_view;      // a window that isn't 16:9 shows more of the world instead of bars (runtime/nvn/output_scale.c)
+    int hdr;             // HDR_* (runtime/nvn/vulkan/device.c hdr_*)
+    int hdr_white;       // nits of SDR white in HDR (0: what Windows gives SDR content on that monitor)
     int fov;             // field of view in play, percent of the game's own (FOV_CHOICES)
     int text_language;   // index in g_text_languages (runtime/language.h), 0: the host's
     int voice_language;  // index in g_voice_languages, 0: the text language's voices

@@ -18,6 +18,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include <atomic>
 #include <chrono>
 #include <string>
 #include <unordered_map>
@@ -36,6 +37,7 @@ extern "C" {
 #include "../window_size.h"
 void rt_request_reboot(int kind);           // runtime/main.c (1: start the game again)
 void menu_request_window_apply(void);       // menu.mm (fullscreen / window size, applied by the window loop)
+void menu_size_list_open(void);             // menu.mm (Window size's list, over the screen)
 bool renderer_gpu_rtx(void);                // vulkan/device.c, metal.m
 }
 
@@ -81,7 +83,7 @@ static_assert(sizeof(Entry) == 0x30);
 enum { KIND_TOGGLE = 0, KIND_CHOICE = 1, KIND_BUTTON = 2 };
 
 enum Page { P_MAIN, P_GAMEPLAY, P_VIDEO, P_AUDIO, P_CONTROLS, P_KEYS, P_STICKS, P_PAD, P_LANGUAGE, P_COUNT };
-enum Action { A_NONE, A_PAGE, A_BIND_KEY, A_BIND_PAD, A_RESET_KEYS, A_RESET_PAD, A_RESTART, A_QUIT };
+enum Action { A_NONE, A_PAGE, A_BIND_KEY, A_BIND_PAD, A_RESET_KEYS, A_RESET_PAD, A_RESTART, A_QUIT, A_SIZE_LIST };
 
 struct Item {
     int page;
@@ -112,6 +114,8 @@ uint64_t g_quit_dialog;            // the quit question's dialog while it is up
 uint64_t g_quit_owner;             // ... and the screen it came from (title menu or Options; its input is off meanwhile)
 bool g_quit_texts;                 // ... and its texts are still to be given (its two-button layout comes next)
 uint64_t g_cap_row;                // a binding row whose capture is running
+uint64_t g_size_row;               // the Window size row whose list was opened
+std::atomic<bool> g_size_redraw;   // ... and a size was picked there (render thread): redraw it
 std::vector<uint64_t> g_dirty;     // rows to redraw, one per frame
 std::chrono::steady_clock::time_point g_hold_until;
 std::unordered_map<uint32_t, std::u16string> g_text;
@@ -140,6 +144,7 @@ const char *const k_shadow[] = {"Console (896)", "High (2048)", "Ultra (4096)", 
 const char *const k_icons[] = {"Automatic", "Keyboard", "Xbox", "PlayStation", "Nintendo"};  // (ICONS_*)
 constexpr int k_fps[] = FPS_CHOICES;  // frame rate (0: Off, no limit)
 const char *const k_vsync[VSYNC_COUNT] = {"On", "Fast", "Adaptive", "Off"};  // (settings.h VSYNC_*)
+const char *const k_hdr[HDR_COUNT] = {"Automatic", "On", "Off"};               // (settings.h HDR_*)
 constexpr int FPS_DEFAULT_INDEX = 2;
 static_assert(k_fps[FPS_DEFAULT_INDEX] == FPS_DEFAULT);
 constexpr int k_sens[] = {10, 25, 50, 75, 100, 125, 150, 200, 250, 300, 400, 500, 600, 800, 1000};  // mouse sensitivity, %
@@ -256,37 +261,26 @@ void build_items(void) {
     v.push_back(toggle(P_VIDEO, "Fullscreen", "Fills the screen. Also F11 or Alt+Enter.",
                        [](const Item &) { return (int)g_settings.fullscreen; },
                        [](const Item &, int x) { g_settings.fullscreen = x; menu_request_window_apply(); }, 0));
-    Item ws = choice(P_VIDEO, "Window size", "",
-                     [](const Item &) {
-                         WinSize list[WINSIZE_MAX];
-                         return winsize_items(list);
-                     },
-                     [](const Item &, int x) {
-                         static char buf[64];
-                         WinSize list[WINSIZE_MAX];
-                         int n = winsize_items(list);
-                         winsize_name(list[x < n ? x : 0], tr("native"), buf, sizeof buf);
-                         return (const char *)buf;
-                     },
-                     [](const Item &) { return winsize_index(winsize_effective(g_settings.fullscreen)); },
-                     [](const Item &, int x) {
-                         WinSize list[WINSIZE_MAX];
-                         int n = winsize_items(list);
-                         if (x >= n) return;
-                         g_settings.window_w = list[x].w, g_settings.window_h = list[x].h;
-                         menu_request_window_apply();
-                     }, 0);
+    // Window size: a button showing the size; A drops the sizes down as a list over it (menu.mm size_list_draw)
+    Item ws = button(P_VIDEO, "Window size", "", nullptr, A_SIZE_LIST, 0);
+    ws.label = [](const Item &, int) {
+        static char buf[64];
+        WinSize list[WINSIZE_MAX];
+        int n = winsize_items(list), x = winsize_index(winsize_effective(g_settings.fullscreen));
+        winsize_name(list[x < n ? x : 0], tr("native"), buf, sizeof buf);
+        return (const char *)buf;
+    };
     ws.desc_fn = [](const Item &) {
         static char buf[256];
         WinSize d = winsize_desktop();
-        snprintf(buf, sizeof buf, tr("Window or fullscreen size. Your display: %d x %d."), d.w, d.h);
+        snprintf(buf, sizeof buf, tr("Window or fullscreen size. A: choose it from a list. Your display: %d x %d."), d.w,
+                 d.h);
         return (const char *)buf;
     };
     ws.reset = [](const Item &) {  // (unset: 1280 x 720 in a window, the desktop in fullscreen)
         g_settings.window_w = g_settings.window_h = 0;
         menu_request_window_apply();
     };
-    ws.wrap = true;
     v.push_back(ws);
     v.push_back(toggle(P_VIDEO, "Fill wide screens", "Shows more to the sides on screens wider than 16:9, instead of bars.",
                        [](const Item &) { return (int)g_settings.wide_view; },
@@ -323,6 +317,12 @@ void build_items(void) {
                        [](const Item &, int x) { return tr(k_vsync[x]); },
                        [](const Item &) { return g_settings.vsync; },
                        [](const Item &, int x) { g_settings.vsync = x; }, VSYNC_DEFAULT));
+    // HDR (settings.h HDR_*: runtime/nvn/vulkan/device.c hdr_wanted)
+    v.push_back(choice(P_VIDEO, "HDR", "Automatic: in HDR while Windows HDR is on, as bright as in SDR. Off: always SDR.",
+                       [](const Item &) { return (int)HDR_COUNT; },
+                       [](const Item &, int x) { return tr(k_hdr[x]); },
+                       [](const Item &) { return g_settings.hdr; },
+                       [](const Item &, int x) { g_settings.hdr = x; }, HDR_AUTO));
     v.push_back(choice(P_VIDEO, "Performance overlay", "Frame rate and system load in a corner. Also F10.",
                        [](const Item &) { return N(k_perf); }, [](const Item &, int x) { return tr(k_perf[x]); },
                        [](const Item &) { return g_settings.perf_overlay; },
@@ -738,6 +738,10 @@ extern "C" int rt_opt_decide(uint64_t row) {
     if (!it || it->kind != KIND_BUTTON) return 0;
     int d, s, ms;
     switch (it->action) {
+    case A_SIZE_LIST:
+        g_size_row = row;
+        menu_size_list_open();
+        return 2;
     case A_PAGE:
         if (bind_capture_active(&d, &s, &ms)) return 2;
         g_next_page = it->arg;
@@ -767,6 +771,9 @@ extern "C" int rt_opt_decide(uint64_t row) {
     return 2;
 }
 
+// Window size's list (menu.mm, render thread): a size was picked, the row shows it
+extern "C" void game_options_size_picked(void) { g_size_redraw = true; }
+
 // Options update: a binding capture that ended redraws the page's rows (a conflict swaps two inputs)
 extern "C" uint64_t rt_opt_tick(uint64_t screen) {
     if (g_quit_dialog) {  // (the quit question is up: 1 skips the screen's update, whose dialog handling takes answers)
@@ -780,6 +787,7 @@ extern "C" uint64_t rt_opt_tick(uint64_t screen) {
         settings_save();
         mark_all_rows(screen);
     }
+    if (g_size_redraw.exchange(false) && g_size_row) g_dirty.push_back(g_size_row);
     if (g_dirty.empty()) return 0;
     uint64_t r = g_dirty.back();
     g_dirty.pop_back();
