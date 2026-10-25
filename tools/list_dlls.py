@@ -26,11 +26,10 @@ def get_deps(binary_path):
     return deps
 
 all_dlls = {}
-queue = ["build/iriswinds.exe"]
-if os.path.exists("build/iriswinds-config.exe"):
-    queue.append("build/iriswinds-config.exe")
-if os.path.exists("build/IrisWinds Configuration.exe"):
-    queue.append("build/IrisWinds Configuration.exe")
+queue = []
+for exe in ["build/iriswinds.exe", "build/iriswinds-config.exe", "build/IrisWinds Configuration.exe"]:
+    if os.path.exists(exe):
+        queue.append(exe)
 
 visited = set()
 while queue:
@@ -45,29 +44,14 @@ while queue:
             queue.append(path)
 
 print(f"Total non-system DLL dependencies found: {len(all_dlls)}")
-dist_dir = "build/dist/IrisWinds"
-os.makedirs(dist_dir, exist_ok=True)
 os.makedirs("build", exist_ok=True)
 
 for name, path in sorted(all_dlls.items()):
     print(f"  {name} -> {path}")
-    dest_dist = os.path.join(dist_dir, name)
+    dest_build = os.path.join("build", name)
     if os.path.exists(path):
-        if not os.path.exists(dest_dist) or os.path.getsize(dest_dist) != os.path.getsize(path):
-            shutil.copy2(path, dest_dist)
-            print(f"    Copied {name} to {dist_dir}")
-
-        dest_build = os.path.join("build", name)
         if not os.path.exists(dest_build) or os.path.getsize(dest_build) != os.path.getsize(path):
             shutil.copy2(path, dest_build)
             print(f"    Copied {name} to build/")
-
-# Also copy all .dll from build/ to dist_dir
-for dll in glob.glob("build/*.dll"):
-    name = os.path.basename(dll)
-    dest_dist = os.path.join(dist_dir, name)
-    if not os.path.exists(dest_dist) or os.path.getsize(dest_dist) != os.path.getsize(dll):
-        shutil.copy2(dll, dest_dist)
-        print(f"  Copied build/{name} to {dist_dir}")
 
 print("DLL bundling completed successfully!")

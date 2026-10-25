@@ -13,23 +13,28 @@ JOBS=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
 ACTION="${1:-build}"
 
 sync_runtime() {
-    echo "==> Syncing runtime DLLs and assets..."
-    # Auto-bundle all DLL dependencies
+    echo "==> Syncing runtime DLLs and assets into build/..."
+    mkdir -p build
+
+    # Standardize configuration tool name
+    if [ -f "build/iriswinds-config.exe" ]; then
+        cp -f "build/iriswinds-config.exe" "build/IrisWinds Configuration.exe"
+        rm -f "build/iriswinds-config.exe"
+    fi
+
+    # Sync scripts and branding assets directly into build/
+    [ -f "IrisWinds.bat" ] && cp -u "IrisWinds.bat" "build/IrisWinds.bat" 2>/dev/null || true
+    [ -f "setup_system_deps.bat" ] && cp -u "setup_system_deps.bat" "build/setup_system_deps.bat" 2>/dev/null || true
+    [ -f "docs/icon/icon_1024.png" ] && cp -u "docs/icon/icon_1024.png" "build/icon.png" 2>/dev/null || true
+    [ -f "docs/icon/splash.jpg" ] && cp -u "docs/icon/splash.jpg" "build/splash.jpg" 2>/dev/null || true
+
+    # Auto-bundle all DLL dependencies directly into build/
     if [ -f "tools/list_dlls.py" ]; then
         python tools/list_dlls.py 2>/dev/null || true
     fi
-    if [ -d "build/dist/IrisWinds" ]; then
-        cp -u build/dist/IrisWinds/*.dll build/ 2>/dev/null || true
-        cp -u build/*.dll build/dist/IrisWinds/ 2>/dev/null || true
-        cp -u build/dist/IrisWinds/*.ttf build/ 2>/dev/null || true
-        cp -u build/dist/IrisWinds/*.png build/ 2>/dev/null || true
-        cp -u build/dist/IrisWinds/*.jpg build/ 2>/dev/null || true
-        cp -u build/dist/IrisWinds/*.ini build/ 2>/dev/null || true
-        [ -d "build/dist/IrisWinds/gamelib-src" ] && cp -ru build/dist/IrisWinds/gamelib-src build/ 2>/dev/null || true
-        [ -d "build/dist/IrisWinds/swgen" ] && cp -ru build/dist/IrisWinds/swgen build/ 2>/dev/null || true
-        [ -d "build/dist/IrisWinds/zig" ] && cp -ru build/dist/IrisWinds/zig build/ 2>/dev/null || true
-    fi
-    # Clean up redundant legacy / duplicate files in build directory
+
+    # Purge any redundant duplicate dist folder or legacy files
+    rm -rf "build/dist"
     rm -f "build/Savage Wind Configuration.exe" build/savagewind* build/build.bat
 }
 
@@ -49,30 +54,57 @@ case "$ACTION" in
     dist)
         echo "==> Building and packaging IrisWinds distribution ($JOBS parallel jobs)..."
         make RELEASE=1 -j"$JOBS"
-        python -c '
-import os, shutil
-b = "build"
-d = "build/dist/IrisWinds"
-os.makedirs(d, exist_ok=True)
-shutil.copy2(f"{b}/iriswinds.exe", f"{d}/iriswinds.exe")
-shutil.copy2(f"{b}/iriswinds-config.exe", f"{d}/IrisWinds Configuration.exe")
-shutil.copy2(f"{b}/iriswinds.dll.a", f"{d}/iriswinds.dll.a")
-if os.path.exists("IrisWinds.bat"): shutil.copy2("IrisWinds.bat", f"{d}/IrisWinds.bat")
-if os.path.exists("setup_system_deps.bat"): shutil.copy2("setup_system_deps.bat", f"{d}/setup_system_deps.bat")
-if os.path.exists("docs/icon/icon_1024.png"): shutil.copy2("docs/icon/icon_1024.png", f"{d}/icon.png")
-if os.path.exists("docs/icon/splash.jpg"): shutil.copy2("docs/icon/splash.jpg", f"{d}/splash.jpg")
-# Remove any accidental duplicates or legacy names:
-for f in ["iriswinds-config.exe", "savagewind.exe", "savagewind-config.exe", "Savage Wind Configuration.exe", "savagewind.dll.a", "build.bat"]:
-    p = os.path.join(d, f)
-    if os.path.exists(p):
-        os.remove(p)
-'
         sync_runtime
-        echo "==> IrisWinds portable folder updated at build/dist/IrisWinds/"
+        python -c '
+import os, zipfile, glob
+
+build_dir = "build"
+zip_path = os.path.join(build_dir, "IrisWinds-0.3.5i-alpha-windows.zip")
+
+# Files to include in the distribution
+include_files = [
+    "iriswinds.exe",
+    "IrisWinds Configuration.exe",
+    "IrisWinds.bat",
+    "setup_system_deps.bat",
+    "iriswinds.dll.a",
+    "icon.png",
+    "splash.jpg"
+]
+
+print("==> Packaging standalone distribution zip...")
+with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
+    # Add primary binaries and assets
+    for name in include_files:
+        src = os.path.join(build_dir, name)
+        if os.path.isfile(src):
+            z.write(src, arcname=f"IrisWinds/{name}")
+            print(f"  + IrisWinds/{name}")
+        else:
+            print(f"  ! Missing file: {name}")
+
+    # Add all bundled DLLs
+    for dll in sorted(glob.glob(os.path.join(build_dir, "*.dll"))):
+        dll_name = os.path.basename(dll)
+        z.write(dll, arcname=f"IrisWinds/{dll_name}")
+        print(f"  + IrisWinds/{dll_name}")
+
+    # Add any fonts or ini files if present
+    for extra in sorted(glob.glob(os.path.join(build_dir, "*.ttf")) + glob.glob(os.path.join(build_dir, "*.ini"))):
+        extra_name = os.path.basename(extra)
+        z.write(extra, arcname=f"IrisWinds/{extra_name}")
+        print(f"  + IrisWinds/{extra_name}")
+
+zip_size_mb = os.path.getsize(zip_path) / (1024 * 1024)
+print(f"==> Package created successfully: {zip_path} ({zip_size_mb:.2f} MB)")
+'
+        # Ensure no duplicate dist folder remains on disk
+        rm -rf "build/dist"
+        echo "==> Build consolidated! Only single output folder exists: build/"
         ;;
     clean)
         echo "==> Cleaning build artifacts..."
-        make clean 2>/dev/null || rm -rf build/rt build/imgui build/link build/iriswinds* build/savagewind* build/dist
+        make clean 2>/dev/null || rm -rf build/rt build/imgui build/inc build/link build/iriswinds* build/savagewind* build/dist
         echo "==> Clean complete."
         ;;
     *)
