@@ -31,6 +31,7 @@ static atomic_bool ui_ready;
 static VkDebugUtilsMessengerEXT messenger;
 uint64_t g_addr_report_lo, g_addr_report_hi;  // (SAVAGEWIND_VK_ADDR_REPORT)
 uint64_t renderer_present_count(void);
+static bool g_m5;     // maintenance5 enabled (the pipeline cache's header: pc_header)
 static bool g_cs_ext;  // VK_EXT_swapchain_colorspace: HDR10 swapchains can be made (the HDR section below)
 
 // ================================================================== instance / device
@@ -268,6 +269,7 @@ static void create_device(void) {
         m5 = m5_have.maintenance5;
     }
     if (m5) ext[n_ext++] = VK_KHR_MAINTENANCE_5_EXTENSION_NAME;
+    g_m5 = m5;
     LOG("[vk] maintenance5 %s\n", m5 ? "on (unwritten point size is 1.0)" : win_legacy ? "off" : "not supported");
     // Color targets a draw samples while it writes them (exec.c resolve_feedback): a feedback loop with a barrier
     // inside the pass between such draws, instead of a copy of the target before each one. With
@@ -494,7 +496,10 @@ static void pc_header(PcHeader *h) {
     h->device = g_vk.props.deviceID;
     h->driver = g_vk.props.driverVersion;
     memcpy(h->uuid, g_vk.props.pipelineCacheUUID, VK_UUID_SIZE);
-    snprintf(h->shaders, sizeof h->shaders, "%s", vk_shader_version());
+    // and the device setup the pipelines were built for: maintenance5, pipeline libraries, feedback loops (in the
+    // layout or not). Pipelines of one setup read back in another hung AMD's Windows driver at the first frame (#85).
+    snprintf(h->shaders, sizeof h->shaders, "%s/%c%c%c", vk_shader_version(), g_m5 ? 'm' : '-', g_vk.gpl ? 'g' : '-',
+             !g_vk.feedback_loop ? '-' : g_vk.feedback_layout ? 'L' : 'f');
 }
 
 // The data of a cache file, or NULL with *why saying what is wrong with it.
@@ -526,7 +531,7 @@ static void *pc_read(FILE *f, size_t *size, const char **why) {
     if (memcmp(h.magic, want.magic, 8) || h.version != want.version) { *why = "older format"; return NULL; }
     if (h.vendor != want.vendor || h.device != want.device) { *why = "made on another GPU"; return NULL; }
     if (h.driver != want.driver || memcmp(h.uuid, want.uuid, VK_UUID_SIZE)) { *why = "made with another driver"; return NULL; }
-    if (memcmp(h.shaders, want.shaders, sizeof h.shaders)) { *why = "made by another shader translator build"; return NULL; }
+    if (memcmp(h.shaders, want.shaders, sizeof h.shaders)) { *why = "made by another shader translator build or device setup"; return NULL; }
     if (h.size != (uint64_t)n - sizeof h) { *why = "cut short"; return NULL; }
     uint8_t *d = malloc(h.size ? h.size : 1);
     if (!d || fread(d, 1, h.size, f) != h.size || data_hash(d, h.size) != h.hash) { free(d); *why = "damaged"; return NULL; }
