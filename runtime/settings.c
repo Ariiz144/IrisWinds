@@ -14,7 +14,8 @@
 // SAVAGEWIND_SETTINGS=<path>: another settings file (test runs never touch the player's savagewind.ini)
 static const char *settings_file(void) {
     const char *e = getenv("SAVAGEWIND_SETTINGS");
-    return e && *e ? e : "savagewind.ini";
+    if (!e || !*e) e = getenv("IRISWINDS_SETTINGS");
+    return e && *e ? e : "iriswinds.ini";
 }
 
 Settings g_settings = {
