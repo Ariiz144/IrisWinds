@@ -94,7 +94,7 @@ static void save_png(id<MTLTexture> tex, const char *path) {
 #endif
 
 // The version this build is (also names the release files; Makefile / tools/bundle_macos.sh / make_dmg.sh read it).
-#define SAVAGEWIND_VERSION "0.3.0-alpha.3"
+#define SAVAGEWIND_VERSION "3.5i"
 extern "C" const char *rt_version(void) { return SAVAGEWIND_VERSION; }  // (the title screen's version line: fs.c)
 
 // ------------------------------------------------------------------ game files
@@ -1536,7 +1536,7 @@ extern "C" void launcher_run(const char *root, int mode) {
                 ImFont *font = ImGui::GetFont();
                 float fs = ImGui::GetFontSize(), right = ImGui::GetWindowPos().x + ds.x - 60 * s;
                 char ver[64];
-                snprintf(ver, sizeof ver, tr("Version %s"), SAVAGEWIND_VERSION);
+                snprintf(ver, sizeof ver, "Alpha %s", SAVAGEWIND_VERSION);
                 float vs = fs * 1.4f, y = ImGui::GetWindowPos().y + ds.y - 134 * s;
                 ImVec2 vsz = font->CalcTextSizeA(vs, FLT_MAX, 0, ver);
                 ImVec2 p(right - vsz.x, y);

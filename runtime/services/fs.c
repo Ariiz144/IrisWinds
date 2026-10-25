@@ -66,6 +66,7 @@ static char *arena_strcat(StringArena *a, const char *s1, const char *s2) {
         size_t cap = 512 * 1024;
         if (total > cap) cap = total;
         StringChunk *chunk = malloc(sizeof(StringChunk) + cap);
+        if (!chunk) return "";
         chunk->next = a->head;
         chunk->used = 0;
         chunk->cap = cap;
@@ -505,10 +506,9 @@ static void rom_index(int fd) {
         if (overlay_file(rom_files[i].path, host, sizeof host) && !stat(host, &sb)) break;
         extern const char *rt_version(void);  // (runtime/ui/launcher.mm)
         static char text[64];
-        const char *v = rt_version(), *dot = strchr(v, '.');
-        int n = dot ? (int)strcspn(dot + 1, ".-") + (int)(dot - v) + 1 : (int)strlen(v);  // (up to the second '.')
-        snprintf(text, sizeof text, "Savage Wind %.*s", n, v);
-        if (strlen(text) > 15) snprintf(text, sizeof text, "Savage Wind");
+        const char *v = rt_version();
+        snprintf(text, sizeof text, "IrisWinds %s", v);
+        if (strlen(text) > 15) snprintf(text, sizeof text, "IrisWinds 3.5i");
         meta_copy(fd, fmeta, foff, fsz);
         uint64_t rel = ov_end - rom_data_off, size = strlen(text);
         memcpy(ov_meta + rom_files[i].meta + 8, &rel, 8);
