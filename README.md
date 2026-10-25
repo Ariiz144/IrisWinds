@@ -1,8 +1,11 @@
+# IrisWinds
+The optimizations and Intel Iris Xe enhancements were researched and developed by Gemini 3.8 and Antigravity, paired with Ariiz144.
+
 # Savage Wind Recomp
 
 > [!IMPORTANT]
 > **This project is made almost entirely with AI.** Nearly all of the code, tooling, reverse engineering and
-> documentation here is written by an AI (Anthropic's Claude, through Claude Code), directed, tested and reviewed by
+> documentation here is written by AIs (Anthropic's Claude and Google DeepMind's Gemini / Antigravity), directed, tested and reviewed by
 > a human. It builds on [LAS Recomp](https://github.com/peiikai/LASRecomp), which was made the same way. If you don't
 > trust code written by AI, you can simply ignore this project. As with anything on the internet, you run the code at
 > your own discretion.
