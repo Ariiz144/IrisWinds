@@ -33,7 +33,20 @@ echo Using bash: %BASH_PATH%
 echo Action:     %ACTION%
 echo.
 
+if not exist "build.sh" (
+    if exist "iriswinds.exe" (
+        echo Starting IrisWinds...
+        start "" "iriswinds.exe"
+        exit /b 0
+    )
+)
+
 if /i "%ACTION%"=="run" (
+    if exist "iriswinds.exe" (
+        echo Starting IrisWinds...
+        start "" "iriswinds.exe"
+        exit /b 0
+    )
     if not exist "build\iriswinds.exe" (
         echo [INFO] iriswinds.exe not found. Compiling first...
         "%BASH_PATH%" -c "export PATH=/ucrt64/bin:/usr/bin:$PATH; ./build.sh build"
