@@ -245,7 +245,7 @@ $(B)/rt/platform/windows_rc.o: runtime/platform/windows.rc runtime/platform/wind
 $(B)/rt/platform/windows_config.o: runtime/platform/windows_config.c
 	@mkdir -p $(dir $@)
 	$(CC) -O2 -Wall $(OSFLAGS) -c $< -o $@
-$(B)/savagewind-config.exe: $(B)/rt/platform/windows_config.o $(B)/rt/platform/windows_rc.o
+$(CONFIG_EXE): $(B)/rt/platform/windows_config.o $(B)/rt/platform/windows_rc.o
 	$(CC) -o $@ $^ -fuse-ld=lld -Wl,--subsystem,windows
 
 VERSION  := $(shell sed -n 's/^\#define SAVAGEWIND_VERSION "\(.*\)"/\1/p' runtime/ui/launcher.mm)
