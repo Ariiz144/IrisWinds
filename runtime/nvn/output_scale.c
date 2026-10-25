@@ -205,10 +205,12 @@ unsigned shadow_map_size(unsigned long long frame) {
     static unsigned w[8];
     if (n < 0) {
         n = 0;
-        for (const char *e = getenv("SAVAGEWIND_SHADOW_AT"); e && *e && n < 8;) {
+        const char *e = getenv("IRISWINDS_SHADOW_AT");
+        if (!e || !*e) e = getenv("SAVAGEWIND_SHADOW_AT");
+        for (; e && *e && n < 8;) {
             char name[16] = "";
             if (sscanf(e, "%llu:%15[^,]", &at[n], name) != 2) break;
-            w[n++] = !strcmp(name, "console") ? 0 : !strcmp(name, "high") ? 2048 : !strcmp(name, "ultra") ? 4096
+            w[n++] = (!strcmp(name, "console") || !strcmp(name, "fast")) ? 0 : !strcmp(name, "high") ? 2048 : !strcmp(name, "ultra") ? 4096
                    : !strcmp(name, "extreme") ? 8192 : (unsigned)atoi(name);
             e = strchr(e, ',');
             if (e) e++;
