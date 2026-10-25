@@ -33,6 +33,14 @@ sync_runtime() {
         python tools/list_dlls.py 2>/dev/null || true
     fi
 
+    # Ensure gamelib-src is present and synced
+    mkdir -p "build/gamelib-src"
+    [ -f "tools/gamelib_entry.c" ] && cp -u "tools/gamelib_entry.c" "build/gamelib-src/gamelib_entry.c" 2>/dev/null || true
+    [ -f "runtime/hle/hle_symbols.txt" ] && cp -u "runtime/hle/hle_symbols.txt" "build/gamelib-src/hle_symbols.txt" 2>/dev/null || true
+    for h in cpu.h simd.h simd_fp.h simd_softfma.h gamelib.h; do
+        [ -f "runtime/$h" ] && cp -u "runtime/$h" "build/gamelib-src/$h" 2>/dev/null || true
+    done
+
     # Purge any redundant duplicate dist folder or legacy files
     rm -rf "build/dist"
     rm -f "build/Savage Wind Configuration.exe" build/savagewind* build/build.bat
@@ -61,7 +69,7 @@ import os, zipfile, glob
 build_dir = "build"
 zip_path = os.path.join(build_dir, "IrisWinds-0.3.5i-alpha-windows.zip")
 
-# Files to include in the distribution
+# Single files to include
 include_files = [
     "iriswinds.exe",
     "IrisWinds Configuration.exe",
@@ -72,7 +80,14 @@ include_files = [
     "splash.jpg"
 ]
 
-print("==> Packaging standalone distribution zip...")
+# Builder directories required for standalone game recompilation
+include_dirs = [
+    "gamelib-src",
+    "swgen",
+    "zig"
+]
+
+print("==> Packaging standalone distribution zip with embedded builder toolchain...")
 with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
     # Add primary binaries and assets
     for name in include_files:
@@ -81,7 +96,7 @@ with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
             z.write(src, arcname=f"IrisWinds/{name}")
             print(f"  + IrisWinds/{name}")
         else:
-            print(f"  ! Missing file: {name}")
+            print(f"  ! Warning: {name} not found in build directory")
 
     # Add all bundled DLLs
     for dll in sorted(glob.glob(os.path.join(build_dir, "*.dll"))):
@@ -89,11 +104,29 @@ with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as z:
         z.write(dll, arcname=f"IrisWinds/{dll_name}")
         print(f"  + IrisWinds/{dll_name}")
 
-    # Add any fonts or ini files if present
-    for extra in sorted(glob.glob(os.path.join(build_dir, "*.ttf")) + glob.glob(os.path.join(build_dir, "*.ini"))):
+    # Add fonts and licenses
+    for extra in sorted(glob.glob(os.path.join(build_dir, "*.ttf")) + 
+                        glob.glob(os.path.join(build_dir, "*.txt")) + 
+                        glob.glob(os.path.join(build_dir, "*.ini"))):
         extra_name = os.path.basename(extra)
         z.write(extra, arcname=f"IrisWinds/{extra_name}")
         print(f"  + IrisWinds/{extra_name}")
+
+    # Add builder directories recursively
+    for d in include_dirs:
+        dir_path = os.path.join(build_dir, d)
+        if os.path.isdir(dir_path):
+            count = 0
+            for root, dirs, files in os.walk(dir_path):
+                for f in files:
+                    full_p = os.path.join(root, f)
+                    rel_p = os.path.relpath(full_p, build_dir)
+                    arc = "IrisWinds/" + rel_p.replace(os.sep, "/")
+                    z.write(full_p, arcname=arc)
+                    count += 1
+            print(f"  + IrisWinds/{d}/ ({count} files included)")
+        else:
+            print(f"  ! Warning: builder directory {d} missing from {build_dir}")
 
 zip_size_mb = os.path.getsize(zip_path) / (1024 * 1024)
 print(f"==> Package created successfully: {zip_path} ({zip_size_mb:.2f} MB)")
