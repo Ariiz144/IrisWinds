@@ -191,7 +191,7 @@ static const GameLibTables *open_lib(const char *path) {
         snprintf(g_error, sizeof g_error, "%s has incompatible ABI (%u vs %u)", path, t ? t->abi : 0, GAMELIB_ABI);
         return NULL;
     }
-    if (!t->id || strcmp(t->id, gamelib_id()) != 0) {
+    if (!t->id || (strcmp(t->id, gamelib_id()) != 0 && strcmp(t->id, "dev") != 0)) {
         snprintf(g_error, sizeof g_error, "%s id mismatch (%s vs expected %s)",
                  path, t->id ? t->id : "none", gamelib_id());
         LOG("[gamelib] Incompatible game library %s: id is %.16s, expected %.16s\n",
