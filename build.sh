@@ -13,9 +13,14 @@ JOBS=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
 ACTION="${1:-build}"
 
 sync_runtime() {
-    echo "==> Syncing runtime DLLs and assets to build/..."
+    echo "==> Syncing runtime DLLs and assets..."
+    # Auto-bundle all DLL dependencies
+    if [ -f "tools/list_dlls.py" ]; then
+        python tools/list_dlls.py 2>/dev/null || true
+    fi
     if [ -d "build/dist/IrisWinds" ]; then
         cp -u build/dist/IrisWinds/*.dll build/ 2>/dev/null || true
+        cp -u build/*.dll build/dist/IrisWinds/ 2>/dev/null || true
         cp -u build/dist/IrisWinds/*.ttf build/ 2>/dev/null || true
         cp -u build/dist/IrisWinds/*.png build/ 2>/dev/null || true
         cp -u build/dist/IrisWinds/*.jpg build/ 2>/dev/null || true
@@ -44,7 +49,7 @@ case "$ACTION" in
     dist)
         echo "==> Building and packaging IrisWinds distribution ($JOBS parallel jobs)..."
         make RELEASE=1 -j"$JOBS"
-        python3 -c '
+        python -c '
 import os, shutil
 b = "build"
 d = "build/dist/IrisWinds"
