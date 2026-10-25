@@ -231,7 +231,11 @@ static void create_device(void) {
     // headers before 1.4.321) it is in ATTACHMENT_FEEDBACK_LOOP_OPTIMAL for the passes that loop (g_vk.feedback_layout,
     // exec.c begin_pass): on the Steam Deck the copies were half of the GPU's frame. SAVAGEWIND_VK_NO_FEEDBACK_LOOP=1:
     // copies, as before; SAVAGEWIND_VK_FEEDBACK_LAYOUT=1: the layout path where unified layouts exist too (testing).
-    bool fbl = !getenv("SAVAGEWIND_VK_NO_FEEDBACK_LOOP") && has_ext(ep, ne, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME) &&
+    // A BOTW test on the target Intel Iris Xe reported artifacts and an igvk64.dll access violation while this path
+    // was active; the user reported Step 3's snapshot-copy path removed the artifacts. Use copies by default on Intel.
+    bool intel_feedback = g_vk.props.vendorID == 0x8086;
+    bool fbl = !intel_feedback && !getenv("SAVAGEWIND_VK_NO_FEEDBACK_LOOP") &&
+               has_ext(ep, ne, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME) &&
                has_ext(ep, ne, VK_KHR_DYNAMIC_RENDERING_LOCAL_READ_EXTENSION_NAME);
 #ifdef VK_KHR_unified_image_layouts
     bool uil = fbl && !getenv("SAVAGEWIND_VK_FEEDBACK_LAYOUT") && has_ext(ep, ne, VK_KHR_UNIFIED_IMAGE_LAYOUTS_EXTENSION_NAME);
