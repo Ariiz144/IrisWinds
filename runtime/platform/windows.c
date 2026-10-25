@@ -145,12 +145,13 @@ static void log_to_file_without_console(void) {
     if (!n || n >= sizeof exe) return;
     char *slash = strrchr(exe, '\\');
     if (slash) slash[1] = 0;
-    snprintf(g_log_path, sizeof g_log_path, "%ssavagewind.log", exe);
-    bool append = getenv("SAVAGEWIND_LOG_APPEND") != NULL;
+    snprintf(g_log_path, sizeof g_log_path, "%siriswinds.log", exe);
+    bool append = getenv("SAVAGEWIND_LOG_APPEND") != NULL || getenv("IRISWINDS_LOG_APPEND") != NULL;
     if (!freopen(g_log_path, append ? "ab" : "wb", stderr)) { g_log_path[0] = 0; return; }
     setvbuf(stderr, NULL, _IONBF, 0);
     _dup2(_fileno(stderr), _fileno(stdout));
     _putenv("SAVAGEWIND_LOG_APPEND=1");
+    _putenv("IRISWINDS_LOG_APPEND=1");
 }
 
 // The recompiled game code is built for a target this CPU runs (runtime/gamelib.h): say so instead of crashing with an
@@ -295,7 +296,7 @@ void plat_print_backtrace(void) {
         const char *s = plat_symbol(pc, &off);
         if (!s) s = rt_host_fn_name(pc, &off);
         if (s) fprintf(stderr, "  #%-2d %016llx %s+%llx\n", i, (unsigned long long)pc, s, (unsigned long long)off);
-        else fprintf(stderr, "  #%-2d %016llx savagewind+%llx\n", i, (unsigned long long)pc,
+        else fprintf(stderr, "  #%-2d %016llx iriswinds+%llx\n", i, (unsigned long long)pc,
                      (unsigned long long)(pc - exe));
     }
 }

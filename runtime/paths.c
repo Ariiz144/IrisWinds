@@ -72,7 +72,7 @@ static bool writable(const char *dir) {
 
 static void fail(const char *msg) {
     fprintf(stderr, "%s\n", msg);
-    SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Savage Wind", msg, NULL);
+    SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "IrisWinds", msg, NULL);
     exit(1);
 }
 
@@ -88,16 +88,17 @@ void rt_paths_init(void) {
     }
     char root[1024];
     const char *env = getenv("SAVAGEWIND_DATA_ROOT");
+    if (!env || !*env) env = getenv("IRISWINDS_DATA_ROOT");
     if (env && *env) snprintf(root, sizeof root, "%s", env);
     else if (is_dir("extracted")) snprintf(root, sizeof root, "%s", g_start), g_dev = true;  // dev / portable: as before
     else {
 #ifdef _WIN32
         snprintf(root, sizeof root, "%s", g_exe_dir);
 #elif defined(__linux__)
-        // (the AppImage is read-only): $XDG_DATA_HOME/savagewind, ~/.local/share/savagewind by default
+        // (the AppImage is read-only): $XDG_DATA_HOME/iriswinds, ~/.local/share/iriswinds by default
         const char *xdg = getenv("XDG_DATA_HOME"), *home = getenv("HOME");
-        if (xdg && *xdg == '/') snprintf(root, sizeof root, "%s/savagewind", xdg);
-        else snprintf(root, sizeof root, "%s/.local/share/savagewind", home && *home ? home : "/tmp");
+        if (xdg && *xdg == '/') snprintf(root, sizeof root, "%s/iriswinds", xdg);
+        else snprintf(root, sizeof root, "%s/.local/share/iriswinds", home && *home ? home : "/tmp");
 #else
         const char *home = getenv("HOME");
         snprintf(root, sizeof root, "%s/Library/Application Support/" RT_BUNDLE_ID, home && *home ? home : "/tmp");
@@ -107,11 +108,11 @@ void rt_paths_init(void) {
     char msg[1400];
     if (!is_dir(root) || !writable(root) || chdir(root) != 0) {
 #ifdef _WIN32
-        snprintf(msg, sizeof msg, "Savage Wind can't write to its folder:\n%s\n\nIt keeps game files, saves and settings "
-                 "next to the program. Move the \"Savage Wind\" folder somewhere you can write to (e.g. Documents or "
+        snprintf(msg, sizeof msg, "IrisWinds can't write to its folder:\n%s\n\nIt keeps game files, saves and settings "
+                 "next to the program. Move the \"IrisWinds\" folder somewhere you can write to (e.g. Documents or "
                  "Desktop, not Program Files) and start it again.", root);
 #else
-        snprintf(msg, sizeof msg, "Savage Wind can't write to its data folder:\n%s", root);
+        snprintf(msg, sizeof msg, "IrisWinds can't write to its data folder:\n%s", root);
 #endif
         fail(msg);
     }

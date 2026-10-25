@@ -83,12 +83,12 @@ static void log_to_file_without_terminal(void) {
     struct stat st;
     if (env && *env) snprintf(dir, sizeof dir, "%s", env);
     else if (stat("extracted", &st) == 0 && S_ISDIR(st.st_mode)) return;  // dev mode: wherever stderr goes already
-    else if (xdg && *xdg == '/') snprintf(dir, sizeof dir, "%s/savagewind", xdg);
-    else snprintf(dir, sizeof dir, "%s/.local/share/savagewind", home && *home ? home : "/tmp");
+    else if (xdg && *xdg == '/') snprintf(dir, sizeof dir, "%s/iriswinds", xdg);
+    else snprintf(dir, sizeof dir, "%s/.local/share/iriswinds", home && *home ? home : "/tmp");
     for (char *c = dir + 1; *c; c++)
         if (*c == '/') { *c = 0; mkdir(dir, 0755); *c = '/'; }
     mkdir(dir, 0755);
-    snprintf(g_log_path, sizeof g_log_path, "%s/savagewind.log", dir);
+    snprintf(g_log_path, sizeof g_log_path, "%s/iriswinds.log", dir);
     bool append = getenv("SAVAGEWIND_LOG_APPEND") != NULL;
     if (!freopen(g_log_path, append ? "a" : "w", stderr)) { g_log_path[0] = 0; return; }
     dup2(STDERR_FILENO, STDOUT_FILENO);
@@ -176,7 +176,7 @@ void plat_print_backtrace(void) {
         if (!s && ours) s = rt_host_fn_name(pc, &off);
         const char *mod = di.dli_fname ? (strrchr(di.dli_fname, '/') ? strrchr(di.dli_fname, '/') + 1 : di.dli_fname) : "?";
         uint64_t moff = pc - (uint64_t)(uintptr_t)di.dli_fbase;
-        if (s && ours) fprintf(stderr, "  #%-2d %016llx %s+%llx (savagewind+%llx)\n", i, (unsigned long long)pc, s,
+        if (s && ours) fprintf(stderr, "  #%-2d %016llx %s+%llx (iriswinds+%llx)\n", i, (unsigned long long)pc, s,
                                (unsigned long long)off, (unsigned long long)moff);
         else if (s) fprintf(stderr, "  #%-2d %016llx %s+%llx (%s)\n", i, (unsigned long long)pc, s, (unsigned long long)off, mod);
         else fprintf(stderr, "  #%-2d %016llx %s+%llx\n", i, (unsigned long long)pc, mod, (unsigned long long)moff);

@@ -136,7 +136,8 @@ static bool exists(const char *p) {
 // The places to look, in order (gamelib.h). Returns how many were filled.
 static int candidates(const char *game_dir, char out[3][1100]) {
     int n = 0;
-    const char *env = getenv("SAVAGEWIND_GAME_LIB");
+    const char *env = getenv("IRISWINDS_GAME_LIB");
+    if (!env || !*env) env = getenv("SAVAGEWIND_GAME_LIB");
     if (env && *env) snprintf(out[n++], 1100, "%s", env);
     char exe_side[1024];
     if (rt_resource(GAMELIB_NAME, NULL, exe_side, sizeof exe_side) && exists(exe_side))
