@@ -79,8 +79,19 @@ static void create_instance(void) {
     if (ar) sscanf(ar, "%llx-%llx", (unsigned long long *)&g_addr_report_lo, (unsigned long long *)&g_addr_report_hi);
     if (validate || ar) ext[n_ext++] = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
     const char *layers[] = {"VK_LAYER_KHRONOS_validation"};
+    // The release as the application's and engine's version ("0.3.1-alpha.3": 0.3.103): drivers keep their shader
+    // caches per application, and with one version for every release AMD's Windows driver reused what it had cached
+    // for Alpha 2 in Alpha 3, built for another setup - a black window until the player reset that cache (#85)
+    extern const char *rt_version(void);  // runtime/ui/launcher.mm
+    unsigned vmaj = 0, vmin = 0, vpatch = 0, vpre = 0;
+    sscanf(rt_version(), "%u.%u.%u-%*[a-z].%u", &vmaj, &vmin, &vpatch, &vpre);
+    uint32_t ver = VK_MAKE_API_VERSION(0, vmaj, vmin, vpatch * 100 + vpre);
+    char engine[64];  // (the release in the engine's name too: whichever of the two a driver keys its cache on)
+    snprintf(engine, sizeof engine, "Savage Wind %s", rt_version());
     VkApplicationInfo app = {.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .pApplicationName = "Savage Wind",
-                             .pEngineName = "Savage Wind", .apiVersion = VK_API_VERSION_1_3};
+                             .applicationVersion = ver, .pEngineName = engine, .engineVersion = ver,
+                             .apiVersion = VK_API_VERSION_1_3};
+    LOG("[vk] application version %u.%u.%u (Savage Wind %s)\n", vmaj, vmin, vpatch * 100 + vpre, rt_version());
     VkInstanceCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app,
                                .enabledExtensionCount = n_ext, .ppEnabledExtensionNames = ext,
                                .enabledLayerCount = validate ? 1 : 0, .ppEnabledLayerNames = layers};
@@ -190,6 +201,18 @@ void vk_device_fault_report(void) {
 static void pipeline_cache_load(void);
 static void *pc_saver(void *arg);
 
+// RADV on a GCN chip (before RDNA): its name ends with the chip, "AMD Radeon RX 560 Series (RADV POLARIS11)"
+static bool radv_gcn(void) {
+    static const char *const gcn[] = {"TAHITI", "PITCAIRN", "VERDE", "OLAND", "HAINAN", "BONAIRE", "KAVERI", "KABINI",
+                                      "MULLINS", "HAWAII", "TONGA", "ICELAND", "CARRIZO", "FIJI", "STONEY", "POLARIS",
+                                      "VEGAM", "VEGA", "RAVEN", "RENOIR", "GFX8", "GFX9"};
+    const char *r = strstr(g_vk.props.deviceName, "(RADV ");
+    if (!r) return false;
+    for (size_t i = 0; i < sizeof gcn / sizeof *gcn; i++)
+        if (!strncmp(r + 6, gcn[i], strlen(gcn[i]))) return true;
+    return false;
+}
+
 static void create_device(void) {
     uint32_t ne = 0;
     vkEnumerateDeviceExtensionProperties(g_vk.phys, NULL, &ne, NULL);
@@ -214,13 +237,23 @@ static void create_device(void) {
         ext[n_ext++] = VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME;
         ext[n_ext++] = VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME;
     }
+#endif
+    VkPhysicalDeviceDriverProperties drv = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
     {
-        VkPhysicalDeviceDriverProperties drv = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
         VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &drv};
         vkGetPhysicalDeviceProperties2(g_vk.phys, &p2);
-        g_vk.radv = drv.driverID == VK_DRIVER_ID_MESA_RADV;
     }
+#ifdef __linux__
+    g_vk.radv = drv.driverID == VK_DRIVER_ID_MESA_RADV;
 #endif
+    // AMD's and Intel's Windows drivers showed only a black window from Alpha 3 on (the start screen too; RX 6600,
+    // RX 6800, RX 9060 XT / 9070 XT, ROG Ally, a Celeron: issues #85, #96), where Alpha 2 drew. Alpha 3 turned three
+    // things on there: maintenance5, graphics pipeline libraries and attachment feedback loops. Those drivers get
+    // Alpha 2's setup again: none of the three. SAVAGEWIND_VK_M5=1 / _GPL=1 / _FEEDBACK_LOOP=1 turn one back on;
+    // SAVAGEWIND_VK_LEGACY=1 gives any GPU that setup (tests).
+    bool win_legacy = drv.driverID == VK_DRIVER_ID_AMD_PROPRIETARY || drv.driverID == VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS ||
+                      getenv("SAVAGEWIND_VK_LEGACY");
+    if (win_legacy) LOG("[vk] %s: maintenance5, pipeline libraries and feedback loops left off\n", drv.driverName);
     bool fault = has_ext(ep, ne, VK_EXT_DEVICE_FAULT_EXTENSION_NAME);  // device-lost diagnostics (vk_device_fault_report)
     if (fault) ext[n_ext++] = VK_EXT_DEVICE_FAULT_EXTENSION_NAME;
     g_fault_ext = fault;
@@ -228,21 +261,26 @@ static void create_device(void) {
     // size is undefined, and on RADV with graphics pipeline libraries the GPU hung within the first frames (Steam Deck).
     // With it the size is 1.0, as on the Switch.
     bool m5 = false;
-    if (has_ext(ep, ne, VK_KHR_MAINTENANCE_5_EXTENSION_NAME)) {
+    if (has_ext(ep, ne, VK_KHR_MAINTENANCE_5_EXTENSION_NAME) && !(win_legacy && !getenv("SAVAGEWIND_VK_M5"))) {
         VkPhysicalDeviceMaintenance5FeaturesKHR m5_have = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR};
         VkPhysicalDeviceFeatures2 f2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &m5_have};
         vkGetPhysicalDeviceFeatures2(g_vk.phys, &f2);
         m5 = m5_have.maintenance5;
     }
     if (m5) ext[n_ext++] = VK_KHR_MAINTENANCE_5_EXTENSION_NAME;
-    LOG("[vk] maintenance5 %s\n", m5 ? "on (unwritten point size is 1.0)" : "not supported");
+    LOG("[vk] maintenance5 %s\n", m5 ? "on (unwritten point size is 1.0)" : win_legacy ? "off" : "not supported");
     // Color targets a draw samples while it writes them (exec.c resolve_feedback): a feedback loop with a barrier
     // inside the pass between such draws, instead of a copy of the target before each one. With
     // VK_KHR_unified_image_layouts the target stays in GENERAL layout. Without it (RADV, AMD's Windows driver; Vulkan
     // headers before 1.4.321) it is in ATTACHMENT_FEEDBACK_LOOP_OPTIMAL for the passes that loop (g_vk.feedback_layout,
     // exec.c begin_pass): on the Steam Deck the copies were half of the GPU's frame. SAVAGEWIND_VK_NO_FEEDBACK_LOOP=1:
     // copies, as before; SAVAGEWIND_VK_FEEDBACK_LAYOUT=1: the layout path where unified layouts exist too (testing).
-    bool fbl = !getenv("SAVAGEWIND_VK_NO_FEEDBACK_LOOP") && has_ext(ep, ne, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME) &&
+    // RADV on GCN chips (Polaris, Vega and older) drew the loops wrong: the pause menus' blurred background came out
+    // black and their cursor off its slot (RX 560, issue #90); RDNA (the Steam Deck, a 660M) is fine. Those take the
+    // copies; SAVAGEWIND_VK_FEEDBACK_LOOP=1 turns the loops on there anyway.
+    bool gcn_off = (radv_gcn() || win_legacy) && !getenv("SAVAGEWIND_VK_FEEDBACK_LOOP");
+    bool fbl = !getenv("SAVAGEWIND_VK_NO_FEEDBACK_LOOP") && !gcn_off &&
+               has_ext(ep, ne, VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME) &&
                has_ext(ep, ne, VK_KHR_DYNAMIC_RENDERING_LOCAL_READ_EXTENSION_NAME);
 #ifdef VK_KHR_unified_image_layouts
     bool uil = fbl && !getenv("SAVAGEWIND_VK_FEEDBACK_LAYOUT") && has_ext(ep, ne, VK_KHR_UNIFIED_IMAGE_LAYOUTS_EXTENSION_NAME);
@@ -251,7 +289,7 @@ static void create_device(void) {
 #endif
     // Pipelines linked from shaders compiled apart from the fixed state (exec.c, graphics pipeline libraries), when
     // the driver links them fast. SAVAGEWIND_VK_NO_GPL=1: whole pipelines, as before.
-    bool gpl = !getenv("SAVAGEWIND_VK_NO_GPL") && has_ext(ep, ne, VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME) &&
+    bool gpl = !getenv("SAVAGEWIND_VK_NO_GPL") && !(win_legacy && !getenv("SAVAGEWIND_VK_GPL")) && has_ext(ep, ne, VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME) &&
                has_ext(ep, ne, VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME);
     // when each frame reached the display (SAVAGEWIND_LOG_PRESENT, tests: "present timing" below)
     bool pwait = getenv("SAVAGEWIND_LOG_PRESENT") && has_ext(ep, ne, VK_KHR_PRESENT_ID_EXTENSION_NAME) &&
@@ -297,7 +335,8 @@ static void create_device(void) {
         if (uil) ext[n_ext++] = VK_KHR_UNIFIED_IMAGE_LAYOUTS_EXTENSION_NAME;
 #endif
     }
-    LOG("[vk] attachment feedback loops %s\n", !g_vk.feedback_loop ? "off (target copies)"
+    LOG("[vk] attachment feedback loops %s\n", gcn_off ? win_legacy ? "off (target copies)" : "off on this GCN chip (target copies)"
+                                               : !g_vk.feedback_loop ? "off (target copies)"
                                                : g_vk.feedback_layout ? "on (feedback loop layout)" : "on");
     VkPhysicalDeviceVertexAttributeDivisorFeaturesEXT div = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_EXT,
@@ -311,7 +350,7 @@ static void create_device(void) {
     VkPhysicalDeviceVulkan13Features f13 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
                                             .dynamicRendering = VK_TRUE, .synchronization2 = VK_TRUE,
                                             .shaderDemoteToHelperInvocation = VK_TRUE, .shaderTerminateInvocation = VK_TRUE,
-                                            .maintenance4 = VK_TRUE, .pipelineCreationCacheControl = VK_TRUE,
+                                            .maintenance4 = VK_TRUE, .pipelineCreationCacheControl = g_vk.gpl,
                                             .pNext = m5 ? (void *)&m5_on : g_vk.custom_border ? (void *)&cbc
                                                                          : g_vk.divisor ? (void *)&div : NULL};
     VkPhysicalDeviceVulkan12Features f12 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,

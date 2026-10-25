@@ -121,6 +121,11 @@ typedef struct TexBackend {
     bool kept;                   // parked past PARK_FRAMES with its contents (textures.c idle_expire)
     uint64_t drawn_frame, prev_drawn;  // last two frames a pass drew into it (exec.c: one-shot draws)
     uint64_t serial;             // which image this is: every image made gets a new one (exec.c's linear targets)
+    // A compressed image drawn into through an uncompressed view of its blocks (a texel a block: BOTW encodes its NPC
+    // speech bubbles to BC4 on the GPU that way). Vulkan draws into no compressed image: the draw goes into this
+    // block-sized image instead, copied into this one after the pass (textures.c block_view, vk_block_flush).
+    struct TexBackend *block;
+    bool block_pending;          // (exec.c) the attachment view just made is block's: copy it after the pass
 } TexBackend;
 
 TexBackend *vk_tex(NvnTexture *t, bool for_render);  // backend image (uploads CPU contents unless for_render)
@@ -132,7 +137,8 @@ VkComponentMapping vk_sample_swizzle(NvnTexture *t, const NvnTextureView *v);  /
 VkImageView vk_image_view(TexBackend *b, VkImageViewType type, VkFormat fmt, uint32_t lv0, uint32_t nlv, uint32_t ly0,
                           uint32_t nly, VkComponentMapping sw, VkImageAspectFlags aspect);
 VkImageView vk_dummy_view(int textype);
-VkSampler vk_sampler(NvnSamplerDesc *d);
+void vk_block_flush(VkCommandBuffer cb, TexBackend *b);  // (outside a pass) b->block's texels into b's blocks
+VkSampler vk_sampler(NvnSamplerDesc *d, bool aniso_ok);  // (aniso_ok: Video > Anisotropic filtering may apply)
 VkSampler vk_default_sampler(bool linear);
 void vk_image_init_layout(VkCommandBuffer cb, VkImage img, VkImageAspectFlags aspect);
 // Destruction once every submission that may use the object has completed.

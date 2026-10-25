@@ -230,6 +230,13 @@ bool menu_handle_event(const SDL_Event *e) {
             return true;
         }
         ImGuiKey k = key_from_scancode(e->key.scancode);
+        if (g_sizes.load()) {  // Window size's list (in game): the keys bound to A, B and up / down work it too
+            int sc = e->key.scancode;
+            if (sc == g_bind_key[BIND_A]) k = ImGuiKey_Enter;
+            else if (sc == g_bind_key[BIND_B]) k = ImGuiKey_Escape;
+            else if (sc == g_bind_key[BIND_LS_UP] || sc == g_bind_key[BIND_UP]) k = ImGuiKey_UpArrow;
+            else if (sc == g_bind_key[BIND_LS_DOWN] || sc == g_bind_key[BIND_DOWN]) k = ImGuiKey_DownArrow;
+        }
         if (k != ImGuiKey_None) { QEvent q = {}; q.kind = QEvent::KEY; q.key = k; q.down = down; push(q); }
         return true;
     }
@@ -248,6 +255,11 @@ bool menu_handle_event(const SDL_Event *e) {
         }
         if (!capturing()) return false;
         ImGuiKey k = key_from_pad(e->gbutton.button);
+        if (g_sizes.load()) {  // Window size's list (in game): the buttons bound to A and B, wherever they are
+            int b = e->gbutton.button;
+            if (b == g_bind_pad[BIND_A]) k = ImGuiKey_GamepadFaceDown;
+            else if (b == g_bind_pad[BIND_B]) k = ImGuiKey_GamepadFaceRight;
+        }
         if (k != ImGuiKey_None) { QEvent q = {}; q.kind = QEvent::KEY; q.key = k; q.down = down; push(q); }
         return true;
     }
@@ -801,6 +813,10 @@ static void tab_about(void) {
     float sens = roundf(g_settings.mouse_sens * 100);
     if (opt_slider("Mouse sensitivity", &sens, 10, 1000, 5, MOUSE_SENS_DEFAULT * 100, "%g%%", "How fast the mouse turns the camera."))
         g_settings.mouse_sens = sens / 100.0f;
+    float sens_y = roundf(g_settings.mouse_sens_y * 100);
+    if (opt_slider("Mouse vertical sensitivity", &sens_y, 50, 200, 5, 100, "%g%%",
+                   "Up and down, as a percentage of the mouse sensitivity."))
+        g_settings.mouse_sens_y = sens_y / 100.0f;
     toggle("Invert mouse Y", &g_settings.mouse_invert_y);
     ImGui::Spacing();
     header("Controls");

@@ -309,7 +309,8 @@ Pendiente:
      el ratón como cámara: con la ventana enfocada, sin menú y sin script, el cursor queda retenido (modo relativo de
      SDL) y su velocidad se vuelve el stick derecho (≈1200 px/s a fondo con sensibilidad 1, más un 12% para pasar la
      zona muerta del juego; `SAVAGEWIND_MOUSE_SCALE`, `SAVAGEWIND_MOUSE_DEADZONE`). Esc suelta el cursor y un clic
-     en la ventana lo vuelve a retener. Ajustes: `mouse_camera`, `mouse_sensitivity`, `mouse_invert_y`.
+     en la ventana lo vuelve a retener. Ajustes: `mouse_camera`, `mouse_sensitivity`, `mouse_vertical_sensitivity`
+     (el eje vertical, en fracción de la sensibilidad: 0,5 a 2) y `mouse_invert_y`.
    - Controles de movimiento (2026-10-22, `runtime/hle/motion.c`): BOTW importa cuatro funciones del sensor de seis
      ejes de nn::hid: `GetSixAxisSensorHandles` y `StartSixAxisSensor` (cuando cambia el estilo del mando,
      `FUN_7100d9e24c`), `GetSixAxisSensorStates` (cada frame, las 16 muestras más nuevas de cada handle) y
@@ -922,8 +923,13 @@ Pendiente:
      una copia del buffer del fragment shader (`sdw_patch`: busca el par exacto; ~10 por frame). El depth bias no se
      escala: la parte por pendiente ya depende del tamaño del píxel del mapa, y la constante (y el -0,002 que restan
      los shaders) es la de consola, que solo puede sobrar. Depth clamp sin cambios.
-     Lo demás que lee las cascadas: un downsample a 448x448x3 (`textureGather`, sin escalar: toma 2x2 texels del mapa
-     grande) y shaders de un solo tap sin offsets. Hay shaders con offsets fijos de ±1/4096 (sin constant buffer) para
+     Lo demás que lee las cascadas: un downsample a 448x448x3 R16 (`textureGather`, el máximo de cada 2x2) y shaders de
+     un solo tap sin offsets. El agua y las demás superficies forward (~20 fragment shaders) toman sus sombras de ese
+     downsample, con una sola muestra y coordenadas normalizadas: también va en `RS_SHADOW` (array 2D R16 cuadrado de
+     3 capas, sin flag de render target), escalado con el mismo factor que las cascadas (Extreme: 4096x4096x3). Sin
+     él, el agua seguía a resolución de consola (#101, 2026-10-25). La regla pide las 3 capas: una R16 de 1024x1024x8
+     que se rellena al cargar también casaba, y al cambiar el ajuste jugando se rehacía vacía y desaparecían el
+     terreno y la hierba. Hay shaders con offsets fijos de ±1/4096 (sin constant buffer) para
      otro mapa de sombras que no aparece en la meseta: si es de 2048, en Ultra quedaría con escalones (sin verificar).
      Pruebas: `SAVAGEWIND_SHADOW_AT=<frame presentado>:<console|high|ultra|extreme|ancho>,...` (A/B en una corrida),
      `SAVAGEWIND_NO_SHADOW_TEXEL_FIX=<frame presentado>` (el tamaño de texel del juego desde ese frame).
@@ -1170,6 +1176,11 @@ Pendiente:
        `MaxHartValue=120,CurrentHart=120`, 30 corazones). Usar con una copia de la partida
        (`SAVAGEWIND_SAVE_DIR`): al guardar, el juego escribe esos valores. Continuar con
        `SAVAGEWIND_INPUT="155:A:4,187:A:4,213:A:4"`.
+     - En Linux, `tools/linux/test_run.sh <carpeta de una ranura> [segundos]` hace todo eso con una copia de la
+       partida en `build/test_run/` (ini propio, ventana oculta, "Continuar" con A): jugable hacia el frame 1100,
+       ~30 s. Pasa las `SAVAGEWIND_*` que se le den (`SAVAGEWIND_TEST_WARP=hateno`…); `TEST_INPUT` añade botones
+       del juego (formato de `SAVAGEWIND_INPUT`, `1400:PLUS:6` abre la Alforja) y `SHOTS=<n>` captura cada n frames.
+       Ojo: `pad:` de `SAVAGEWIND_HOST_INPUT` usa nombres de SDL (`start`, `south`), no `PLUS`.
      - En Git Bash, `VAR=1 timeout 60 ./build/savagewind.exe` no le pasa la variable al programa: usar
        `timeout 60 env VAR=1 ./build/savagewind.exe`. Con `/c/msys64/usr/bin` primero en el PATH, `env` es el de
        MSYS2 y tampoco ve las variables exportadas desde Git Bash: pasarlas como argumentos de `env`.

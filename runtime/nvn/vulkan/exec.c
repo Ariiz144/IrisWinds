@@ -29,6 +29,8 @@ static uint8_t pass_color_unsynced;  // the color targets drawn or cleared since
 static uint8_t pass_feedback;        // the color targets (bits) the current pass began with a feedback loop enabled
 static TexBackend *pass_fbl[8];      // (g_vk.feedback_layout) its targets moved to ATTACHMENT_FEEDBACK_LOOP_OPTIMAL
 static int pass_nfbl;
+static TexBackend *pass_block[8];    // its targets drawn through a view of a compressed image's blocks (vk_block_flush)
+static int pass_nblock;
 static bool draw_feedback;           // the current draw samples a target it writes (its pipeline allows the loop)
 static uint64_t stat_upload_bytes;
 static uint64_t stat_sets, stat_sets_reused;  // descriptor sets asked for / shared with an identical one
@@ -1062,6 +1064,8 @@ static void vk_end_pass_at(int line) {
     in_pass = false;
     for (int i = 0; i < pass_nfbl; i++) feedback_layout_move(vk_cmd(), pass_fbl[i], false);
     pass_nfbl = 0;
+    for (int i = 0; i < pass_nblock; i++) vk_block_flush(vk_cmd(), pass_block[i]);
+    pass_nblock = 0;
     for (int i = 0; i < pass_nlinear; i++) readback_schedule(vk_cmd(), pass_linear[i], &pass_linear_view[i], pass_linear_has_view[i]);
     pass_nlinear = 0;
     // (debug frame) what the pass drew: its targets, as begin_pass recorded them (st.rt may name the next pass's)
@@ -1186,6 +1190,11 @@ static void begin_pass(void) {
         VkImageView v = vk_view(t, &st.rt.cview[i], st.rt.has_cview[i], true, TEXTYPE_2D);
         TexBackend *b = t->backend;
         if (b && b->drawn_frame != renderer_present_count()) { b->prev_drawn = b->drawn_frame; b->drawn_frame = renderer_present_count(); }
+        bool blocks = b && b->block_pending;  // (a view of a compressed image's blocks: drawn into b->block)
+        if (blocks) {
+            b->block_pending = false;
+            if (v && pass_nblock < 8) pass_block[pass_nblock++] = b;
+        }
         if (!v) continue;
         ca[i].imageView = v;
         ca[i].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
@@ -1216,6 +1225,7 @@ static void begin_pass(void) {
                       ? vk_format(st.rt.cview[i].format) : b->format;
         uint32_t lv = st.rt.has_cview[i] && (st.rt.cview[i].setmask & 1) ? st.rt.cview[i].base_level : 0;
         uint32_t ew = level_extent(b->width, lv), eh = level_extent(b->height, lv);
+        if (blocks) ew = b->block->width, eh = b->block->height;
         if (!w) { renderer_texture_scale(t, &pass_sx, &pass_sy); pass_out = b->rs_group == RS_OUT; w = ew; }
         if (ew < minw) minw = ew;
         if (eh < minh) minh = eh;
@@ -3339,6 +3349,14 @@ void vk_exec_reset(void) {
 static struct { NvnTexture *t; TexBackend *img; float sx, sy; } scene_up;
 static void scene_post(Prog *pr, CmdRec *r);
 
+// SAVAGEWIND_ANISO_ALL=<presented frame>: from then on every texture takes Video > Anisotropic filtering's override,
+// as before texture_info left some out (same-view A/B in one run)
+static bool aniso_all(void) {
+    static long long at = -1;
+    if (at < 0) at = getenv("SAVAGEWIND_ANISO_ALL") ? atoll(getenv("SAVAGEWIND_ANISO_ALL")) : 0;
+    return at && renderer_present_count() >= (uint64_t)at;
+}
+
 static void texture_info(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo *out, float sc[2], uint32_t wh[2]) {
     ShaderTexture *st_ = &si->tex[i];
     int slot = ((int)st_->handle_offset - 0x20) / 8;  // 64-bit handles from offset 0x20
@@ -3347,12 +3365,16 @@ static void texture_info(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo
     VkSampler smp = VK_NULL_HANDLE;
     VkImageLayout layout = VK_IMAGE_LAYOUT_GENERAL;
     uint32_t tic = h & 0xFFFFF, tsc = (uint32_t)(h >> 20) & 0xFFF;
+    // (vk_sampler's Video > Anisotropic filtering: not for textures with one mip level - the render targets BOTW reads
+    // back - nor in blended draws - particles, effects, decals - whose quads' square edges it brought out)
+    bool all = aniso_all(), aniso_ok = all || !(st.color_state[0] & 1);
     sc[0] = sc[1] = 1;
     wh[0] = wh[1] = 0;
     if (h && st.tpool && tic < (uint32_t)st.tpool->count) {
         NvnTexEntry *e = &((NvnTexEntry *)st.tpool->entries)[tic];
         NvnTexture *et = e->tex;  // (a finalized one too: textures.c gives it the image of its memory and shape)
         if (et) {
+            aniso_ok = aniso_ok && (all || (e->has_view && (e->view.setmask & 1) ? e->view.num_levels : et->levels) > 1);
             // Per-frame memo: ~2400 lookups per overworld frame recomputed the view (format / range math, cache
             // probe). The first lookup of a frame still runs vk_view (upload check); a view that may have been
             // destroyed (eviction, image re-created) bumps vk_view_gen. SAVAGEWIND_VK_NO_TEX_MEMO=1 disables.
@@ -3391,7 +3413,7 @@ static void texture_info(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo
                 }
         }
     }
-    if (h && st.spool && tsc < (uint32_t)st.spool->count) smp = vk_sampler(&((NvnSamplerDesc *)st.spool->entries)[tsc]);
+    if (h && st.spool && tsc < (uint32_t)st.spool->count) smp = vk_sampler(&((NvnSamplerDesc *)st.spool->entries)[tsc], aniso_ok);
     if (!view) view = vk_dummy_view(st_->type), layout = VK_IMAGE_LAYOUT_GENERAL;
     if (!smp) smp = vk_default_sampler(true);
     *out = (VkDescriptorImageInfo){smp, view, layout};
