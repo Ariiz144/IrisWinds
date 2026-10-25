@@ -70,6 +70,8 @@ void vk_wait_ready(void);  // until the main thread has made the window and devi
 void vk_full_barrier(VkCommandBuffer cb);
 void vk_end_pass(void);
 void vk_submit_extra(VkSemaphore wait, VkSemaphore signal, VkCommandBuffer extra);  // submit + one more cb (present)
+void vk_queue_lock(void);
+void vk_queue_unlock(void);
 void vk_present_idle(void);  // device.c: the presentation thread has no present queued or in progress
 void vk_dyn_forget(void);    // exec.c: graphics pipeline / dynamic state of the main command buffer changed elsewhere
 

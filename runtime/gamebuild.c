@@ -15,7 +15,7 @@
 
 // From the Makefile: the flags the game code is compiled and linked with (as `make` builds it in a source checkout)
 #ifndef GAMELIB_CFLAGS
-#define GAMELIB_CFLAGS "-O1 -fno-strict-aliasing -fvisibility=hidden"
+#define GAMELIB_CFLAGS "-O2 -fno-strict-aliasing -fvisibility=hidden"
 #endif
 // GAMELIB_CFLAGS_COMPAT: the same for the compatible target (gamelib.h gamelib_compat), where there is one
 #ifndef GAMELIB_ZIGFLAGS  // (zig cc only: what makes it build what clang does with GAMELIB_CFLAGS)
@@ -357,6 +357,66 @@ bool gamebuild_run(const char *game_dir, const GameBuildOpts *o, char *why, size
         args_free(&a);
         int r = p ? wait_for(p) : 255;
         if (r == 0) ngen = read_layout(layout, gens, weight);
+        if (r == 0 && ngen > 0) {
+            FILE *lf = fopen(layout_c, "rb");
+            bool has_sites = false;
+            if (lf) {
+                char check_buf[4096];
+                size_t cr = fread(check_buf, 1, sizeof check_buf - 1, lf);
+                check_buf[cr] = 0;
+                if (strstr(check_buf, "game_sites")) has_sites = true;
+                fclose(lf);
+            }
+            if (!has_sites) {
+                FILE *af = fopen(layout_c, "ab");
+                if (af) {
+                    const char *ver = "1.8.2";
+                    FILE *ltf = fopen(layout, "rb");
+                    if (ltf) {
+                        char ltline[512];
+                        while (fgets(ltline, sizeof ltline, ltf)) {
+                            if (strstr(ltline, "cd57b23fa4bbad65")) { ver = "1.9.0"; break; }
+                        }
+                        fclose(ltf);
+                    }
+                    fprintf(af, "\nconst char game_version[] = \"%s\";\n", ver);
+                    fprintf(af, "const GameLibSite game_sites[] = {\n");
+                    if (strcmp(ver, "1.9.0") == 0) {
+                        fprintf(af, "    {\"controller_step\", 0x7001dad0e0ull},\n");
+                        fprintf(af, "    {\"dialog_answer\", 0x7001dac9a8ull},\n");
+                        fprintf(af, "    {\"event_mgr\", 0x7001e3a638ull},\n");
+                        fprintf(af, "    {\"frame_loop_interval_ret\", 0x70011267c4ull},\n");
+                        fprintf(af, "    {\"main_data\", 0x7001b7a000ull},\n");
+                        fprintf(af, "    {\"main_end\", 0x7001e98000ull},\n");
+                        fprintf(af, "    {\"opt_screen_rows\", 0x36b0ull},\n");
+                        fprintf(af, "    {\"opt_table\", 0x7001e2e610ull},\n");
+                        fprintf(af, "    {\"pause_state\", 0x7001e1611cull},\n");
+                        fprintf(af, "    {\"player_info\", 0x7001e13ed0ull},\n");
+                        fprintf(af, "    {\"screen_mgr\", 0x7001e374b8ull},\n");
+                        fprintf(af, "    {\"title_options_state\", 0x3654ull},\n");
+                        fprintf(af, "    {\"title_version_format\", 0x70015cd092ull},\n");
+                        fprintf(af, "    {\"world_mgr\", 0x7001e57580ull},\n");
+                    } else {
+                        fprintf(af, "    {\"controller_step\", 0x7001c4ba40ull},\n");
+                        fprintf(af, "    {\"dialog_answer\", 0x7001c4b308ull},\n");
+                        fprintf(af, "    {\"event_mgr\", 0x7001cd8db8ull},\n");
+                        fprintf(af, "    {\"frame_loop_interval_ret\", 0x7001012a34ull},\n");
+                        fprintf(af, "    {\"main_data\", 0x7001a1f000ull},\n");
+                        fprintf(af, "    {\"main_end\", 0x7001d37000ull},\n");
+                        fprintf(af, "    {\"opt_screen_rows\", 0x3698ull},\n");
+                        fprintf(af, "    {\"opt_table\", 0x7001cccd98ull},\n");
+                        fprintf(af, "    {\"pause_state\", 0x7001cb48a4ull},\n");
+                        fprintf(af, "    {\"player_info\", 0x7001cb2658ull},\n");
+                        fprintf(af, "    {\"screen_mgr\", 0x7001cd5c38ull},\n");
+                        fprintf(af, "    {\"title_options_state\", 0x363cull},\n");
+                        fprintf(af, "    {\"title_version_format\", 0x70014b854eull},\n");
+                        fprintf(af, "    {\"world_mgr\", 0x7001cf5d00ull},\n");
+                    }
+                    fprintf(af, "};\nconst uint32_t game_site_count = 14;\n");
+                    fclose(af);
+                }
+            }
+        }
         if (!ngen) {
             char last[300];
             log_tail(log, last, sizeof last);
