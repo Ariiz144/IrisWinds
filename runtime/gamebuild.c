@@ -287,7 +287,9 @@ static PlatProc start_compile(const Tools *t, const Unit *u) {
     snprintf(inc, sizeof inc, "-I%s", t->inc);
     add(&a, inc);
     if (u->uses_gamelib_id) {
-        add(&a, "-DGAMELIB_ID=\"" GAMELIB_ID "\"");
+        char def[128];
+        snprintf(def, sizeof def, "-DGAMELIB_ID=\"%s\"", gamelib_id());
+        add(&a, def);
     }
     add(&a, "-c");
     add(&a, u->src);
@@ -527,7 +529,7 @@ bool gamebuild_run(const char *game_dir, const GameBuildOpts *o, char *why, size
         // compiles
         while (nrun < jobs && next < units.n) {
             Unit *u = &units.u[next];
-            if (recomp_cache_get_obj(u->src, u->stem, u->uses_gamelib_id, GAMELIB_ID, u->obj)) {
+            if (recomp_cache_get_obj(u->src, u->stem, u->uses_gamelib_id, gamelib_id(), u->obj)) {
                 done_bytes += u->bytes;
                 next++;
                 continue;
@@ -548,7 +550,7 @@ bool gamebuild_run(const char *game_dir, const GameBuildOpts *o, char *why, size
                 snprintf(why, why_size, "the game code didn't compile");
                 ok = false;
             } else {
-                recomp_cache_put_obj(u->src, u->stem, u->uses_gamelib_id, GAMELIB_ID, u->obj);
+                recomp_cache_put_obj(u->src, u->stem, u->uses_gamelib_id, gamelib_id(), u->obj);
             }
             done_bytes += u->bytes;
             run[k--] = run[--nrun];
@@ -627,7 +629,7 @@ bool gamebuild_run(const char *game_dir, const GameBuildOpts *o, char *why, size
         }
     }
     if (ok) {
-        if (!recomp_cache_promote_lib(tmp, lib, GAMELIB_ID, why, why_size)) {
+        if (!recomp_cache_promote_lib(tmp, lib, gamelib_id(), why, why_size)) {
             ok = false;
         }
         if (ok) {

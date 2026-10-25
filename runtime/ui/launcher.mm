@@ -516,8 +516,7 @@ check:
         if (why.empty() && g_settings.precompile_shaders && shader_precompile_available()) run_precompile();
 #endif
         if (why.empty()) set_job("Game files ready.");
-        else set_failure(why.find("NSO") != std::string::npos ? FAIL_VERSION
-                         : version_failure(why) ? version_failure(why) : FAIL_MISSING);
+        else explain_status(why);
     }
 done:
     pthread_mutex_lock(&g_lock);

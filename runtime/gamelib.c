@@ -114,7 +114,21 @@ static bool read_id(const char *lib, char id[128]) {
 
 static bool id_matches(const char *lib) {
     char id[128];
-    return read_id(lib, id) && !strcmp(id, gamelib_id());
+    if (!read_id(lib, id)) return false;
+    if (!strcmp(id, gamelib_id())) return true;
+    if (!strcmp(id, "dev")) {
+        // Automatically migrate legacy 'dev' id fallback to active identity
+        char id_path[1100];
+        snprintf(id_path, sizeof id_path, "%s.id", lib);
+        FILE *f = fopen(id_path, "wb");
+        if (f) {
+            fprintf(f, "%s\n", gamelib_id());
+            fclose(f);
+            LOG("[gamelib] migrated legacy 'dev' id to active identity %s\n", gamelib_id());
+            return true;
+        }
+    }
+    return false;
 }
 
 bool gamelib_other_cpu(const char *game_dir) {
