@@ -1066,6 +1066,29 @@ static void vk_end_pass_at(int line) {
     pass_nfbl = 0;
     for (int i = 0; i < pass_nlinear; i++) readback_schedule(vk_cmd(), pass_linear[i], &pass_linear_view[i], pass_linear_has_view[i]);
     pass_nlinear = 0;
+    if (pass_ds_written || pass_color_written) {
+        VkPipelineStageFlags2 src_stage = 0;
+        VkAccessFlags2 src_access = 0;
+        if (pass_ds_written) {
+            src_stage |= VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT;
+            src_access |= VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        }
+        if (pass_color_written) {
+            src_stage |= VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+            src_access |= VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+        }
+        VkMemoryBarrier2 mb = {
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+            .srcStageMask = src_stage,
+            .srcAccessMask = src_access,
+            .dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+            .dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT
+        };
+        VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb};
+        vkCmdPipelineBarrier2(vk_cmd(), &di);
+        pass_ds_written = false;
+        pass_color_written = 0;
+    }
     // (debug frame) what the pass drew: its targets, as begin_pass recorded them (st.rt may name the next pass's)
     if (g_debug_frame && pass_dbg_n && pass_dbg[0] && pass_dbg[0]->backend) {
         char path[256];
@@ -2166,7 +2189,8 @@ static VkResult create_pipeline_in(const PipeState *k, VkShaderModule vsm, VkSha
                                                  .depthClampEnable = k->depth_clamp && g_vk.depth_clamp,
                                                  .polygonMode = k->poly_fill ? VK_POLYGON_MODE_FILL : VK_POLYGON_MODE_LINE, .lineWidth = 1};
     VkPipelineMultisampleStateCreateInfo ms = {.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
-                                               .rasterizationSamples = (VkSampleCountFlagBits)k->samples, .alphaToCoverageEnable = k->a2c};
+                                               .rasterizationSamples = (VkSampleCountFlagBits)k->samples,
+                                               .alphaToCoverageEnable = (k->samples > 1 && k->a2c) ? VK_TRUE : VK_FALSE};
     VkPipelineDepthStencilStateCreateInfo ds = {.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
     VkPipelineColorBlendAttachmentState cba[8] = {0};
     for (uint32_t i = 0; i < k->ncolor; i++) {
@@ -2293,9 +2317,10 @@ static VkPipeline gpl_shader_lib(VkShaderModule m, int stage, VkPipelineLayout l
         return gpl_create(&pi, VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT, cache, &p) == VK_SUCCESS ? p : VK_NULL_HANDLE;
     }
     VkPipelineDepthStencilStateCreateInfo ds = {.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+    uint32_t smp = 1u << (variant >> 1);
     VkPipelineMultisampleStateCreateInfo ms = {.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
-                                               .rasterizationSamples = (VkSampleCountFlagBits)(1u << (variant >> 1)),
-                                               .alphaToCoverageEnable = variant & 1};
+                                               .rasterizationSamples = (VkSampleCountFlagBits)smp,
+                                               .alphaToCoverageEnable = (smp > 1 && (variant & 1)) ? VK_TRUE : VK_FALSE};
     VkPipelineDynamicStateCreateInfo dy = {.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
                                            .dynamicStateCount = sizeof DYN_FS / sizeof DYN_FS[0], .pDynamicStates = DYN_FS};
     pi.pDepthStencilState = &ds;
@@ -2309,7 +2334,7 @@ static int samples_log2(uint32_t n) { int l = 0; while ((1u << l) < n && l < 6) 
 // A stage's library for this state: made once (the first thread to make it keeps it)
 static VkPipeline gpl_stage_lib(StageBuild *b, int stage, const PipeState *s) {
     int variant = stage == STAGE_VERTEX ? (s->depth_clamp ? 1 : 0) | (s->poly_fill ? 2 : 0)
-                                        : (samples_log2(s->samples) << 1) | (s->a2c ? 1 : 0);
+                                        : (samples_log2(s->samples) << 1) | ((s->samples > 1 && s->a2c) ? 1 : 0);
     if (variant >= 8 || !b->lib_layout) return VK_NULL_HANDLE;
     uint64_t have = atomic_load(&b->lib[variant]);
     if (have) return (VkPipeline)(uintptr_t)have;
@@ -2350,7 +2375,7 @@ static VkPipeline gpl_state_lib(const PipeState *s, bool output) {
         k.samples = s->samples;
         memcpy(k.blend, s->blend, sizeof k.blend);
         k.blend_on = s->blend_on;
-        k.a2c = s->a2c;
+        k.a2c = s->samples > 1 ? s->a2c : 0;
         memcpy(k.write_mask, s->write_mask, sizeof k.write_mask);
     }
     uint64_t h = hash_words(output ? 0x5bd1e995u : 0x27d4eb2fu, &k, sizeof k);
@@ -2405,7 +2430,8 @@ static VkPipeline gpl_state_lib(const PipeState *s, bool output) {
         VkPipelineColorBlendStateCreateInfo cb = {.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
                                                   .attachmentCount = k.ncolor, .pAttachments = cba};
         VkPipelineMultisampleStateCreateInfo ms = {.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
-                                                   .rasterizationSamples = (VkSampleCountFlagBits)k.samples, .alphaToCoverageEnable = k.a2c};
+                                                   .rasterizationSamples = (VkSampleCountFlagBits)k.samples,
+                                                   .alphaToCoverageEnable = (k.samples > 1 && k.a2c) ? VK_TRUE : VK_FALSE};
         VkPipelineDynamicStateCreateInfo dy = {.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
                                                .dynamicStateCount = sizeof DYN_OUT / sizeof DYN_OUT[0], .pDynamicStates = DYN_OUT};
         VkPipelineRenderingCreateInfo ri = {.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, .colorAttachmentCount = k.ncolor,
@@ -3896,7 +3922,7 @@ static void warm_outs_init(void) {  // (from the pipeline list read at start)
         o.blend_on = r->u.g.blend_on;
         memcpy(o.blend, r->u.g.blend, sizeof o.blend);
         memcpy(o.write_mask, r->u.g.write_mask, sizeof o.write_mask);
-        o.a2c = r->u.g.a2c;
+        o.a2c = r->u.g.samples > 1 ? r->u.g.a2c : 0;
         int j = 0;
         while (j < nwarm_outs && !(warm_outs[j].omap == fi->out_mask && !memcmp(&warm_outs[j].s, &o, sizeof o))) j++;
         if (j == nwarm_outs) {
@@ -3997,7 +4023,7 @@ bool vk_pso_warm(const ShaderInfo *vi, const ShaderInfo *fi, const uint8_t attr_
             s.ncolor = o.ncolor; memcpy(s.color, o.color, sizeof s.color);
             s.depth = o.depth; s.stencil = o.stencil; s.samples = o.samples ? o.samples : 1;
             s.blend_on = o.blend_on; memcpy(s.blend, o.blend, sizeof s.blend); memcpy(s.write_mask, o.write_mask, sizeof s.write_mask);
-            s.a2c = o.a2c;
+            s.a2c = s.samples > 1 ? o.a2c : 0;
         } else {
             s.samples = 1;
             s.depth = VK_FORMAT_D32_SFLOAT;
@@ -4469,7 +4495,7 @@ static void draw_(CmdRec *r, bool indexed) {
             memcpy(k.s.blend[i] + 1, st.blend[i] + 1, 6);  // (the factors and ops; 0 is the target index, 7 padding)
         }
     }
-    k.s.a2c = st.ms[0xC] != 0;
+    k.s.a2c = (k.s.samples > 1 && (st.ms[0] & 1)) ? (st.ms[0xC] != 0) : 0;
     k.s.topo_class = cls;
     k.s.poly_fill = st.poly[2] != 1;
     pp = pipe_memo.pp;
@@ -4518,7 +4544,7 @@ have_pipe:
     // workaround: LESS_OR_EQUAL with a few ulps of bias towards the camera, which also let walls paint over the
     // plants stuck flat on them (beach) - so it is off.
     static int tol = -1;
-    if (tol < 0) tol = getenv("SAVAGEWIND_VK_EQUAL_TOL") != NULL;
+    if (tol < 0) tol = getenv("IRISWINDS_VK_EQUAL_TOL") != NULL || getenv("SAVAGEWIND_VK_EQUAL_TOL") != NULL;
     bool equal_tol = dop == VK_COMPARE_OP_EQUAL && tol;
     if (equal_tol) dop = VK_COMPARE_OP_LESS_OR_EQUAL;
     if (!DYN_SAME(dop, (uint32_t)dop)) vkCmdSetDepthCompareOp(cb, dop);
