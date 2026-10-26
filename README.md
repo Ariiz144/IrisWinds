@@ -43,6 +43,10 @@ mouse, and its text and voices in any of its languages.
 
 ## Getting started (Alpha 3)
 
+**You need:** a 64-bit CPU with SSE4.2 (AVX2 runs faster), a GPU with a Vulkan 1.3 driver, and 16 GB of RAM. With
+integrated graphics, which share the PC's RAM, 8 GB isn't enough: the game's 3 GB of memory has to stay available
+to the GPU ([#117](https://github.com/Revivedx/SavageWindRecomp/issues/117)).
+
 1. Download from [Releases](https://github.com/Revivedx/SavageWindRecomp/releases):
    - **Windows:** `SavageWind-0.3.0-alpha.3-windows.zip`. Extract it to a folder you can write to (not Program
      Files): your game files, saves and settings are kept in that folder.

@@ -196,6 +196,12 @@ void plat_fatal_notice(void) {
                          "(Windows resets a GPU after 2 seconds) or it ran out of video memory. Lower Video > Upscaler "
                          "quality and Shadow resolution, close other programs and update the driver; on a laptop, run "
                          "Savage Wind on the dedicated GPU.");
+            } else if (strstr(line, "GPU ran out of memory")) {  // (vk.h VK_CHECK: out of device or host memory, #117)
+                size_t l = strlen(text);
+                snprintf(text + l, sizeof text - l, "\n\nThe graphics card ran out of memory. Integrated graphics share the "
+                         "PC's RAM, and Savage Wind keeps the game's 3 GB of memory available to the GPU: with integrated "
+                         "graphics it needs 16 GB of RAM. Close other programs and lower Video > Shadow resolution and the "
+                         "upscaler quality; with a dedicated GPU, update its driver.");
             } else if (strstr(line, "Vulkan 1.3") || strstr(line, "vkCreateInstance")) {  // (no driver, or too old)
                 size_t l = strlen(text);
                 snprintf(text + l, sizeof text - l, "\n\nSavage Wind needs a graphics driver with Vulkan 1.3: install the "

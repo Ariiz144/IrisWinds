@@ -161,7 +161,24 @@ void plat_fatal_notice(void) {
     if (!g_log_path[0]) return;
     fflush(stderr);
     char text[1200];
-    snprintf(text, sizeof text, "Savage Wind stopped because of an error.\n\nDetails: %s", g_log_path);
+    // (the GPU out of memory, vk.h VK_CHECK: the reason a player can act on, #117)
+    bool oom = false;
+    FILE *f = fopen(g_log_path, "rb");
+    if (f) {
+        static char tail[8192];
+        fseek(f, 0, SEEK_END);
+        long sz = ftell(f);
+        fseek(f, sz > (long)sizeof tail - 1 ? sz - (long)sizeof tail + 1 : 0, SEEK_SET);
+        tail[fread(tail, 1, sizeof tail - 1, f)] = 0;
+        fclose(f);
+        oom = strstr(tail, "FATAL: the GPU ran out of memory") != NULL;
+    }
+    snprintf(text, sizeof text, "Savage Wind stopped because of an error.%s\n\nDetails: %s",
+             oom ? "\n\nThe graphics card ran out of memory. Integrated graphics share the PC's RAM, and Savage Wind keeps "
+                   "the game's 3 GB of memory available to the GPU: with integrated graphics it needs 16 GB of RAM. Close "
+                   "other programs and lower Video > Shadow resolution and the upscaler quality."
+                 : "",
+             g_log_path);
     SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Savage Wind", text, NULL);
 }
 
