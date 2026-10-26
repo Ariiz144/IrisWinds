@@ -71,7 +71,7 @@ void plat_thread_realtime(uint64_t period_ns) {
 }
 
 // ---- process
-// Started from a desktop (the AppImage) there is no terminal: stdout / stderr go to savagewind.log in the data folder
+// Started from a desktop (the AppImage) there is no terminal: stdout / stderr go to iriswinds.log in the data folder
 // (runtime/paths.h; rt_paths_init runs later, so the same rule is applied here). Processes started by this one (the
 // start screen re-executing itself for the game) append to the same log.
 static char g_log_path[1024];
@@ -79,20 +79,38 @@ static char g_log_path[1024];
 static void log_to_file_without_terminal(void) {
     if (isatty(STDERR_FILENO)) return;
     char dir[900];
-    const char *env = getenv("SAVAGEWIND_DATA_ROOT"), *xdg = getenv("XDG_DATA_HOME"), *home = getenv("HOME");
+    const char *env = getenv("IRISWINDS_DATA_ROOT"), *xdg = getenv("XDG_DATA_HOME"), *home = getenv("HOME");
+    if (!env || !*env) env = getenv("SAVAGEWIND_DATA_ROOT");
     struct stat st;
     if (env && *env) snprintf(dir, sizeof dir, "%s", env);
     else if (stat("extracted", &st) == 0 && S_ISDIR(st.st_mode)) return;  // dev mode: wherever stderr goes already
-    else if (xdg && *xdg == '/') snprintf(dir, sizeof dir, "%s/iriswinds", xdg);
-    else snprintf(dir, sizeof dir, "%s/.local/share/iriswinds", home && *home ? home : "/tmp");
+    else {
+        char legacy[900];
+        if (xdg && *xdg == '/') {
+            snprintf(dir, sizeof dir, "%s/iriswinds", xdg);
+            snprintf(legacy, sizeof legacy, "%s/savagewind", xdg);
+        } else {
+            const char *h = home && *home ? home : "/tmp";
+            snprintf(dir, sizeof dir, "%s/.local/share/iriswinds", h);
+            snprintf(legacy, sizeof legacy, "%s/.local/share/savagewind", h);
+        }
+        if (stat(dir, &st) != 0 && stat(legacy, &st) == 0 && S_ISDIR(st.st_mode))
+            snprintf(dir, sizeof dir, "%s", legacy);
+    }
     for (char *c = dir + 1; *c; c++)
         if (*c == '/') { *c = 0; mkdir(dir, 0755); *c = '/'; }
     mkdir(dir, 0755);
     snprintf(g_log_path, sizeof g_log_path, "%s/iriswinds.log", dir);
-    bool append = getenv("SAVAGEWIND_LOG_APPEND") != NULL;
+    bool append = getenv("SAVAGEWIND_LOG_APPEND") != NULL || getenv("IRISWINDS_LOG_APPEND") != NULL;
+    if (!append) {  // Keep the last run's log if a new setup attempt fails early.
+        char prev[1100];
+        snprintf(prev, sizeof prev, "%s/iriswinds.prev.log", dir);
+        rename(g_log_path, prev);
+    }
     if (!freopen(g_log_path, append ? "a" : "w", stderr)) { g_log_path[0] = 0; return; }
     dup2(STDERR_FILENO, STDOUT_FILENO);
     setenv("SAVAGEWIND_LOG_APPEND", "1", 1);
+    setenv("IRISWINDS_LOG_APPEND", "1", 1);
 }
 
 // The recompiled game code is built for a target this CPU runs (runtime/gamelib.h): say so instead of crashing with an
@@ -100,7 +118,7 @@ static void log_to_file_without_terminal(void) {
 static void require_cpu(void) {
     const char *need = gamelib_cpu_problem();
     if (!need) return;
-    fprintf(stderr, "FATAL: Savage Wind needs %s.\n", need);
+    fprintf(stderr, "FATAL: IrisWinds needs %s.\n", need);
     exit(1);
 }
 
@@ -143,7 +161,7 @@ void plat_exec(char *const argv[]) {
 // ---- diagnostics
 // Exported symbols only (the Makefile links with -rdynamic); frames in the generated code are left to the caller,
 // which maps them to guest functions (runtime/dispatch.c). Static runtime functions come out as the nearest guest
-// function, so backtrace lines also give the offset in the executable (addr2line -fe savagewind <offset>).
+// function, so backtrace lines also give the offset in the executable (addr2line -fe iriswinds <offset>).
 const char *plat_symbol(uint64_t pc, uint64_t *offset) {
     Dl_info di = {0};
     if (!dladdr((void *)(uintptr_t)pc, &di) || !di.dli_sname) return NULL;
@@ -156,8 +174,25 @@ void plat_fatal_notice(void) {
     if (!g_log_path[0]) return;
     fflush(stderr);
     char text[1200];
-    snprintf(text, sizeof text, "Savage Wind stopped because of an error.\n\nDetails: %s", g_log_path);
-    SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Savage Wind", text, NULL);
+    // (the GPU out of memory, vk.h VK_CHECK: the reason a player can act on, #117)
+    bool oom = false;
+    FILE *f = fopen(g_log_path, "rb");
+    if (f) {
+        static char tail[8192];
+        fseek(f, 0, SEEK_END);
+        long sz = ftell(f);
+        fseek(f, sz > (long)sizeof tail - 1 ? sz - (long)sizeof tail + 1 : 0, SEEK_SET);
+        tail[fread(tail, 1, sizeof tail - 1, f)] = 0;
+        fclose(f);
+        oom = strstr(tail, "FATAL: the GPU ran out of memory") != NULL;
+    }
+    snprintf(text, sizeof text, "IrisWinds stopped because of an error.%s\n\nDetails: %s",
+             oom ? "\n\nThe graphics card ran out of memory. Integrated graphics share the PC's RAM, and IrisWinds keeps "
+                   "the game's 3 GB of memory available to the GPU: with integrated graphics it needs 16 GB of RAM. Close "
+                   "other programs and lower Video > Shadow resolution and the upscaler quality."
+                 : "",
+             g_log_path);
+    SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "IrisWinds", text, NULL);
 }
 
 const char *rt_host_fn_name(uint64_t pc, uint64_t *offset);  // runtime/dispatch.c
@@ -247,7 +282,7 @@ int plat_proc_wait(PlatProc p, bool block) {
     pid_t r = waitpid((pid_t)p, &st, block ? 0 : WNOHANG);
     if (r == 0) return -1;
     if (r < 0) return 255;
-    return WIFEXITED(st) ? WEXITSTATUS(st) : 255;
+    return WIFEXITED(st) ? WEXITSTATUS(st) : WIFSIGNALED(st) ? 128 + (WTERMSIG(st) & 127) : 255;  // (as a shell: 137 = killed)
 }
 
 static int rm_entry(const char *path, const struct stat *sb, int flag, struct FTW *ftw) {

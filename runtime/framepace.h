@@ -16,6 +16,8 @@ bool framepace_in_event(void);
 bool framepace_title_ui(void);
 // The pause menu's pages or the map are up (16:9 layouts that cover the whole picture)
 bool framepace_menu_ui(void);
+// The game is paused (the pause menu, the map) or the start screen's menu is up
+bool framepace_paused(void);
 // present_pace: a frame was presented at t (plat_now_ns), on its pace's grid or not.
 void framepace_presented(uint64_t t, bool on_grid);
 

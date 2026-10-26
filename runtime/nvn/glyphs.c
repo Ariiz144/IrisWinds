@@ -665,7 +665,8 @@ bool glyphs_apply(uint64_t addr, uint64_t pool_lo, uint64_t pool_hi, uint32_t fo
 
 // Some prompts are not text: the HUD draws them with textures of its own layouts (Layout/Common.sblarc): the action
 // button ("Pick up", "Talk"...), the paraglider's button with its diamond of the others, the d-pad of the quick menus.
-// R8 coverage masks, a button glyph each, recognised by size and contents (as uploaded, deswizzled).
+// R8 coverage masks, a button glyph each, recognised by size and contents (as uploaded, deswizzled). The dim letters
+// of that diamond are text: runtime/services/fs.c (hud_letters_patch) makes them icon characters of this sheet.
 typedef struct { uint16_t w, h; uint64_t hash; int code; } LayoutIcon;
 static const LayoutIcon k_layout_icons[] = {
     {48, 48, 0x3cf281fb77fe6e1full, 0xE040},  // Nt_KeyTexA_00

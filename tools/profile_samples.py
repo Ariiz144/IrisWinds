@@ -4,7 +4,7 @@
 Usage: profile_samples.py [samples.txt] [--top N] [--thread HANDLE] [--busy]
 
 Addresses in the game library become f_<guest address> (its exported symbols, from `nm build/swgame.dll`), those in
-the runtime the runtime's functions (`nm build/savagewind.exe`). --busy leaves out samples whose top frames are a
+the runtime the runtime's functions (`nm build/iriswinds.exe`). --busy leaves out samples whose top frames are a
 wait (condition variables, sleeps), so the numbers are where the CPU goes.
 """
 import argparse
@@ -72,11 +72,11 @@ def main():
             threads[int(p[1])] = p[2]
         elif p[0] == 'S':
             samples.append((int(p[1]), [int(x, 16) for x in p[2:]]))
-    exe = Map(symbols(os.path.join(ROOT, 'build', 'savagewind.exe')), 0x140000000, bases.get('exe', 0x140000000))
+    exe = Map(symbols(os.path.join(ROOT, 'build', 'iriswinds.exe')), 0x140000000, bases.get('exe', 0x140000000))
     dll = Map(symbols(os.path.join(ROOT, 'build', 'swgame.dll')), 0x180000000, bases.get('swgame', 0x180000000))
     dll_lo = bases.get('swgame', 0)
     dll_size = image_size(os.path.join(ROOT, 'build', 'swgame.dll'))
-    exe_size = image_size(os.path.join(ROOT, 'build', 'savagewind.exe'))
+    exe_size = image_size(os.path.join(ROOT, 'build', 'iriswinds.exe'))
 
     def name(addr):
         if dll_lo and dll_lo <= addr < dll_lo + dll_size:

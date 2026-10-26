@@ -3,6 +3,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <string>
 
 #include "imgui.h"
@@ -135,6 +136,43 @@ bool opt_choice(const char *label, int *v, const char *const *names, int n, int 
     if (!step) return false;
     int nv = cur + (step == 2 ? 1 : step);
     nv = wrap ? (nv + n) % n : nv < 0 ? 0 : nv >= n ? n - 1 : nv;
+    if (nv == cur) return false;
+    *v = nv;
+    return true;
+}
+
+bool opt_list(const char *label, int *v, const char *const *names, int n, int def, const char *desc, bool *picked) {
+    int cur = *v >= 0 && *v < n ? *v : 0;
+    int step = row(label, tr(names[cur]), cur != def, desc, true, true);
+    *picked = false;
+    ImVec2 a = ImGui::GetItemRectMin(), b = ImGui::GetItemRectMax();
+    ImGui::PushID(label);
+    static bool test_open;  // (test: SAVAGEWIND_OPT_LIST=<label> opens that list once)
+    const char *t = getenv("SAVAGEWIND_OPT_LIST");
+    if (step == 2 || (t && !test_open && !strcmp(t, label) && (test_open = true))) ImGui::OpenPopup("##list");
+    int nv = step == 1 || step == -1 ? (cur + step + n) % n : cur;
+    // the list below the row (above it when there's no room), the current value selected and in view
+    float rows_h = ImGui::GetFrameHeightWithSpacing() * 12;
+    bool up = b.y + rows_h > ImGui::GetMainViewport()->WorkPos.y + ImGui::GetMainViewport()->WorkSize.y;
+    ImGui::SetNextWindowPos(up ? ImVec2(a.x, a.y) : ImVec2(a.x, b.y), ImGuiCond_Appearing, ImVec2(0, up ? 1.0f : 0.0f));
+    ImGui::SetNextWindowSizeConstraints(ImVec2(b.x - a.x, 0), ImVec2(b.x - a.x, rows_h));
+    ImVec4 bg = ImGui::GetStyleColorVec4(ImGuiCol_PopupBg);
+    bg.w = 1;  // (opaque: the rows below don't show through)
+    ImGui::PushStyleColor(ImGuiCol_PopupBg, bg);
+    ImGui::PushStyleColor(ImGuiCol_Border, ImGui::ColorConvertU32ToFloat4(kGold));
+    bool open = ImGui::BeginPopup("##list");
+    ImGui::PopStyleColor(2);
+    if (open) {
+        bool appearing = ImGui::IsWindowAppearing();
+        for (int i = 0; i < n; i++) {
+            ImGui::PushID(i);
+            if (ImGui::Selectable(tr(names[i]), i == cur)) nv = i, *picked = true;
+            if (i == cur && appearing) ImGui::SetItemDefaultFocus(), ImGui::SetScrollHereY(0.5f);
+            ImGui::PopID();
+        }
+        ImGui::EndPopup();
+    }
+    ImGui::PopID();
     if (nv == cur) return false;
     *v = nv;
     return true;

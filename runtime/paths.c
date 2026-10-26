@@ -87,8 +87,8 @@ void rt_paths_init(void) {
         if (s) *s = 0;
     }
     char root[1024];
-    const char *env = getenv("SAVAGEWIND_DATA_ROOT");
-    if (!env || !*env) env = getenv("IRISWINDS_DATA_ROOT");
+    const char *env = getenv("IRISWINDS_DATA_ROOT");
+    if (!env || !*env) env = getenv("SAVAGEWIND_DATA_ROOT");
     if (env && *env) snprintf(root, sizeof root, "%s", env);
     else if (is_dir("extracted")) snprintf(root, sizeof root, "%s", g_start), g_dev = true;  // dev / portable: as before
     else {
@@ -97,8 +97,16 @@ void rt_paths_init(void) {
 #elif defined(__linux__)
         // (the AppImage is read-only): $XDG_DATA_HOME/iriswinds, ~/.local/share/iriswinds by default
         const char *xdg = getenv("XDG_DATA_HOME"), *home = getenv("HOME");
-        if (xdg && *xdg == '/') snprintf(root, sizeof root, "%s/iriswinds", xdg);
-        else snprintf(root, sizeof root, "%s/.local/share/iriswinds", home && *home ? home : "/tmp");
+        char legacy[1024];
+        if (xdg && *xdg == '/') {
+            snprintf(root, sizeof root, "%s/iriswinds", xdg);
+            snprintf(legacy, sizeof legacy, "%s/savagewind", xdg);
+        } else {
+            const char *h = home && *home ? home : "/tmp";
+            snprintf(root, sizeof root, "%s/.local/share/iriswinds", h);
+            snprintf(legacy, sizeof legacy, "%s/.local/share/savagewind", h);
+        }
+        if (!is_dir(root) && is_dir(legacy)) snprintf(root, sizeof root, "%s", legacy);
 #else
         const char *home = getenv("HOME");
         snprintf(root, sizeof root, "%s/Library/Application Support/" RT_BUNDLE_ID, home && *home ? home : "/tmp");

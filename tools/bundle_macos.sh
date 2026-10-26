@@ -1,17 +1,17 @@
 #!/bin/bash
-# make app: build/Savage Wind.app from <exe> (default build/mac15/savagewind). Contents/MacOS: the executable;
+# make app: build/IrisWinds.app from <exe> (default build/mac15/iriswinds). Contents/MacOS: the executable;
 # Contents/Frameworks: every non-system dylib it loads (SDL3, FFmpeg; from build/deps, else Homebrew), load
 # paths rewritten to @rpath; Contents/Resources: the icon and what the start screen builds the game code with on the player's
 # machine (runtime/gamebuild.c): the generator helper (build/helper/swgen), the compiler (build/zig, tools/fetch_zig.sh)
 # and the headers the code is compiled against (gamelib-src/). Ad-hoc signed. No game files, game code or fonts: the
 # app keeps those in ~/Library/Application Support/<bundle id> (runtime/paths.h). One app: Option held while it opens
-# shows the configuration screen (runtime/ui/launcher.mm launcher_config_key_held), Windows' "Savage Wind Configuration".
+# shows the configuration screen (runtime/ui/launcher.mm launcher_config_key_held), Windows' "IrisWinds Configuration".
 # MACOS_MIN=<x.y>: LSMinimumSystemVersion, and every Mach-O inside must be built for it or older (else it fails and
 # lists them); without it the newest minimum found inside is used.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-EXE=${1:-build/mac15/savagewind}
-APP="build/Savage Wind.app"
+EXE=${1:-build/mac15/iriswinds}
+APP="build/IrisWinds.app"
 DEPS=$PWD/build/deps
 BUNDLE_ID=$(sed -n 's/^#define RT_BUNDLE_ID "\(.*\)"/\1/p' runtime/paths.h)
 VERSION=$(sed -n 's/^#define SAVAGEWIND_VERSION "\(.*\)"/\1/p' runtime/ui/launcher.mm)
@@ -33,8 +33,8 @@ if nm "$EXE" | grep ' _f_70' >/dev/null; then echo "$EXE has game code linked in
 rm -rf "$APP"
 C="$APP/Contents"
 mkdir -p "$C/MacOS" "$C/Frameworks" "$C/Resources"
-cp "$EXE" "$C/MacOS/savagewind"
-strip -S "$C/MacOS/savagewind"  # (debug-map entries only: the symbols crash reports name functions by stay)
+cp "$EXE" "$C/MacOS/iriswinds"
+strip -S "$C/MacOS/iriswinds"  # (debug-map entries only: the symbols crash reports name functions by stay)
 cp -R "$GEN_HELPER" "$C/Resources/swgen"
 cp -R "$ZIG" "$C/Resources/zig"
 mkdir "$C/Resources/gamelib-src"
@@ -42,6 +42,7 @@ cp runtime/cpu.h runtime/simd.h runtime/simd_fp.h runtime/simd_softfma.h runtime
    runtime/hle/hle_symbols.txt "$C/Resources/gamelib-src/"
 cp docs/icon/icon.icns "$C/Resources/icon.icns"
 cp docs/icon/icon_1024.png "$C/Resources/icon.png"  # (window / Dock icon at run time)
+cp docs/icon/splash.jpg "$C/Resources/splash.jpg"  # (IrisWinds start screen art)
 cp third_party/fonts/FiraSans/FiraSans-SemiBold.ttf third_party/fonts/FiraSans/FiraSans-Medium.ttf "$C/Resources/"  # (menus; OFL, README "License")
 cp third_party/fonts/FiraSans/OFL.txt "$C/Resources/FiraSans-OFL.txt"
 cp third_party/fonts/NotoSansThai/NotoSansThai-Medium.ttf "$C/Resources/"  # (Thai menus; OFL)
@@ -60,7 +61,7 @@ find_dep() {  # dep as referenced by (the original of) $2 -> a real file
 }
 deps_of() { otool -L "$1" | tail -n +2 | awk '{print $1}' | grep -v "^$(otool -D "$1" | tail -n +2 | head -1)\$" || true; }
 origin() { local s; s="$(dirname "$1")/.$(basename "$1").src"; if [ -f "$s" ]; then cat "$s"; else echo "$1"; fi; }
-queue="$C/MacOS/savagewind"
+queue="$C/MacOS/iriswinds"
 copied=" "
 while [ -n "$queue" ]; do
     f=${queue%%|*}; [ "$queue" = "$f" ] && queue= || queue=${queue#*|}
@@ -81,8 +82,8 @@ while [ -n "$queue" ]; do
 done
 rm -f "$C/Frameworks"/.*.src
 rpaths() { otool -l "$1" | awk '/LC_RPATH/ {getline; getline; print $2}'; }
-for r in $(rpaths "$C/MacOS/savagewind"); do install_name_tool -delete_rpath "$r" "$C/MacOS/savagewind"; done
-install_name_tool -add_rpath "@executable_path/../Frameworks" "$C/MacOS/savagewind"
+for r in $(rpaths "$C/MacOS/iriswinds"); do install_name_tool -delete_rpath "$r" "$C/MacOS/iriswinds"; done
+install_name_tool -add_rpath "@executable_path/../Frameworks" "$C/MacOS/iriswinds"
 for f in "$C/Frameworks"/*.dylib; do  # (their own build rpaths, if any: point them at the bundle instead)
     for r in $(rpaths "$f"); do install_name_tool -delete_rpath "$r" "$f"; done
     install_name_tool -add_rpath "@loader_path" "$f" 2>/dev/null || true
@@ -111,10 +112,10 @@ cat > "$C/Info.plist" <<EOF
 <plist version="1.0">
 <dict>
     <key>CFBundleDevelopmentRegion</key><string>en</string>
-    <key>CFBundleExecutable</key><string>savagewind</string>
+    <key>CFBundleExecutable</key><string>iriswinds</string>
     <key>CFBundleIdentifier</key><string>$BUNDLE_ID</string>
-    <key>CFBundleName</key><string>Savage Wind</string>
-    <key>CFBundleDisplayName</key><string>Savage Wind</string>
+    <key>CFBundleName</key><string>IrisWinds</string>
+    <key>CFBundleDisplayName</key><string>IrisWinds</string>
     <key>CFBundleIconFile</key><string>icon</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleShortVersionString</key><string>$VERSION</string>
@@ -131,7 +132,7 @@ printf 'APPL????' > "$C/PkgInfo"
 
 # ---- ad-hoc signature (Apple Silicon refuses to run unsigned code; the rewrites above invalidated the originals):
 # every Mach-O inside first, then the bundle
-while read -r f; do [ "$f" = "$C/MacOS/savagewind" ] || codesign -f -s - "$f" 2>/dev/null; done < <(machos)
+while read -r f; do [ "$f" = "$C/MacOS/iriswinds" ] || codesign -f -s - "$f" 2>/dev/null; done < <(machos)
 codesign -f -s - "$APP"
 codesign --verify --strict "$APP"
 if find "$APP" -name 'swgame*' | grep . >/dev/null; then echo "game code inside $APP"; exit 1; fi

@@ -153,7 +153,9 @@ static bool format_supports(VkFormat f, VkFormatFeatureFlags want) {
 //   RS_SCENE  the 3D scene's targets (1600x900 docked, and their fractions): the internal resolution, the window's
 //             with the upscaler off, smaller by the upscaler's factor with it on (exec.c upscales at the composite)
 //   RS_SHADOW shadow maps (BOTW's sun cascades: D16 896x896x3): Video > Shadow resolution, a width (2048 to 8192) they
-//             are made at instead of the game's; never smaller than the game's (output_scale.c shadow_map_size)
+//             are made at instead of the game's; never smaller than the game's (output_scale.c shadow_map_size). Also
+//             their half-size copy (R16 448x448x3, the max of each 2x2), at the same factor: water and the other
+//             forward-shaded surfaces take their shadows from it (issue #101)
 static float g_rs[4][2] = {{1, 1}, {1, 1}, {1, 1}, {1, 1}};
 static uint32_t g_shadow_size;
 void renderer_get_scale(float *sx, float *sy) { *sx = g_rs[RS_OUT][0]; *sy = g_rs[RS_OUT][1]; }
@@ -175,8 +177,33 @@ static bool rs_stale(const TexBackend *b) {
 // Which scale a texture takes (RS_*): the game's screen-sized targets are 16:9 2D images or 2D arrays (BOTW renders
 // some half-size passes into layers of 800x450x2 arrays) with the compressible flag (render targets) or the display
 // flag; shadow maps are square depth render targets, 512 or more (BOTW's sun cascades; its 192x192 depth target is no
-// shadow map). Everything else keeps its guest size: LUTs, cubemaps, the small odd-sized steps of the bloom and
-// exposure chains (sampled with normalized coordinates, they work at any size). SAVAGEWIND_NO_SCALE=1: none scaled.
+// shadow map), and the cascades' half-size copy is a square R16 2D array of 3 layers, one per cascade (no
+// render-target flag; a looser rule also took a 1024x1024x8 R16 array filled once at load, which a change of the
+// setting then made again empty: the terrain went). Everything else keeps its guest size: LUTs, cubemaps, the small
+// odd-sized steps of the bloom and exposure chains (sampled with normalized coordinates, they work at any size).
+// SAVAGEWIND_NO_SCALE=1: none scaled.
+// The sun cascades' half-size copy (R16 2D array of 3 layers, square, 256 or more: 448x448x3 in BOTW): a pass takes the
+// max of each 2x2 of the cascades into it, and water, terrain, grass and the other forward-shaded surfaces do their
+// shadow comparisons on it.
+bool vk_is_shadow_copy(const NvnTexture *t) {
+    return t && t->target == 4 && t->format == 0x06 && t->samples <= 1 && t->width == t->height && t->width >= 256 &&
+           t->depth == 3;
+}
+
+// Above the console's shadow resolution, the copy's readers compare against the cascades themselves (exec.c
+// shadow_copy_source): already a depth image, already at the chosen size, sampled at the same normalized coordinates and
+// layers. The copy stays at the game's size. Scaling the copy with the cascades instead (as before) made it 4096x4096x3
+// at Extreme, drawn every frame and sampled by every forward-shaded pixel: 1.5-1.7 ms of GPU on an RTX 5090 at
+// 5120x2160. SAVAGEWIND_NO_SHADOW_DIRECT=1: the scaled copy, as before.
+bool vk_shadow_direct(void) {
+    static int on = -1;
+    if (on < 0) on = getenv("SAVAGEWIND_NO_SHADOW_DIRECT") == NULL;
+    return on;
+}
+
+// The cascades t are made bigger than the game's (Shadow resolution above Console); at Console the copy's readers keep it
+bool vk_shadow_scaled(const NvnTexture *t) { return t && g_shadow_size > t->width; }
+
 static uint8_t tex_scale_group(const NvnTexture *t) {
     static int on = -1;
     if (on < 0) on = getenv("SAVAGEWIND_NO_SCALE") == NULL;
@@ -184,6 +211,7 @@ static uint8_t tex_scale_group(const NvnTexture *t) {
     if ((t->target == 1 || t->target == 4) && t->samples <= 1 && (t->flags & 8) && renderer_format_is_depth(t->format) &&
         t->width == t->height && t->width >= 512)
         return RS_SHADOW;
+    if (!vk_shadow_direct() && vk_is_shadow_copy(t)) return RS_SHADOW;  // (the copy's readers use the cascades instead)
     if ((t->target != 1 && t->target != 4) || t->samples > 1 || !(t->flags & 9) || t->width < 32 || t->height < 16) return RS_NONE;
     float a = (float)t->width / (float)t->height;
     if (a < 1.74f || a > 1.81f) return RS_NONE;
@@ -277,7 +305,8 @@ void vk_collect_dead(void) {
 static void create_image(NvnTexture *t, TexBackend *b) {
     VkFmt mf = fmt_of(t->format);
     b->scalable = b->rs_group != RS_NONE;
-    b->guest_w = t->width;
+    // (RS_SHADOW: the cascades' width, also for their half-size copy, so that both grow by the same factor)
+    b->guest_w = b->rs_group == RS_SHADOW && !renderer_format_is_depth(t->format) ? t->width * 2 : t->width;
     b->sx = rs_want(b, 0);
     b->sy = rs_want(b, 1);
     uint32_t tw = t->width ? t->width : 1, th = t->height ? t->height : 1;
@@ -403,6 +432,11 @@ static uint32_t level_w(const TexBackend *b, uint32_t lv) { uint32_t v = b->widt
 static uint32_t level_h(const TexBackend *b, uint32_t lv) { uint32_t v = b->height >> lv; return v ? v : 1; }
 
 static void destroy_image(TexBackend *b) {
+    if (b->block) {
+        destroy_image(b->block);
+        free(b->block);
+        b->block = NULL;
+    }
     views_forget(b);
     if (b->image || b->mem) defer((Dead){.img = b->image, .mem = b->mem});  // (never the same allocation twice)
     b->image = VK_NULL_HANDLE;
@@ -799,7 +833,6 @@ static void upload_levels(NvnTexture *t, TexBackend *b, uint32_t level_mask) {
             if (b->astc_bw) {  // blocks -> linear block rows -> RGBA8 texels
                 const uint8_t *src = (const uint8_t *)(uintptr_t)t->addr + layer * layer_size + l.offset;
                 uint8_t *blocks = malloc((uint64_t)l.wb * l.hb * 16);
-                if (!blocks) continue;
                 if (linear) for (uint32_t y = 0; y < l.hb; y++) memcpy(blocks + (uint64_t)y * l.wb * 16, src + (uint64_t)y * t->stride, l.wb * 16);
                 else tegra_deswizzle(src, blocks, l.wb, l.hb, 1, 16, l.block_height_log2, l.block_depth_log2);
                 VkSpan s = vk_transient((uint64_t)l.w * l.h * 4, 16);
@@ -818,7 +851,6 @@ static void upload_levels(NvnTexture *t, TexBackend *b, uint32_t level_mask) {
             uint32_t out_row = expand ? l.wb * 4 : row;
             VkSpan s = vk_transient((uint64_t)out_row * l.hb * l.d, 16);
             uint8_t *lin = expand ? malloc(sz) : s.ptr;
-            if (!lin) continue;
             const uint8_t *src = (const uint8_t *)(uintptr_t)t->addr + layer * layer_size + l.offset;
             if (linear) {
                 for (uint32_t y = 0; y < l.hb; y++) memcpy(lin + (uint64_t)y * row, src + (uint64_t)y * (t->stride ? t->stride : row), row);
@@ -934,8 +966,7 @@ void vk_trace_event(NvnTexture *t, uint64_t key, NvnTexture *const *srcs, int ns
         va_list ap;
         va_start(ap, fmt);
         vsnprintf(e + o, sizeof h->ev[0] - (size_t)o, fmt, ap);
-        va_end(ap);
-        for (int i = 0; i < nsrcs; i++) {
+        va_end(ap);        for (int i = 0; i < nsrcs; i++) {
             bool have = !srcs[i] || trace_mem(srcs[i]) == trace_mem(t);
             for (unsigned k = 0; k < TRACE_SRCS && !have; k++) have = h->src[k] == srcs[i];
             if (!have) h->src[h->nsrc++ % TRACE_SRCS] = srcs[i];
@@ -1116,6 +1147,53 @@ VkComponentMapping vk_sample_swizzle(NvnTexture *t, const NvnTextureView *v) {
     return sw;
 }
 
+static bool is_bc(VkFormat f) { return f >= VK_FORMAT_BC1_RGB_UNORM_BLOCK && f <= VK_FORMAT_BC7_SRGB_BLOCK; }
+
+// Attachment view for a draw into the blocks of BC image b, a texel a 4x4 block in format fmt (the game's view: RG32
+// for 8-byte blocks): a view of b->block, made for it, that vk_block_flush copies into b after the pass.
+static VkImageView block_view(TexBackend *b, VkFormat fmt) {
+    TexBackend *s = b->block;
+    if (s && s->format != fmt) {
+        destroy_image(s);
+        free(s);
+        s = b->block = NULL;
+    }
+    if (!s) {
+        if (!format_supports(fmt, VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT)) return VK_NULL_HANDLE;
+        s = calloc(1, sizeof *s);
+        s->format = fmt;
+        s->width = (b->width + 3) / 4, s->height = (b->height + 3) / 4;
+        s->depth = s->layers = s->levels = s->samples = 1;
+        s->aspect = VK_IMAGE_ASPECT_COLOR_BIT;
+        s->base_type = VK_IMAGE_VIEW_TYPE_2D;
+        VkImageCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D, .format = fmt,
+                                .extent = {s->width, s->height, 1}, .mipLevels = 1, .arrayLayers = 1,
+                                .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
+                                .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                                         VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT};
+        VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+        if (vmaCreateImage(g_vk.vma, &ci, &ai, &s->image, &s->mem, NULL) != VK_SUCCESS) {
+            free(s);
+            return VK_NULL_HANDLE;
+        }
+        vk_image_init_layout(vk_upload_cmd(), s->image, VK_IMAGE_ASPECT_COLOR_BIT);
+        b->block = s;
+    }
+    b->block_pending = true;
+    return vk_image_view(s, VK_IMAGE_VIEW_TYPE_2D, fmt, 0, 1, 0, 1, IDENTITY, VK_IMAGE_ASPECT_COLOR_BIT);
+}
+
+// A texel of b->block is a block of b: an image copy between the two formats moves texels into blocks as they are
+void vk_block_flush(VkCommandBuffer cb, TexBackend *b) {
+    TexBackend *s = b->block;
+    if (!s) return;
+    vk_full_barrier(cb);
+    VkImageCopy c = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                     .extent = {s->width, s->height, 1}};
+    vkCmdCopyImage(cb, s->image, VK_IMAGE_LAYOUT_GENERAL, b->image, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+    vk_full_barrier(cb);
+}
+
 // render: attachment view (one level, one layer). Otherwise a sampled view of type want_textype (TEXTYPE_*),
 // with the NVN component swizzle, converting between compatible types the way renderer.m does.
 VkImageView vk_view(NvnTexture *t, const NvnTextureView *v, bool has_view, bool render, int want_textype) {
@@ -1134,6 +1212,8 @@ VkImageView vk_view(NvnTexture *t, const NvnTextureView *v, bool has_view, bool 
     if (lv0 + nlv > b->levels) nlv = b->levels - lv0;
     if (ly0 >= b->layers) ly0 = b->layers - 1;
     if (ly0 + nly > b->layers) nly = b->layers - ly0;
+    if (render && fmt != b->format && is_bc(b->format) && !is_bc(fmt) && lv0 == 0 && b->layers == 1 && b->depth == 1)
+        return block_view(b, fmt);  // (drawn into through a view of its blocks)
     if (render) {
         if (b->base_type == VK_IMAGE_VIEW_TYPE_3D) {
             // One slice of one level (the view's layer is the slice), as a 2D view of the 2D-array-compatible image.
@@ -1219,11 +1299,15 @@ static VkCompareOp compare_op(uint32_t f) {
 // 2x .. 16x override it on texture samplers that filter linearly between mip levels or within one (ground, walls,
 // paths at a distance). Left alone: point-filtered samplers (pixel-exact data, some UI), samplers without mipmaps (the
 // UI, render targets read back), ones clamped to one mip level (BOTW reads its bloom and blur chains that way) and
-// depth-comparison ones (shadow maps).
-static float sampler_aniso(const NvnSamplerDesc *d) {
+// depth-comparison ones (shadow maps). And whatever the sampler (aniso_ok false, exec.c texture_info): textures with
+// one mip level - BOTW reads its render targets with samplers allowing the whole mip chain, and filtered that way
+// they put stepped light outlines along edges (around Link's bow and quiver most) - and the blended draws:
+// particles, effects, decals, whose quads' square edges the wider footprint brought out (floating dust as small
+// squares). Both the worse the higher the setting.
+static float sampler_aniso(const NvnSamplerDesc *d, bool aniso_ok) {
     float game = d->max_aniso > 1 ? fminf(d->max_aniso, 16) : 1;
     int a = g_settings.anisotropy;
-    if (a <= 0 || a > 4 || !g_vk.feat_aniso) return game;
+    if (a <= 0 || a > 4 || !g_vk.feat_aniso || !aniso_ok) return game;
     if (d->compare_mode || d->mag_filter != 1 || (d->min_filter != 3 && d->min_filter != 5)) return game;
     if (d->lod_max - d->lod_min < 0.5f) return game;
     return fminf((float)(1 << a), g_vk.props.limits.maxSamplerAnisotropy);
@@ -1237,12 +1321,14 @@ static pthread_mutex_t g_sampler_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static VkSampler sampler_create(const NvnSamplerDesc *d, float aniso);
 
-VkSampler vk_sampler(NvnSamplerDesc *d) {
-    float an = sampler_aniso(d);
-    if (d->backend && d->backend_aniso == an) return (VkSampler)d->backend;
+VkSampler vk_sampler(NvnSamplerDesc *d, bool aniso_ok) {
+    float an = sampler_aniso(d, aniso_ok);
+    void **slot = aniso_ok ? &d->backend : &d->backend_plain;
+    float *slot_aniso = aniso_ok ? &d->backend_aniso : &d->backend_plain_aniso;
+    if (*slot && *slot_aniso == an) return (VkSampler)*slot;
     NvnSamplerDesc key = *d;
-    key.backend = NULL;
-    key.backend_aniso = an;
+    key.backend = key.backend_plain = NULL;
+    key.backend_aniso = an, key.backend_plain_aniso = 0;
     pthread_mutex_lock(&g_sampler_lock);
     VkSampler s = VK_NULL_HANDLE;
     for (int i = 0; i < g_nsamplers && !s; i++)
@@ -1262,8 +1348,8 @@ VkSampler vk_sampler(NvnSamplerDesc *d) {
                      d->lod_max, d->lod_bias, d->max_aniso, an);
     }
     pthread_mutex_unlock(&g_sampler_lock);
-    d->backend = (void *)s;
-    d->backend_aniso = an;
+    *slot = (void *)s;
+    *slot_aniso = an;
     return s;
 }
 

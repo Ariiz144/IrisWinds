@@ -24,3 +24,8 @@ double upscale_factor(void);
 // Video > Shadow resolution: the width the game's shadow maps are made at from presented frame `frame` on (0: their
 // own size; vulkan/textures.c RS_SHADOW)
 unsigned shadow_map_size(unsigned long long frame);
+// The world camera's projection as last built (rt_persp: tan(fovy / 2) and aspect as drawn, near, far), for frame
+// generation's motion vectors (vulkan/framegen.c). false before the first one.
+typedef struct { float tan_half_fovy, aspect, near_, far_; unsigned long long serial; } WorldProj;
+void output_world_proj_set(float t, float a, float n, float f);
+bool output_world_proj(WorldProj *p);

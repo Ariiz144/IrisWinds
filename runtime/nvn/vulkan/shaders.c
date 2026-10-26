@@ -817,6 +817,27 @@ static const char *builtin_src(const char *name, int *stage) {
                "  o = vec4(clamp(r, 0.0, 1.0), e4.a);\n"
                "}\n";
     }
+    // Frame generation's camera motion vectors (exec.c vk_fg_generate): the 3D scene's depth at each pixel back to
+    // NDC, through m (the previous frame's view-projection x this one's inverse) to where that point was, as a uv
+    // offset (previous - this). b = depth size, the rows' direction in NDC (+1: row 0 at the bottom), 1 when the depth
+    // is OpenGL's -1..1 (NVN's default depth mode). Link's box (uv min, max) and depth range: his own motion there (lk.zw).
+    if (!strcmp(name, "fg_mv.frag")) {
+        *stage = STAGE_FRAGMENT;
+        return "#version 450\n"
+               "layout(set = 0, binding = 0) uniform sampler2D d;\n"
+               "layout(push_constant) uniform P { mat4 m; vec4 b; vec4 box; vec4 lk; } pc;\n"
+               "layout(location = 0) out vec2 o;\n"
+               "void main() {\n"
+               "  vec2 uv = gl_FragCoord.xy / pc.b.xy;\n"
+               "  float z = texelFetch(d, ivec2(gl_FragCoord.xy), 0).r;\n"
+               "  vec4 c = pc.m * vec4(uv.x * 2.0 - 1.0, (uv.y * 2.0 - 1.0) * pc.b.z, pc.b.w > 0.5 ? z * 2.0 - 1.0 : z, 1.0);\n"
+               "  vec2 p = c.xy / max(abs(c.w), 1e-6) * sign(c.w);\n"
+               "  o = vec2(p.x, p.y * pc.b.z) * 0.5 + 0.5 - uv;\n"
+               "  bool inbox = all(greaterThanEqual(uv, pc.box.xy)) && all(lessThanEqual(uv, pc.box.zw));\n"
+               "  if (inbox && z >= pc.lk.x && z <= pc.lk.y) o = pc.lk.zw;\n"
+               "  if (pc.b.w > 1.5) o = vec2(inbox ? 1.0 : 0.0, inbox && z >= pc.lk.x && z <= pc.lk.y ? 1.0 : 0.0);  // (debug)\n"
+               "}\n";
+    }
     if (!strcmp(name, "clear.vert")) {
         *stage = STAGE_VERTEX;
         return "#version 450\n"

@@ -22,6 +22,8 @@
 void vk_device_fault_report(void);
 #define VK_CHECK(x) do { VkResult r_ = (x); if (r_ != VK_SUCCESS) { if (r_ == VK_ERROR_DEVICE_LOST) { vk_device_fault_report(); \
     FATAL("Vulkan device lost: the GPU stopped responding (%s, %s:%d)\n", #x, __FILE__, __LINE__); } \
+    if (r_ == VK_ERROR_OUT_OF_DEVICE_MEMORY || r_ == VK_ERROR_OUT_OF_HOST_MEMORY) \
+        FATAL("the GPU ran out of memory (%s: %d, %s:%d)\n", #x, r_, __FILE__, __LINE__); \
     FATAL("%s failed: %d (%s:%d)\n", #x, r_, __FILE__, __LINE__); } } while (0)
 
 typedef struct {
@@ -70,8 +72,6 @@ void vk_wait_ready(void);  // until the main thread has made the window and devi
 void vk_full_barrier(VkCommandBuffer cb);
 void vk_end_pass(void);
 void vk_submit_extra(VkSemaphore wait, VkSemaphore signal, VkCommandBuffer extra);  // submit + one more cb (present)
-void vk_queue_lock(void);
-void vk_queue_unlock(void);
 void vk_present_idle(void);  // device.c: the presentation thread has no present queued or in progress
 void vk_dyn_forget(void);    // exec.c: graphics pipeline / dynamic state of the main command buffer changed elsewhere
 
@@ -123,6 +123,11 @@ typedef struct TexBackend {
     bool kept;                   // parked past PARK_FRAMES with its contents (textures.c idle_expire)
     uint64_t drawn_frame, prev_drawn;  // last two frames a pass drew into it (exec.c: one-shot draws)
     uint64_t serial;             // which image this is: every image made gets a new one (exec.c's linear targets)
+    // A compressed image drawn into through an uncompressed view of its blocks (a texel a block: BOTW encodes its NPC
+    // speech bubbles to BC4 on the GPU that way). Vulkan draws into no compressed image: the draw goes into this
+    // block-sized image instead, copied into this one after the pass (textures.c block_view, vk_block_flush).
+    struct TexBackend *block;
+    bool block_pending;          // (exec.c) the attachment view just made is block's: copy it after the pass
 } TexBackend;
 
 TexBackend *vk_tex(NvnTexture *t, bool for_render);  // backend image (uploads CPU contents unless for_render)
@@ -134,7 +139,8 @@ VkComponentMapping vk_sample_swizzle(NvnTexture *t, const NvnTextureView *v);  /
 VkImageView vk_image_view(TexBackend *b, VkImageViewType type, VkFormat fmt, uint32_t lv0, uint32_t nlv, uint32_t ly0,
                           uint32_t nly, VkComponentMapping sw, VkImageAspectFlags aspect);
 VkImageView vk_dummy_view(int textype);
-VkSampler vk_sampler(NvnSamplerDesc *d);
+void vk_block_flush(VkCommandBuffer cb, TexBackend *b);  // (outside a pass) b->block's texels into b's blocks
+VkSampler vk_sampler(NvnSamplerDesc *d, bool aniso_ok);  // (aniso_ok: Video > Anisotropic filtering may apply)
 VkSampler vk_default_sampler(bool linear);
 void vk_image_init_layout(VkCommandBuffer cb, VkImage img, VkImageAspectFlags aspect);
 // Destruction once every submission that may use the object has completed.
@@ -143,6 +149,9 @@ void vk_defer_view(VkImageView v);
 void vk_views_forget(TexBackend *b);  // drop (deferred) the cached views of an image being replaced
 void vk_make_scalable_like(NvnTexture *t, NvnTexture *like);  // a pass's attachments share one scale
 uint8_t vk_texture_scale_group(NvnTexture *t);
+bool vk_is_shadow_copy(const NvnTexture *t);  // the sun cascades' half-size R16 copy (textures.c)
+bool vk_shadow_direct(void);                  // its readers compare against the cascades (SAVAGEWIND_NO_SHADOW_DIRECT=1: off)
+bool vk_shadow_scaled(const NvnTexture *t);  // the cascades t are bigger than the game's (Shadow resolution above Console)
 void renderer_get_scene_scale(float *sx, float *sy);
 void renderer_set_scene_scale(float sx, float sy);
 void renderer_set_shadow_size(uint32_t n);  // shadow maps' width (RS_SHADOW; 0: the game's own)

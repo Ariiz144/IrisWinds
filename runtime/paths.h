@@ -1,12 +1,12 @@
-// Where Savage Wind keeps its files (runtime/paths.c).
+// Where IrisWinds keeps its files (runtime/paths.c).
 //
 // Data root: everything the app writes or the user brings - extracted/ (game files), save/,
-// cache/ (shaders / pipelines), fonts/ (imported), savagewind.ini. rt_paths_init() picks it and makes it the
+// cache/ (shaders / pipelines), fonts/ (imported), iriswinds.ini. rt_paths_init() picks it and makes it the
 // working directory, so the rest of the runtime opens those by their relative names. In order:
-//   1. SAVAGEWIND_DATA_ROOT (tests, scratch installs)
-//   2. dev / portable mode: the starting directory already has extracted/ (a source checkout: `./build/savagewind
+//   1. IRISWINDS_DATA_ROOT (legacy SAVAGEWIND_DATA_ROOT is also accepted)
+//   2. dev / portable mode: the starting directory already has extracted/ (a source checkout: `./build/iriswinds
 //      extracted`, the test scripts) - used as is
-//   3. macOS: ~/Library/Application Support/local.savagewind (the .app bundle itself is never written to)
+//   3. macOS: ~/Library/Application Support/local.savagewind (legacy id retained for existing data)
 //      Windows: the folder of the .exe (portable, no installer); refuses to start, with a message, if not writable
 //      Linux: $XDG_DATA_HOME/savagewind (~/.local/share/savagewind)
 //
@@ -32,8 +32,8 @@ bool rt_resource(const char *name, const char *dev_rel, char *out, size_t n);
 
 // The only way the app deletes game files. Removes the named entry of game_dir (an extracted/ folder) only if
 // game_dir is <data root>/extracted itself (symlinks resolved; a symlinked extracted/ is refused) and the entry is
-// one the setup creates (exefs, romfs, romfs.bin, leftover folders) and not a link. The folder the user picked
-// never gets here. true = removed or not there.
+// one the setup creates (exefs, romfs, leftover folders, an older version's romfs.bin) and not a link. The folder the
+// user picked never gets here. true = removed or not there.
 bool rt_remove_game_file(const char *game_dir, const char *name);
 // All the game files set up there (rt_remove_game_file on each, then the empty folder). Saves, settings stay.
 bool rt_remove_game_files(const char *game_dir);

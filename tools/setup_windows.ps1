@@ -1,4 +1,4 @@
-# One-time setup of a Windows machine for building Savage Wind (see docs/BUILD-windows.md).
+# One-time setup of a Windows machine for building IrisWinds (see docs/BUILD-windows.md).
 # Installs MSYS2 (clang, lld, make, SDL3, FFmpeg, Vulkan loader/headers, shaderc) and Python 3.12, then creates
 # tools/venv (lifter: unicorn, capstone, lz4). Safe to re-run.
 $ErrorActionPreference = 'Stop'

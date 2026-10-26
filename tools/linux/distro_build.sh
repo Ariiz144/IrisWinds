@@ -52,7 +52,7 @@ for image in $images; do
     if "$ENGINE" run --rm $PLATFORM -v "$REPO":/src:ro -w /src \
             -e SW_INSTALL="$install" -e JOBS="$JOBS" "$image" \
             sh -c 'eval "$SW_INSTALL" || exit 1; make -j"$JOBS" B=/tmp/build || exit 1; \
-                   ldd /tmp/build/savagewind | grep -E "SDL3|avformat|shaderc"' \
+                   ldd /tmp/build/iriswinds | grep -E "SDL3|avformat|shaderc"' \
             > "$log" 2>&1 < /dev/null; then
         echo "=== $image OK"
         grep -E "SDL3|avformat|shaderc" "$log" | sed "s/^/    /"

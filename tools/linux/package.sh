@@ -1,7 +1,7 @@
 #!/bin/bash
 # tools/linux/package.sh <x86_64|aarch64> (inside the amd64 build container, tools/linux/appimage.sh): the game built
 # against build/linux/<arch>/deps and the game code generator helper (tools/linux/gen_helper.sh) put together
-# as an AppDir and packed by appimagetool: build/dist/Savage_Wind-<version>-<arch>.AppImage.
+# as an AppDir and packed by appimagetool: build/dist/IrisWinds-<version>-<arch>.AppImage.
 # Shipped next to the executable (usr/bin, where runtime/paths.c rt_resource looks): what the start screen
 # builds the game code with on the player's machine (runtime/gamebuild.c: swgen/, zig/ from tools/fetch_zig.sh,
 # gamelib-src/), the window icon, the start screen font. No game code: that's built from the player's own files. usr/lib: the libraries from deps/ only - glibc, libstdc++, zlib, the Vulkan loader
@@ -14,7 +14,7 @@ P=$L/deps
 B=$L/game
 APPDIR=$L/AppDir
 VERSION=$(sed -n 's/^#define SAVAGEWIND_VERSION "\(.*\)"/\1/p' runtime/ui/launcher.mm)
-OUT=build/dist/Savage_Wind-$VERSION-$ARCH.AppImage
+OUT=build/dist/IrisWinds-$VERSION-$ARCH.AppImage
 JOBS=$(nproc)
 
 tools/linux/build_deps.sh "$ARCH"
@@ -29,19 +29,21 @@ else
 fi
 
 # the app alone (the game code is built on the player's machine)
-make -j"$JOBS" B="$B" DEPS="$P" "${MAKEARGS[@]}" "$B/savagewind"  # (the DEPS link line asks for libshaderc_shared itself)
-if nm "$B/savagewind" | grep ' f_70' >/dev/null; then echo "$B/savagewind has game code linked in"; exit 1; fi
+make -j"$JOBS" B="$B" DEPS="$P" "${MAKEARGS[@]}" "$B/iriswinds"  # (the DEPS link line asks for libshaderc_shared itself)
+if nm "$B/iriswinds" | grep ' f_70' >/dev/null; then echo "$B/iriswinds has game code linked in"; exit 1; fi
 ZIG_TARGET=$ARCH-linux tools/fetch_zig.sh
 
 # ---- AppDir
 rm -rf "$APPDIR" && mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/lib"
-cp "$B/savagewind" "$APPDIR/usr/bin/"
-llvm-strip --strip-debug "$APPDIR/usr/bin/savagewind"  # (symbols stay: crash backtraces name functions)
+cp "$B/iriswinds" "$APPDIR/usr/bin/"
+llvm-strip --strip-debug "$APPDIR/usr/bin/iriswinds"  # (symbols stay: crash backtraces name functions)
 cp docs/icon/icon_1024.png "$APPDIR/usr/bin/icon.png"
+cp docs/icon/splash.jpg "$APPDIR/usr/bin/splash.jpg"
 cp third_party/fonts/FiraSans/FiraSans-SemiBold.ttf third_party/fonts/FiraSans/FiraSans-Medium.ttf "$APPDIR/usr/bin/"  # (menus, OFL)
 cp third_party/fonts/FiraSans/OFL.txt "$APPDIR/usr/bin/FiraSans-OFL.txt"
 cp third_party/fonts/NotoSansThai/NotoSansThai-Medium.ttf "$APPDIR/usr/bin/"  # (Thai menus, OFL)
 cp third_party/fonts/NotoSansThai/OFL.txt "$APPDIR/usr/bin/NotoSansThai-OFL.txt"
+cp third_party/FidelityFX/LICENSE.txt "$APPDIR/usr/bin/FidelityFX-LICENSE.txt"  # (AMD FidelityFX SDK, MIT: frame generation)
 cp README.md LICENSE "$APPDIR/usr/bin/"  # (licenses and source links of the bundled components: README "License")
 [ -d "$L/helper/swgen" ] || { echo "no game code generator helper: tools/linux/gen_helper.sh $ARCH first"; exit 1; }
 cp -R "$L/helper/swgen" build/zig "$APPDIR/usr/bin/"
@@ -49,13 +51,13 @@ mkdir "$APPDIR/usr/bin/gamelib-src"
 cp runtime/cpu.h runtime/simd.h runtime/simd_fp.h runtime/simd_softfma.h runtime/gamelib.h tools/gamelib_entry.c \
    runtime/hle/hle_symbols.txt "$APPDIR/usr/bin/gamelib-src/"
 cp tools/linux/AppRun "$APPDIR/" && chmod +x "$APPDIR/AppRun"
-cp tools/linux/savagewind.desktop "$APPDIR/"
-cp docs/icon/icon_1024.png "$APPDIR/savagewind.png" && ln -sf savagewind.png "$APPDIR/.DirIcon"
+cp tools/linux/iriswinds.desktop "$APPDIR/"
+cp docs/icon/icon_1024.png "$APPDIR/iriswinds.png" && ln -sf iriswinds.png "$APPDIR/.DirIcon"
 
-# libraries: what savagewind needs (DT_NEEDED, recursively) that deps/ provides; anything else must be a system one
+# libraries: what iriswinds needs (DT_NEEDED, recursively) that deps/ provides; anything else must be a system one
 needed() { readelf -d "$1" | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p'; }
 SYSTEM_LIBS='^(libc|libm|libdl|libpthread|librt|libresolv|libstdc\+\+|libgcc_s|libz|libvulkan)\.so|^ld-linux'
-todo=("$APPDIR/usr/bin/savagewind")
+todo=("$APPDIR/usr/bin/iriswinds")
 while [ ${#todo[@]} -gt 0 ]; do
     f=${todo[0]}; todo=("${todo[@]:1}")
     for n in $(needed "$f"); do
@@ -69,7 +71,7 @@ while [ ${#todo[@]} -gt 0 ]; do
         fi
     done
 done
-patchelf --set-rpath '$ORIGIN/../lib' "$APPDIR/usr/bin/savagewind"
+patchelf --set-rpath '$ORIGIN/../lib' "$APPDIR/usr/bin/iriswinds"
 if ls "$APPDIR/usr/lib" | grep -iE 'x264|x265|xvid|postproc|vulkan'; then  # (no GPL codecs, no Vulkan loader)
     echo "package: library that must not ship"; exit 1
 fi

@@ -14,7 +14,6 @@
 #include "game_sites.h"
 #include "paths.h"
 #include "rt.h"
-#include "recomp_cache.h"
 
 static const GameLibTables *g_tables;
 static char g_error[256];
@@ -114,21 +113,7 @@ static bool read_id(const char *lib, char id[128]) {
 
 static bool id_matches(const char *lib) {
     char id[128];
-    if (!read_id(lib, id)) return false;
-    if (!strcmp(id, gamelib_id())) return true;
-    if (!strcmp(id, "dev")) {
-        // Automatically migrate legacy 'dev' id fallback to active identity
-        char id_path[1100];
-        snprintf(id_path, sizeof id_path, "%s.id", lib);
-        FILE *f = fopen(id_path, "wb");
-        if (f) {
-            fprintf(f, "%s\n", gamelib_id());
-            fclose(f);
-            LOG("[gamelib] migrated legacy 'dev' id to active identity %s\n", gamelib_id());
-            return true;
-        }
-    }
-    return false;
+    return read_id(lib, id) && !strcmp(id, gamelib_id());
 }
 
 bool gamelib_other_cpu(const char *game_dir) {
@@ -149,7 +134,7 @@ static bool exists(const char *p) {
 }
 
 // The places to look, in order (gamelib.h). Returns how many were filled.
-static int candidates(const char *game_dir, char out[6][1100]) {
+static int candidates(const char *game_dir, char out[3][1100]) {
     int n = 0;
     const char *env = getenv("IRISWINDS_GAME_LIB");
     if (!env || !*env) env = getenv("SAVAGEWIND_GAME_LIB");
@@ -158,20 +143,15 @@ static int candidates(const char *game_dir, char out[6][1100]) {
     if (rt_resource(GAMELIB_NAME, NULL, exe_side, sizeof exe_side) && exists(exe_side))
         snprintf(out[n++], 1100, "%s", exe_side);
     if (game_dir) snprintf(out[n++], 1100, "%s/%s", game_dir, GAMELIB_NAME);
-    snprintf(out[n++], 1100, "%s", "cache/" GAMELIB_NAME);
-    snprintf(out[n++], 1100, "%s", "extracted/" GAMELIB_NAME);
-    for (int i = 0; i < n; i++) {
-        recomp_cache_recover_lib(out[i]);
-    }
     return n;
 }
 
 bool gamelib_present(const char *game_dir) {
     if (g_tables) return true;
-    char c[6][1100];
+    char c[3][1100];
     int n = candidates(game_dir, c);
     for (int i = 0; i < n; i++)
-        if (exists(c[i]) && id_matches(c[i]) && recomp_cache_is_valid_lib(c[i], NULL, 0)) return true;
+        if (exists(c[i]) && id_matches(c[i])) return true;
     return false;
 }
 
@@ -187,16 +167,9 @@ static const GameLibTables *open_lib(const char *path) {
 #endif
     if (!entry) { snprintf(g_error, sizeof g_error, "%s: not game code", path); return NULL; }
     const GameLibTables *t = entry();
-    if (!t || t->abi != GAMELIB_ABI) {
-        snprintf(g_error, sizeof g_error, "%s has incompatible ABI (%u vs %u)", path, t ? t->abi : 0, GAMELIB_ABI);
-        return NULL;
-    }
-    if (!t->id || (strcmp(t->id, gamelib_id()) != 0 && strcmp(t->id, "dev") != 0)) {
-        snprintf(g_error, sizeof g_error, "%s id mismatch (%s vs expected %s)",
-                 path, t->id ? t->id : "none", gamelib_id());
-        LOG("[gamelib] Incompatible game library %s: id is %.16s, expected %.16s\n",
-            path, t->id ? t->id : "none", gamelib_id());
-        return NULL;
+    if (!t || t->abi != GAMELIB_ABI || !t->id || strcmp(t->id, gamelib_id())) {
+        snprintf(g_error, sizeof g_error, "%s was built for another version", path);
+        return NULL;  // (left loaded: nothing of it runs)
     }
     return t;
 }
@@ -206,18 +179,14 @@ bool gamelib_load(const char *game_dir, char *why, size_t why_size) {
     if (!tried) {
         tried = true;
         snprintf(g_error, sizeof g_error, "the game code hasn't been built: set up the game files on the start screen");
-        char c[6][1100];
+        char c[3][1100];
         int n = candidates(game_dir, c);
-        const char *env = getenv("IRISWINDS_GAME_LIB");
-        if (!env || !*env) env = getenv("SAVAGEWIND_GAME_LIB");
+        const char *env = getenv("SAVAGEWIND_GAME_LIB");
         for (int i = 0; i < n && !g_tables; i++) {
             if (!exists(c[i])) continue;
             bool given = i == 0 && env && *env;  // SAVAGEWIND_GAME_LIB: loaded as given, the library's own id decides
             if (!given && !id_matches(c[i])) {
                 snprintf(g_error, sizeof g_error, "%s was built for another version", c[i]);
-                continue;
-            }
-            if (!recomp_cache_is_valid_lib(c[i], g_error, sizeof g_error)) {
                 continue;
             }
             g_tables = open_lib(c[i]);

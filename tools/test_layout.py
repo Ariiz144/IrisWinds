@@ -402,7 +402,7 @@ def main():
     check(f'game_module_count = {len(lay)};' in c, 'layout.c module count')
     check('game_version[] = "";' in c and 'game_site_count = 0;' in c, 'layout.c without game sites (--no-sites)')
     r = run('gen.py', 'layout', exefs, os.path.join(root, 'nosites'), ok=False)
-    check('not a version Savage Wind knows' in r.stderr, 'a main module of no known version: refused')
+    check('not a version IrisWinds knows' in r.stderr, 'a main module of no known version: refused')
 
     # ---- gen.py <module> with layout.txt
     one = os.path.join(root, 'one')

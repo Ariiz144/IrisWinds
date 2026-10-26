@@ -1,5 +1,5 @@
 // The start screen's background (splash.h). The player's own picture when there is one (rt_user_splash: splash.jpg /
-// splash.png in the data folder, decoded with stb_image), shown filling the window; else Savage Wind's own art, drawn
+// splash.png in the data folder, decoded with stb_image), shown filling the window; else IrisWinds's own art, drawn
 // here: an old forest at a sunlit clearing, the icon's plain sword (docs/icon/icon.svg) in a mossy stone, the grass
 // swaying, petals and fireflies. The menu sits on the left, so the clearing is on the right. The start screen lays its
 // dark banners over either, which keep its text readable.
@@ -150,7 +150,7 @@ static void quad_grad(ImDrawList *dl, ImVec2 a, ImVec2 b, ImVec2 c, ImVec2 d, Im
     dl->PrimWriteIdx((ImDrawIdx)i), dl->PrimWriteIdx((ImDrawIdx)(i + 2)), dl->PrimWriteIdx((ImDrawIdx)(i + 3));
 }
 
-// ------------------------------------------------------------------ Savage Wind's own art
+// ------------------------------------------------------------------ IrisWinds's own art
 // An old forest at a clearing, drawn here (nothing of the game's): tall trunks fading into a green haze, the canopy
 // opening at the upper right, shafts of sunlight through it, mossy rocks, ferns and tall grass swaying in the wind,
 // petals drifting and fireflies. The menu and the game files card sit on the left, so the light is on the right.
@@ -179,7 +179,7 @@ static void shape(ImDrawList *dl, const Place &P, const float (*pts)[2], int n, 
     fill_grad(dl, q, n, a, b, rgba(c0, alpha), rgba(c1, alpha));
 }
 
-// Savage Wind's own plain sword (the icon's, docs/icon/icon.svg): pommel, wrapped grip, crossguard, a blade lit on
+// IrisWinds's own plain sword (the icon's, docs/icon/icon.svg): pommel, wrapped grip, crossguard, a blade lit on
 // its left half; its tip goes into whatever is drawn over it
 static void sword(ImDrawList *dl, const Place &P) {
     float k = P.k;
@@ -338,7 +338,7 @@ static void forest_art(ImDrawList *dl, ImVec2 sz, float t) {
         float bend = h * (0.25f * sinf(t * 1.1f + x * 0.01f) + 0.15f);
         blade(dl, x, y, H * 0.003f, h, bend, rgba(0x2a5a20), mix(rgba(0x5f9a34), rgba(0xd8f58a), light));
     }
-    {  // in the clearing's light: Savage Wind's sword in a mossy stone (the old tale, not any game's sword)
+    {  // in the clearing's light: IrisWinds's sword in a mossy stone (the old tale, not any game's sword)
         ImVec2 c(W * 0.80f, H * 0.775f);
         float r = H * 0.075f, k = H * 0.30f / 429.0f;  // (the sword from its pommel to the stone: 429 units)
         Place S{ImVec2(c.x, c.y - r * 0.85f - (560 - 515) * k), k};

@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=IrisWinds
+Comment=Static recompilation runtime (bring your own game files)
+Exec=iriswinds
+Icon=iriswinds
+Categories=Game;
+Terminal=false
+Actions=Configuration;
+
+[Desktop Action Configuration]
+Name=IrisWinds Configuration
+Exec=iriswinds --config

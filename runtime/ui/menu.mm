@@ -45,6 +45,9 @@ static std::atomic<bool> g_text_busy{false};  // a text field / the on-screen ke
 static std::atomic<bool> g_want_window_apply{false};  // fullscreen or the window size changed
 // (also from the game's Options screen, game_options.mm)
 extern "C" void menu_request_window_apply(void) { g_want_window_apply.store(true); }
+// The window size stepped through (left / right): applied once it stays put a moment, not at every size on the way
+static std::atomic<uint64_t> g_size_apply_at{0};  // SDL_GetTicks() then (0: none)
+extern "C" void menu_request_window_size_apply(void) { g_size_apply_at.store(SDL_GetTicks() + 600); }
 extern "C" bool game_options_input_hold(void);  // game_options.mm: a binding capture from the game's Options screen
 
 struct QEvent {
@@ -146,10 +149,21 @@ static std::atomic<int> g_kbd{0};  // 1 open, 2 confirmed, 3 cancelled
 static std::atomic<bool> g_last_pad{false};
 static char g_kbd_text[96];
 static int g_kbd_max = 8;
-static bool capturing() { return g_open.load() || g_kbd.load() == 1; }
+// Window size's list over the game's Options screen (game_options.mm A_SIZE_LIST): up, and until when the press that
+// closed it is kept from the game
+static std::atomic<bool> g_sizes{false};
+static std::atomic<uint64_t> g_sizes_hold{0};  // SDL_GetTicks()
+extern "C" void game_options_size_picked(void);  // game_options.mm (the row shows the new size)
+extern "C" void menu_size_list_open(void) {
+    input_reset();
+    g_sizes = true;
+}
+static bool capturing() { return g_open.load() || g_kbd.load() == 1 || g_sizes.load(); }
 // The game gets no input while this is true (runtime/hle/input.c): menu or name entry up, or a binding capture begun
 // from the game's Options screen.
-extern "C" bool menu_input_captured(void) { return capturing() || game_options_input_hold(); }
+extern "C" bool menu_input_captured(void) {
+    return capturing() || game_options_input_hold() || SDL_GetTicks() < g_sizes_hold.load();
+}
 
 // In game the settings are the game's own Options screen (game_options.mm): F1, Esc and the controller's home button no
 // longer open this menu (SAVAGEWIND_OVERLAY=1 brings it back). Esc frees the mouse cursor instead, a click in the
@@ -216,6 +230,13 @@ bool menu_handle_event(const SDL_Event *e) {
             return true;
         }
         ImGuiKey k = key_from_scancode(e->key.scancode);
+        if (g_sizes.load()) {  // Window size's list (in game): the keys bound to A, B and up / down work it too
+            int sc = e->key.scancode;
+            if (sc == g_bind_key[BIND_A]) k = ImGuiKey_Enter;
+            else if (sc == g_bind_key[BIND_B]) k = ImGuiKey_Escape;
+            else if (sc == g_bind_key[BIND_LS_UP] || sc == g_bind_key[BIND_UP]) k = ImGuiKey_UpArrow;
+            else if (sc == g_bind_key[BIND_LS_DOWN] || sc == g_bind_key[BIND_DOWN]) k = ImGuiKey_DownArrow;
+        }
         if (k != ImGuiKey_None) { QEvent q = {}; q.kind = QEvent::KEY; q.key = k; q.down = down; push(q); }
         return true;
     }
@@ -234,6 +255,11 @@ bool menu_handle_event(const SDL_Event *e) {
         }
         if (!capturing()) return false;
         ImGuiKey k = key_from_pad(e->gbutton.button);
+        if (g_sizes.load()) {  // Window size's list (in game): the buttons bound to A and B, wherever they are
+            int b = e->gbutton.button;
+            if (b == g_bind_pad[BIND_A]) k = ImGuiKey_GamepadFaceDown;
+            else if (b == g_bind_pad[BIND_B]) k = ImGuiKey_GamepadFaceRight;
+        }
         if (k != ImGuiKey_None) { QEvent q = {}; q.kind = QEvent::KEY; q.key = k; q.down = down; push(q); }
         return true;
     }
@@ -291,6 +317,8 @@ void menu_apply_window_requests(void *win) {
         text_input = want_text;
     }
     // (the window was made at its size and fullscreen mode: ui_window_init)
+    uint64_t at = g_size_apply_at.load();
+    if (at && SDL_GetTicks() >= at && g_size_apply_at.compare_exchange_strong(at, 0)) g_want_window_apply.store(true);
     if (g_want_window_apply.exchange(false)) winsize_apply(w);
     else winsize_refresh(w);  // (moved to another display, or its desktop size changed: other sizes are offered)
 }
@@ -519,9 +547,11 @@ static void tab_display(void) {
         snprintf(desc, sizeof desc, tr("The size of the game's window, or of the screen in fullscreen. Only the sizes your "
                                        "display can show: its own first, then grouped by shape. A shape wider than 16:9 "
                                        "is filled with Fill wide screens on; any other keeps 16:9 with bars.\n\nYour display: %d x %d."), desk.w, desk.h);
-        if (opt_choice("Window size", &cur, names, n, def, desc)) {  // (past either end: the other one)
+        bool picked;
+        if (opt_list("Window size", &cur, names, n, def, desc, &picked)) {  // (past either end: the other one)
             g_settings.window_w = list[cur].w, g_settings.window_h = list[cur].h;
-            g_want_window_apply.store(true);
+            if (picked) g_want_window_apply.store(true);
+            else menu_request_window_size_apply();  // (stepping: the size where it stops)
         }
     }
     {   // Fill wide screens (runtime/nvn/output_scale.c rt_persp)
@@ -590,6 +620,14 @@ static void tab_display(void) {
             desc += std::string("\n\n") + line;
         }
         opt_choice("VSync", &g_settings.vsync, names, VSYNC_COUNT, VSYNC_DEFAULT, desc.c_str(), false);
+    }
+    {   // HDR (settings.h HDR_*: runtime/nvn/vulkan/device.c hdr_wanted)
+        static const char *const names[HDR_COUNT] = {"Automatic", "On", "Off"};
+        opt_choice("HDR", &g_settings.hdr, names, HDR_COUNT, HDR_AUTO,
+                   "Automatic: while Windows HDR is on for this display, the picture is sent in HDR, so it looks as bright "
+                   "and colourful as in SDR (in SDR, Windows shows it dim and dull then). On: always in HDR, where the "
+                   "display takes it. Off: always SDR. White follows Windows' SDR content brightness (Settings > System > "
+                   "Display > HDR).", false);
     }
     static const char *const perf_names[] = {"Off", "FPS", "Full"};
     opt_choice("Performance overlay", &g_settings.perf_overlay, perf_names, 3, PERF_OFF,
@@ -670,6 +708,12 @@ static void tab_display(void) {
                    "AMD FidelityFX CAS sharpens the 3D image after the upscaler (or at the window's resolution with the "
                    "upscaler off), before the HUD is drawn over it: edges get crisper without halos. Most useful with "
                    "AMD FSR 1.", false);
+        // AMD FSR 3 frame generation (vulkan/framegen.cpp; the frame rate counts the presented frames: framepace.c)
+        opt_toggle("Frame generation (AMD FSR 3)", &g_settings.frame_gen, false,
+                   "AMD FSR 3 makes a frame between each two the game draws: about twice the frames on screen. The "
+                   "frame rate above counts them all, so the game itself draws half of it (60 with 120) and the "
+                   "controls answer as at that rate, a little later. In play only: the menus and the map show the "
+                   "game's own frames. Fast moves can leave faint smears around Link and what moves on its own.");
     }
 #endif
     opt_toggle("Asynchronous shaders", &g_settings.async_shaders, false,
@@ -775,6 +819,10 @@ static void tab_about(void) {
     float sens = roundf(g_settings.mouse_sens * 100);
     if (opt_slider("Mouse sensitivity", &sens, 10, 1000, 5, MOUSE_SENS_DEFAULT * 100, "%g%%", "How fast the mouse turns the camera."))
         g_settings.mouse_sens = sens / 100.0f;
+    float sens_y = roundf(g_settings.mouse_sens_y * 100);
+    if (opt_slider("Mouse vertical sensitivity", &sens_y, 50, 200, 5, 100, "%g%%",
+                   "Up and down, as a percentage of the mouse sensitivity."))
+        g_settings.mouse_sens_y = sens_y / 100.0f;
     toggle("Invert mouse Y", &g_settings.mouse_invert_y);
     ImGui::Spacing();
     header("Controls");
@@ -815,7 +863,8 @@ static void perf_overlay_draw(ImGuiIO &io, float scale) {
     const ImVec4 gpu_c(0.55f, 0.83f, 0.31f, 1), cpu_c(0.18f, 0.59f, 0.80f, 1), ram_c(0.80f, 0.45f, 0.70f, 1),
                  fps_c(0.95f, 0.95f, 0.95f, 1);
     if (g_settings.perf_overlay == PERF_FPS) {
-        ImGui::TextColored(fps_c, "%.0f FPS  %.1f ms", s.fps, s.frame_ms_avg);
+        // (frame generation: the presented frames, generated ones included)
+        ImGui::TextColored(fps_c, "%.0f FPS  %.1f ms", s.fps + s.fps_generated, s.frame_ms_avg);
         ImGui::End();
         return;
     }
@@ -830,7 +879,8 @@ static void perf_overlay_draw(ImGuiIO &io, float scale) {
         ImGui::TableNextColumn(); ImGui::TextColored(ram_c, "RAM");
         perf_cell("%.1f GB", s.ram_used_mb / 1024); perf_cell("/ %.1f GB", s.ram_total_mb / 1024); perf_cell(tr("game %.1f GB"), s.ram_game_mb / 1024);
         ImGui::TableNextColumn(); ImGui::TextColored(fps_c, "FPS");
-        perf_cell("%.0f", s.fps); perf_cell("%.1f ms", s.frame_ms_avg); perf_cell(tr("max %.1f ms"), s.frame_ms_max);
+        perf_cell("%.0f", s.fps + s.fps_generated);
+        perf_cell("%.1f ms", s.frame_ms_avg); perf_cell(tr("max %.1f ms"), s.frame_ms_max);
         ImGui::EndTable();
     }
     float top = s.frame_ms_max > 50 ? s.frame_ms_max : 50;
@@ -869,6 +919,82 @@ static void keyboard_draw(ImGuiIO &io, float scale) {
     }
     ImGui::End();
     if (g_kbd.load() != 1) was_open = false;
+}
+
+// Window size's list, dropped down under the row's button on the game's Options screen (Video), drawn like the game's
+// own pop-up lists: the menu is 16:9 in the middle of the window (output_scale.c), the button where its layout has it
+static void size_list_draw(ImGuiIO &io, float scale) {
+    static bool was_open;
+    static int frames;
+    bool appearing = !was_open;
+    was_open = true;
+    frames = appearing ? 0 : frames + 1;
+    float gw = io.DisplaySize.x, gh = gw * 9 / 16;
+    if (gh > io.DisplaySize.y) gh = io.DisplaySize.y, gw = gh * 16 / 9;
+    float ox = (io.DisplaySize.x - gw) * 0.5f, oy = (io.DisplaySize.y - gh) * 0.5f;
+    float x0 = ox + gw * 0.496f, x1 = ox + gw * 0.708f, y0 = oy + gh * 0.318f, bottom = oy + gh * 0.87f;
+    float row_h = gh * 0.046f;
+    WinSize list[WINSIZE_MAX];
+    static char names[WINSIZE_MAX][64];
+    int n = winsize_list(list, g_settings.fullscreen), cur = 0;
+    WinSize e = winsize_effective(g_settings.fullscreen);
+    for (int i = 0; i < n; i++) {
+        winsize_name(list[i], tr("native"), names[i], sizeof names[i]);
+        if (list[i].w == e.w && list[i].h == e.h) cur = i;
+    }
+    ImGui::SetNextWindowPos(ImVec2(x0, y0), ImGuiCond_Always);
+    ImGui::SetNextWindowSizeConstraints(ImVec2(x1 - x0, 0), ImVec2(x1 - x0, bottom - y0));
+    if (appearing) ImGui::SetNextWindowFocus();
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 1.5f * scale);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(4 * scale, 4 * scale));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0, 2 * scale));
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.04f, 0.04f, 0.04f, 0.94f));
+    ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.62f, 0.62f, 0.58f, 0.9f));
+    ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(1, 1, 1, 0.10f));
+    ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(1, 1, 1, 0.22f));
+    ImGui::PushStyleColor(ImGuiCol_HeaderActive, ImVec4(1, 1, 1, 0.30f));
+    ImGui::PushStyleColor(ImGuiCol_NavCursor, ImVec4(0.95f, 0.93f, 0.85f, 1));
+    ImGui::Begin("##sizes", NULL, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings |
+                                      ImGuiWindowFlags_AlwaysAutoResize);
+    ImGui::PushFont(g_menu_font);
+    int picked = -1;
+    for (int i = 0; i < n; i++) {
+        ImGui::PushID(i);
+        ImVec2 p = ImGui::GetCursorScreenPos();
+        float w = ImGui::GetContentRegionAvail().x;
+        if (ImGui::Selectable("##size", i == cur, 0, ImVec2(w, row_h))) picked = i;
+        if (appearing && i == cur) {
+            ImGui::SetItemDefaultFocus();
+            ImGui::SetScrollHereY(0.5f);
+            ImGui::SetNavCursorVisible(g_last_pad.load());
+        }
+        bool hot = ImGui::IsItemHovered() || ImGui::IsItemFocused();
+        ImVec2 ts = ImGui::CalcTextSize(names[i]);
+        ImU32 col = i == cur ? IM_COL32(236, 194, 84, 255) : hot ? IM_COL32(255, 255, 255, 255) : IM_COL32(215, 213, 205, 255);
+        ImGui::GetWindowDrawList()->AddText(ImVec2(p.x + (w - ts.x) * 0.5f, p.y + (row_h - ts.y) * 0.5f), col, names[i]);
+        ImGui::PopID();
+    }
+    // (test) SAVAGEWIND_SIZE_PICK=<n>: picks size n three seconds after the list is up
+    if (const char *t = getenv("SAVAGEWIND_SIZE_PICK"); t && frames == 180) picked = atoi(t) < n ? atoi(t) : cur;
+    bool cancel = !appearing && (ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false) ||
+                                 ImGui::IsKeyPressed(ImGuiKey_Escape, false) ||
+                                 (ImGui::IsMouseClicked(0) && !ImGui::IsWindowHovered()));
+    ImGui::PopFont();
+    ImGui::End();
+    ImGui::PopStyleColor(6);
+    ImGui::PopStyleVar(4);
+    if (picked >= 0 && picked != cur) {
+        g_settings.window_w = list[picked].w, g_settings.window_h = list[picked].h;
+        settings_save();
+        g_want_window_apply.store(true);
+        game_options_size_picked();
+    }
+    if (picked >= 0 || cancel) {
+        g_sizes_hold = SDL_GetTicks() + 300;  // (the A / B that closed it, still down, stays out of the game)
+        g_sizes = false;
+        was_open = false;
+    }
 }
 
 // Game thread (runtime/hle/swkbd.c): show the dialog, re-present the last frame until it's answered.
@@ -1020,7 +1146,8 @@ void menu_render(void *cmd, uint32_t target_w, uint32_t target_h) {
 #endif
     bool open = g_open.load();
     bool kbd = g_kbd.load() == 1;
-    if (!open && !kbd && g_settings.perf_overlay == PERF_OFF) {
+    bool sizes = g_sizes.load();
+    if (!open && !kbd && !sizes && g_settings.perf_overlay == PERF_OFF) {
         if (g_inited) { pthread_mutex_lock(&q_lock); q_events.clear(); pthread_mutex_unlock(&q_lock); }
         return;
     }
@@ -1114,6 +1241,7 @@ void menu_render(void *cmd, uint32_t target_w, uint32_t target_h) {
     }
 
     if (kbd) keyboard_draw(io, scale);
+    if (sizes) size_list_draw(io, scale);
     ImGui::Render();
     g_text_busy = open && ui_text_busy();
 #ifdef __APPLE__

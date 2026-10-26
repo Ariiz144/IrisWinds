@@ -1,4 +1,4 @@
-"""Savage Wind probe: how far the generator gets on a game's exefs, without writing any C.
+"""IrisWinds probe: how far the generator gets on a game's exefs, without writing any C.
 
 Usage: sw_probe.py [exefs_dir] [--modules main,sdk] [--sample N] [--json report.json]
 
@@ -165,7 +165,7 @@ def main():
     if 'main' in bases:  # (tools/game_sites.py VERSIONS)
         version = game_sites.supported_version(header(os.path.join(args.exefs, 'main'))['build_id'])
         print('  game version: ' + (f'{version.name}' + ('' if version.supported else ' (not supported yet)')
-                                    if version else 'not one Savage Wind knows'))
+                                    if version else 'not one IrisWinds knows'))
     other = [f for f in present if f not in bases and f != 'rtld']
     if other:
         print(f'  NOTE: files that are not modules the runtime loads: {other}')

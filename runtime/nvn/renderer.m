@@ -948,7 +948,7 @@ static Prog *get_program(NvnProgram *p, ShaderKey *vkey, ShaderKey *fkey) {
     // First-time compiles take ~40 ms each on Metal: build off the render thread; draws using this program are
     // skipped until it's ready (the object appears a few frames later instead of the game stalling).
     static dispatch_queue_t q;
-    if (!q) q = dispatch_queue_create("savagewind.shaders", DISPATCH_QUEUE_CONCURRENT);
+    if (!q) q = dispatch_queue_create("iriswinds.shaders", DISPATCH_QUEUE_CONCURRENT);
     dispatch_async(q, ^{ compile_program(pr); });
     return pr;
 }
