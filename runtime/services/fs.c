@@ -46,6 +46,7 @@ typedef struct { const char *path; uint64_t grow; } GrownFile;
 static GrownFile *grown;
 static int ngrown;
 static uint8_t *rstb_blob;  // the patched ResourceSizeTable served from memory (rstb_patch)
+static uint8_t *hud_pack;   // Pack/Bootup.pack with the HUD letters patched (hud_letters_patch)
 
 // Reboot: the next boot builds its own index / overlay when the game opens the RomFS again.
 RT_ON_RESET(fs_reset) {
@@ -55,8 +56,8 @@ RT_ON_RESET(fs_reset) {
     }
     for (int i = 0; i < npatches; i++) free(patches[i].data);  // (ov_meta and the extended table are among these)
     for (int i = 0; i < rom_nfiles; i++) free(rom_files[i].path);
-    free(ov), free(rom_files), free(grown), free(rstb_blob);
-    grown = NULL, ngrown = 0, rstb_blob = NULL;
+    free(ov), free(rom_files), free(grown), free(rstb_blob), free(hud_pack);
+    grown = NULL, ngrown = 0, rstb_blob = NULL, hud_pack = NULL;
     ov = NULL, ov_n = ov_cap = 0;
     ov_meta = NULL, ov_meta_off = ov_meta_size = ov_end = 0;
     npatches = 0;
@@ -340,6 +341,231 @@ static uint8_t *yaz0_pack_literal(const uint8_t *d, size_t n, size_t *out_n) {
     return o;
 }
 
+// Yaz0 with back-references (greedy, hash chains over the 4 KB window): for files whose size the game holds to
+// (a pack's resources are read into buffers of about their size). hdr: the original's 16 bytes (its alignment).
+static uint8_t *yaz0_pack(const uint8_t *d, size_t n, const uint8_t *hdr, size_t *out_n) {
+    enum { WIN = 0x1000, MAXM = 0x111, HBITS = 16, DEPTH = 48 };
+    uint8_t *o = malloc(16 + n + (n + 7) / 8 + 16);
+    int32_t *head = malloc(sizeof *head << HBITS), *prev = malloc(sizeof *prev * WIN);
+    memset(head, 0xff, sizeof *head << HBITS);
+    memcpy(o, hdr, 16);
+    o[4] = (uint8_t)(n >> 24), o[5] = (uint8_t)(n >> 16), o[6] = (uint8_t)(n >> 8), o[7] = (uint8_t)n;
+    size_t w = 16, s = 0;
+#define YHASH(p) ((uint32_t)((d[p] << 16 | d[(p) + 1] << 8 | d[(p) + 2]) * 2654435761u) >> (32 - HBITS))
+#define YADD(p) do { if ((p) + 2 < n) { uint32_t h_ = YHASH(p); prev[(p) & (WIN - 1)] = head[h_]; head[h_] = (int32_t)(p); } } while (0)
+    while (s < n) {
+        size_t flag_at = w++;
+        uint8_t flag = 0;
+        for (int b = 0; b < 8 && s < n; b++) {
+            size_t best = 0, dist = 0;
+            if (s + 2 < n) {
+                size_t lim = n - s < MAXM ? n - s : MAXM;
+                int32_t c = head[YHASH(s)];
+                for (int k = 0; k < DEPTH && c >= 0 && s - (size_t)c <= WIN; k++) {
+                    size_t l = 0;
+                    while (l < lim && d[c + l] == d[s + l]) l++;
+                    if (l > best) { best = l, dist = s - (size_t)c; if (l == lim) break; }
+                    int32_t nx = prev[c & (WIN - 1)];
+                    if (nx >= c) break;  // (the ring slot was reused: older than the window)
+                    c = nx;
+                }
+            }
+            if (best < 3) {
+                flag |= (uint8_t)(0x80 >> b);
+                o[w++] = d[s];
+                YADD(s);
+                s++;
+                continue;
+            }
+            size_t dd = dist - 1;
+            if (best >= 0x12) {
+                o[w++] = (uint8_t)(dd >> 8), o[w++] = (uint8_t)dd, o[w++] = (uint8_t)(best - 0x12);
+            } else {
+                o[w++] = (uint8_t)((best - 2) << 4 | dd >> 8), o[w++] = (uint8_t)dd;
+            }
+            for (size_t i = 0; i < best; i++) YADD(s + i);
+            s += best;
+        }
+        o[flag_at] = flag;
+    }
+#undef YHASH
+#undef YADD
+    free(head);
+    free(prev);
+    *out_n = w;
+    return o;
+}
+
+// SARC (little-endian): the node of `name` (its index; start and end in the data, which begins at *data_off), or -1
+static int sarc_find(const uint8_t *d, size_t n, const char *name, uint32_t *data_off, uint32_t *start, uint32_t *end) {
+    if (n < 0x20 || memcmp(d, "SARC", 4) || d[6] != 0xFF || d[7] != 0xFE || memcmp(d + 0x14, "SFAT", 4)) return -1;
+    uint32_t doff, cnt = d[0x1A] | d[0x1B] << 8;
+    memcpy(&doff, d + 0xC, 4);
+    size_t names = 0x20 + (size_t)cnt * 16 + 8;
+    if (names > n || doff > n) return -1;
+    for (uint32_t i = 0; i < cnt; i++) {
+        uint32_t attr, s, e;
+        memcpy(&attr, d + 0x20 + i * 16 + 4, 4);
+        memcpy(&s, d + 0x20 + i * 16 + 8, 4);
+        memcpy(&e, d + 0x20 + i * 16 + 12, 4);
+        size_t at = names + (size_t)(attr & 0xFFFFFF) * 4;
+        if (!(attr >> 24) || at >= n || strncmp((const char *)d + at, name, n - at)) continue;
+        if (s > e || doff + (uint64_t)e > n) return -1;
+        *data_off = doff, *start = s, *end = e;
+        return (int)i;
+    }
+    return -1;
+}
+
+// The HUD's prompt with its diamond of the other buttons (Layout/Common.sblarc, PaDoCommandA/B/X/Y_00: "Pick up",
+// "Talk", the rune's "Activate", the paraglider) writes the dim A / B / X / Y around it as text in the HUD's normal
+// font: the Switch's letters with any button icons. They become the button characters of the icon font
+// (External_00.bffnt, U+E040..E043, which glyphs.c redraws for the device in use): the layouts get that font as a
+// second one, and those text panes use it. The patched layouts go at the end of the archive, the archive is
+// recompressed into Pack/Bootup.pack where it was (what follows it moves by a multiple of 0x2000, so every file keeps
+// its alignment) and the pack is served from memory; the archive's ResourceSizeTable entry grows with it.
+// SAVAGEWIND_NO_HUD_LETTERS=1: the game's letters.
+
+#define HUD_ICON_SCALE 1.5f
+
+// One layout (FLYT, little-endian, a single font), patched into out (room for n + 64 bytes); returns its size or 0
+static size_t hud_letters_flyt(const uint8_t *b, size_t n, uint8_t *out, int *panes) {
+    static const char icon_font[] = "External_00.bffnt";
+    if (n < 0x14 || memcmp(b, "FLYT", 4) || b[4] != 0xFF || b[5] != 0xFE) return 0;
+    size_t hs = b[6] | b[7] << 8, o = hs, w = hs;
+    if (hs > n) return 0;
+    memcpy(out, b, hs);
+    bool fonts = false;
+    while (o + 8 <= n) {
+        uint32_t sz;
+        memcpy(&sz, b + o + 4, 4);
+        if (sz < 8 || o + sz > n) return 0;
+        uint8_t *sec = out + w;
+        if (!memcmp(b + o, "fnl1", 4)) {
+            uint32_t first;
+            memcpy(&first, b + o + 12, 4);
+            if ((b[o + 8] | b[o + 9] << 8) != 1 || 12 + first >= sz) return 0;
+            const char *name0 = (const char *)b + o + 12 + first;
+            size_t l0 = strnlen(name0, sz - 12 - first) + 1, l1 = sizeof icon_font;
+            uint32_t total = (uint32_t)((12 + 8 + l0 + l1 + 3) & ~3u), off0 = 8, off1 = (uint32_t)(8 + l0);
+            memset(sec, 0, total);
+            memcpy(sec, "fnl1", 4);
+            memcpy(sec + 4, &total, 4);
+            sec[8] = 2;
+            memcpy(sec + 12, &off0, 4);
+            memcpy(sec + 16, &off1, 4);
+            memcpy(sec + 20, name0, l0);
+            memcpy(sec + 20 + l0, icon_font, l1);
+            w += total;
+            o += sz;
+            fonts = true;
+            continue;
+        }
+        memcpy(sec, b + o, sz);
+        if (!memcmp(sec, "txt1", 4) && sz >= 0x68) {
+            uint32_t toff;
+            memcpy(&toff, sec + 0x64, 4);
+            if (toff && toff + 4 <= sz && !sec[toff + 1] && !sec[toff + 2] && !sec[toff + 3]) {
+                const char *k = strchr("ABXY", sec[toff]);
+                if (k && *k) {
+                    sec[0x5A] = 1, sec[0x5B] = 0;  // (the font: the second)
+                    uint16_t c = (uint16_t)(0xE040 + (k - "ABXY"));
+                    memcpy(sec + toff, &c, 2);
+                    float fs[2];  // the font size: an icon fills less of its cell than a letter
+                    memcpy(fs, sec + 0x70, 8);
+                    fs[0] *= HUD_ICON_SCALE, fs[1] *= HUD_ICON_SCALE;
+                    memcpy(sec + 0x70, fs, 8);
+                    (*panes)++;
+                }
+            }
+        }
+        w += sz;
+        o += sz;
+    }
+    if (!fonts || w > n + 64) return 0;
+    uint32_t total = (uint32_t)w;
+    memcpy(out + 0xC, &total, 4);
+    return w;
+}
+
+static void hud_letters_patch(const uint8_t *fmeta, uint64_t foff, uint64_t fsz) {
+    static const char pack_path[] = "Pack/Bootup.pack";
+    static const char *const layouts[] = {"blyt/PaDoCommandA_00.bflyt", "blyt/PaDoCommandB_00.bflyt",
+                                          "blyt/PaDoCommandX_00.bflyt", "blyt/PaDoCommandY_00.bflyt"};
+    if (getenv("SAVAGEWIND_NO_HUD_LETTERS")) return;
+    int k = 0;
+    while (k < rom_nfiles && strcmp(rom_files[k].path, pack_path)) k++;
+    char host[1200];
+    if (k == rom_nfiles || overlay_file(pack_path, host, sizeof host)) return;
+    uint64_t t0 = plat_now_ns();
+    size_t pn = rom_files[k].size, zn = 0, an = 0, nn = 0;
+    uint8_t *pack = malloc(pn), *arc = NULL, *arc2 = NULL, *z2 = NULL;
+    uint32_t pdoff, ps, pe, adoff, as, ae;
+    int node = -1, panes = 0;
+    if (romfs_image_pread(romfs, pack, pn, rom_files[k].off) == (ssize_t)pn)
+        node = sarc_find(pack, pn, "Layout/Common.sblarc", &pdoff, &ps, &pe);
+    if (node >= 0) arc = yaz0_unpack(pack + pdoff + ps, pe - ps, &an);
+    const char *why = node < 0 ? "no Layout/Common.sblarc" : !arc ? "archive not readable" : NULL;
+    if (!why) {
+        arc2 = malloc(an + 4 * (0x80 + 0x2000));
+        memcpy(arc2, arc, an);
+        nn = an;
+        for (int i = 0; i < 4 && !why; i++) {
+            int li = sarc_find(arc, an, layouts[i], &adoff, &as, &ae);
+            if (li < 0 || ae - as > 0x2000 - 64) { why = "layout not found"; break; }
+            size_t at = (nn + 0x7F) & ~(size_t)0x7F;
+            memset(arc2 + nn, 0, at - nn);
+            nn = at;
+            size_t ln = hud_letters_flyt(arc + adoff + as, ae - as, arc2 + nn, &panes);
+            if (!ln) { why = "layout not as expected"; break; }
+            uint32_t s = (uint32_t)(nn - adoff), e = (uint32_t)(nn - adoff + ln);
+            memcpy(arc2 + 0x20 + li * 16 + 8, &s, 4);
+            memcpy(arc2 + 0x20 + li * 16 + 12, &e, 4);
+            nn += ln;
+        }
+    }
+    if (!why && panes != 12) why = "letters not as expected";
+    if (why) {
+        LOG("[fs] HUD letters: %s, the game's letters stay\n", why);
+        free(pack), free(arc), free(arc2);
+        return;
+    }
+    uint32_t total = (uint32_t)nn;
+    memcpy(arc2 + 8, &total, 4);
+    z2 = yaz0_pack(arc2, nn, pack + pdoff + ps, &zn);
+    // the pack: the new archive where the old one was, what follows moved by delta (a multiple of 0x2000)
+    uint64_t old = pe - ps, delta = zn > old ? (zn - old + 0x1FFF) & ~0x1FFFull : 0;
+    size_t qn = pn + delta;
+    free(hud_pack);
+    hud_pack = calloc(1, qn);
+    memcpy(hud_pack, pack, pdoff + ps);
+    memcpy(hud_pack + pdoff + ps, z2, zn);
+    memcpy(hud_pack + pdoff + pe + delta, pack + pdoff + pe, pn - pdoff - pe);
+    uint32_t cnt = pack[0x1A] | pack[0x1B] << 8, ne = (uint32_t)(ps + zn), q32 = (uint32_t)qn;
+    for (uint32_t i = 0; i < cnt; i++) {
+        uint32_t s, e;
+        memcpy(&s, hud_pack + 0x20 + i * 16 + 8, 4);
+        memcpy(&e, hud_pack + 0x20 + i * 16 + 12, 4);
+        if (i == (uint32_t)node) { memcpy(hud_pack + 0x20 + i * 16 + 12, &ne, 4); continue; }
+        if (s >= pe) s += (uint32_t)delta, e += (uint32_t)delta;
+        memcpy(hud_pack + 0x20 + i * 16 + 8, &s, 4);
+        memcpy(hud_pack + 0x20 + i * 16 + 12, &e, 4);
+    }
+    memcpy(hud_pack + 8, &q32, 4);
+    free(pack), free(arc), free(arc2), free(z2);
+    meta_copy(fmeta, foff, fsz);
+    uint64_t rel = ov_end - rom_data_off, size = qn;
+    memcpy(ov_meta + rom_files[k].meta + 8, &rel, 8);
+    memcpy(ov_meta + rom_files[k].meta + 0x10, &size, 8);
+    if (ov_n == ov_cap) { ov_cap = ov_cap ? ov_cap * 2 : 256; ov = realloc(ov, sizeof *ov * ov_cap); }
+    ov[ov_n++] = (Overlay){ov_end, size, NULL, -1, hud_pack};
+    ov_end = (ov_end + size + 0xF) & ~0xFull;
+    grown = realloc(grown, sizeof *grown * (ngrown + 1));
+    grown[ngrown++] = (GrownFile){"Layout/Common.blarc", nn - an};
+    LOG("[fs] HUD letters: %d button letters use the icon font (archive %zu -> %zu bytes, pack +%llu KB, %.0f ms)\n",
+        panes, (size_t)old, zn, (unsigned long long)(delta >> 10), (plat_now_ns() - t0) / 1e6);
+}
+
 static void rstb_patch(const uint8_t *fmeta, uint64_t foff, uint64_t fsz) {
     static const char rstb_path[] = "System/Resource/ResourceSizeTable.product.srsizetable";
     if (!ngrown) return;
@@ -475,6 +701,7 @@ static void rom_index(void) {
         ov_end = (ov_end + size + 0xF) & ~0xFull;
         break;
     }
+    hud_letters_patch(fmeta, foff, fsz);
     rstb_patch(fmeta, foff, fsz);
     if (ov_n) LOG("[fs] overlay: %d romfs files replaced\n", ov_n);
     if (ov_meta) { patches[npatches++] = (Patch){ov_meta_off, ov_meta_size, ov_meta}; }
