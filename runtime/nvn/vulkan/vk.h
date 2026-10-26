@@ -9,6 +9,8 @@
 #pragma once
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
 #include <vulkan/vulkan.h>
 #if __has_include(<vma/vk_mem_alloc.h>)
 #include <vma/vk_mem_alloc.h>
@@ -18,6 +20,21 @@
 
 #include "../nvn.h"
 #include "../maxwell/shader.h"
+
+static inline bool env_bool(const char *name, bool def) {
+    const char *val = getenv(name);
+    if (!val) return def;
+    if (val[0] == '\0') return false;
+    if (strcmp(val, "0") == 0 ||
+        !strcasecmp(val, "false") ||
+        !strcasecmp(val, "off") ||
+        !strcasecmp(val, "no")) return false;
+    if (strcmp(val, "1") == 0 ||
+        !strcasecmp(val, "true") ||
+        !strcasecmp(val, "on") ||
+        !strcasecmp(val, "yes")) return true;
+    return true;
+}
 
 void vk_device_fault_report(void);
 #define VK_CHECK(x) do { VkResult r_ = (x); if (r_ != VK_SUCCESS) { if (r_ == VK_ERROR_DEVICE_LOST) { vk_device_fault_report(); \

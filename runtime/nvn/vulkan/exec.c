@@ -15,6 +15,7 @@
 #include "shaders.h"
 #include "vk.h"
 #include "../renderer.h"
+#include "../output_scale.h"
 #include "../../settings.h"
 
 static uint64_t stat_build_waits;  // draws that waited for their pipeline (draw_must_happen)
@@ -33,6 +34,7 @@ static int pass_nfbl;
 static bool draw_feedback;           // the current draw samples a target it writes (its pipeline allows the loop)
 static uint64_t stat_upload_bytes;
 static uint64_t stat_sets, stat_sets_reused, stat_sets_collisions, stat_sets_allocs, stat_sets_updates;  // descriptor sets asked for / shared / collisions / allocs / updates
+static uint64_t g_pass_id = 1;
 // SAVAGEWIND_VK_PROF=1: render-thread time per category in the fps log (exec = whole command lists, draw = draw(),
 // sets = descriptor sets incl. cbuf copies, vtx = index scan + vertex copies, submit = vkQueueSubmit2)
 static int prof = -1;
@@ -1133,6 +1135,7 @@ static uint32_t level_extent(uint32_t v, uint32_t lv) { v >>= lv; return v ? v :
 static void begin_pass(void) {
     if (in_pass && !st.rt_dirty) return;
     vk_end_pass();
+    g_pass_id++;
     pass_ds_written = false;
     pass_color_written = pass_color_unsynced = pass_feedback = 0;
     if (dl_on == 2) renderer_flush();  // (SAVAGEWIND_VK_DEVLOST_TRACE=2: each pass its own submission)
@@ -2632,6 +2635,7 @@ typedef struct {
     TexBackend copy;
     bool valid;
     uint64_t last_used_frame;
+    uint64_t pass_id;
 } ResSnapshot;
 
 #define MAX_RES_SNAPSHOTS 24
@@ -2651,7 +2655,10 @@ static const char *snap_reason = "?";
 static void snapshots_invalidate(NvnTexture *t) {
     for (int i = 0; i < 8; i++) if ((!t || snap_tex[i] == t) && snap_ok[i]) { snap_ok[i] = false; snap_why[i] = snap_reason; }
     for (int i = 0; i < n_res_snaps; i++) {
-        if (!t || res_snaps[i].key == t) res_snaps[i].valid = false;
+        if (!t || res_snaps[i].key == t || (t && t->backend && res_snaps[i].src_serial == ((TexBackend *)t->backend)->serial)) {
+            res_snaps[i].valid = false;
+            if (!t) res_snaps[i].pass_id = 0;
+        }
     }
     if (t && t->backend) ((TexBackend *)t->backend)->write_version++;
 }
@@ -2660,7 +2667,10 @@ static int find_or_alloc_res_snapshot(NvnTexture *t, TexBackend *src) {
     int best_slot = -1;
     uint64_t oldest_frame = ~0ull;
     for (int i = 0; i < n_res_snaps; i++) {
-        if (res_snaps[i].key == t && res_snaps[i].src_serial == src->serial) return i;
+        if (res_snaps[i].src_serial == src->serial) {
+            res_snaps[i].key = t;
+            return i;
+        }
         if (!res_snaps[i].valid && best_slot < 0) best_slot = i;
         if (res_snaps[i].last_used_frame < oldest_frame) {
             oldest_frame = res_snaps[i].last_used_frame;
@@ -2672,6 +2682,7 @@ static int find_or_alloc_res_snapshot(NvnTexture *t, TexBackend *src) {
         res_snaps[idx].key = t;
         res_snaps[idx].src_serial = src->serial;
         res_snaps[idx].valid = false;
+        res_snaps[idx].pass_id = 0;
         return idx;
     }
     if (best_slot < 0) best_slot = 0;
@@ -2679,6 +2690,7 @@ static int find_or_alloc_res_snapshot(NvnTexture *t, TexBackend *src) {
     s->key = t;
     s->src_serial = src->serial;
     s->valid = false;
+    s->pass_id = 0;
     return best_slot;
 }
 
@@ -2862,7 +2874,7 @@ static void resolve_feedback_legacy(Prog *pr) {
     nfeedback = 0;
     draw_feedback = false;
     static int off = -1;
-    if (off < 0) off = getenv("SAVAGEWIND_NO_FEEDBACK") != NULL;
+    if (off < 0) off = env_bool("SAVAGEWIND_NO_FEEDBACK", false);
     if (off) return;
     ShaderInfo *infos[2] = {pr->vi, pr->fi};
     for (int sg = 0; sg < 2; sg++)
@@ -2873,10 +2885,18 @@ static void resolve_feedback_legacy(Prog *pr) {
             for (int k = 0; k < nfeedback; k++) have |= feedback_tex[k] == t;
             if (have || nfeedback == 4) continue;
             static int nosnap = -1;
-            if (nosnap < 0) nosnap = getenv("SAVAGEWIND_NO_SNAPSHOT_REUSE") != NULL;
+            if (nosnap < 0) nosnap = env_bool("SAVAGEWIND_NO_SNAPSHOT_REUSE", false);
             int si = -1;
             for (int k = 0; k < 8; k++) if (snap_tex[k] == t) si = k;
-            bool self_write = t == st.rt.depth && st.ds[0] && st.ds[1];
+            bool self_write = (t == st.rt.depth && st.ds[0] && st.ds[1]);
+            if (!self_write) {
+                for (int ci = 0; ci < st.rt.ncolor; ci++) {
+                    if (st.rt.color[ci] == t && draw_writes_color(pr, ci)) {
+                        self_write = true;
+                        break;
+                    }
+                }
+            }
             TexBackend *src = vk_tex(t, true);
             Snap *existing = NULL;
             for (int k = 0; k < nsnaps; k++) if (snaps[k].key == t && snaps[k].copy.image) existing = &snaps[k];
@@ -2887,7 +2907,7 @@ static void resolve_feedback_legacy(Prog *pr) {
             // each time also ended the pass: ~500 copies a frame in the Shrine of Resurrection.) Depth written earlier
             // in this pass needs a barrier first: the pass ends, without a copy.
             static int nolive = -1;
-            if (nolive < 0) nolive = getenv("SAVAGEWIND_NO_LIVE_DEPTH") != NULL;
+            if (nolive < 0) nolive = env_bool("SAVAGEWIND_NO_LIVE_DEPTH", false);
             if (!nolive && t == st.rt.depth && depth_read_only()) {
                 if (pass_ds_written) { vk_end_pass(); st.rt_dirty = true; }
                 stat_feedback_live++;
@@ -3093,11 +3113,11 @@ static void plan_draw_feedback(Prog *pr, FeedbackPlan *plan) {
     static const VkComponentMapping id = {0};
     ShaderInfo *infos[2] = {pr->vi, pr->fi};
     static int nosnap = -1;
-    if (nosnap < 0) nosnap = getenv("SAVAGEWIND_NO_SNAPSHOT_REUSE") != NULL;
+    if (nosnap < 0) nosnap = env_bool("SAVAGEWIND_NO_SNAPSHOT_REUSE", false);
     static int nolive = -1;
-    if (nolive < 0) nolive = getenv("SAVAGEWIND_NO_LIVE_DEPTH") != NULL;
+    if (nolive < 0) nolive = env_bool("SAVAGEWIND_NO_LIVE_DEPTH", false);
     static int nofbl = -1;
-    if (nofbl < 0) nofbl = getenv("SAVAGEWIND_VK_FEEDBACK_COPY") != NULL;
+    if (nofbl < 0) nofbl = env_bool("SAVAGEWIND_VK_FEEDBACK_COPY", false);
 
     for (int sg = 0; sg < 2; sg++) {
         for (int i = 0; i < infos[sg]->ntex; i++) {
@@ -3223,14 +3243,45 @@ static void plan_draw_feedback(Prog *pr, FeedbackPlan *plan) {
             ResSnapshot *s = &res_snaps[s_idx];
             s->last_used_frame = renderer_present_count();
 
-            bool self_write = t == st.rt.depth && st.ds[0] && st.ds[1];
-            if (!nosnap && (res_snapshot_can_reuse(s, src) || (self_write && s->copy.image))) {
+            bool self_write = (t == st.rt.depth && st.ds[0] && st.ds[1]);
+            if (!self_write) {
+                for (int ci = 0; ci < st.rt.ncolor; ci++) {
+                    if (st.rt.color[ci] == t && draw_writes_color(pr, ci)) {
+                        self_write = true;
+                        break;
+                    }
+                }
+            }
+
+            bool intra_pass_reuse = (s->pass_id == g_pass_id && s->copy.image != VK_NULL_HANDLE);
+
+            static int log_snap = -1;
+            if (log_snap < 0) {
+                log_snap = env_bool("IRISWINDS_LOG_SNAPSHOT", false) || env_bool("SAVAGEWIND_LOG_FEEDBACK", false);
+            }
+
+            if (!nosnap && (res_snapshot_can_reuse(s, src) || intra_pass_reuse || (self_write && s->copy.image))) {
                 stat_snapshot_reuse++;
+                if (log_snap) {
+                    LOG("[snap] draw %llu: req tex %p (fmt %#x %ux%u, %s) -> slot %d (image %p, valid %d, ver %llu vs %llu) => REUSE (reuse=%llu, copy=%llu)\n",
+                        (unsigned long long)stat_draws, (void *)t, src->format, src->width, src->height,
+                        t == st.rt.depth ? "depth" : "color", s_idx, (void *)s->copy.image, (int)s->valid,
+                        (unsigned long long)s->src_version, (unsigned long long)src->write_version,
+                        (unsigned long long)stat_snapshot_reuse, (unsigned long long)stat_feedback_copies);
+                }
                 PlanReq *r = &plan->reqs[plan->nreqs++];
                 r->t = t; r->src = src; r->mode = REQ_MODE_SNAPSHOT_REUSE; r->any_type = false;
                 r->snap_idx = s_idx;
                 r->view = vk_image_view(&s->copy, VK_IMAGE_VIEW_TYPE_2D, src->format, 0, 1, 0, 1, id, sa);
                 continue;
+            }
+
+            if (log_snap) {
+                LOG("[snap] draw %llu: req tex %p (fmt %#x %ux%u, %s) -> slot %d (image %p, valid %d, ver %llu vs %llu) => COPY (reuse=%llu, copy=%llu)\n",
+                    (unsigned long long)stat_draws, (void *)t, src->format, src->width, src->height,
+                    t == st.rt.depth ? "depth" : "color", s_idx, (void *)s->copy.image, (int)s->valid,
+                    (unsigned long long)s->src_version, (unsigned long long)src->write_version,
+                    (unsigned long long)stat_snapshot_reuse, (unsigned long long)stat_feedback_copies + 1);
             }
 
             ensure_res_snapshot_image(s, src);
@@ -3371,6 +3422,7 @@ static void execute_feedback_plan(FeedbackPlan *plan) {
 
         ResSnapshot *s = &res_snaps[plan->reqs[k].snap_idx];
         s->valid = true;
+        s->pass_id = g_pass_id;
         s->src_serial = src->serial;
         s->src_version = src->write_version;
 
@@ -3402,7 +3454,7 @@ static void resolve_feedback(Prog *pr) {
     nfeedback = 0;
     draw_feedback = false;
     static int off = -1;
-    if (off < 0) off = getenv("SAVAGEWIND_NO_FEEDBACK") != NULL;
+    if (off < 0) off = env_bool("SAVAGEWIND_NO_FEEDBACK", false);
     if (off) return;
 
     static int planner_on = -1;
@@ -6112,10 +6164,11 @@ static VkImageView post_process(VkCommandBuffer cb, TexBackend *b, double ow_d, 
 static void scene_post(Prog *pr, CmdRec *r) {
     scene_up.t = NULL;
     static int fsr_on = -1, cas_on = -1;
-    if (fsr_on < 0) fsr_on = getenv("SAVAGEWIND_SCENE_FSR") ? atoi(getenv("SAVAGEWIND_SCENE_FSR")) : 1;
-    if (cas_on < 0) cas_on = getenv("SAVAGEWIND_SCENE_CAS") ? atoi(getenv("SAVAGEWIND_SCENE_CAS")) : 1;
-    bool fsr = fsr_on && g_settings.upscaler == UPSCALE_FSR1, cas = cas_on && g_settings.sharpening > 0;
-    if (!fsr && !cas) return;
+    if (fsr_on < 0) fsr_on = env_bool("SAVAGEWIND_SCENE_FSR", true);
+    if (cas_on < 0) cas_on = env_bool("SAVAGEWIND_SCENE_CAS", true);
+    bool fsr = fsr_on && (g_settings.upscaler == UPSCALE_FSR1 || upscale_factor() > 1.001);
+    bool cas_setting = cas_on && g_settings.sharpening > 0;
+    if (!fsr && !cas_setting) return;
     NvnTexture *rt = st.rt.ncolor ? st.rt.color[0] : NULL;
     if (!rt || r->x[2] > 6 || !pr->fi->ntex || vk_texture_scale_group(rt) != RS_OUT) return;
     const float *vp = st.viewport[0];
@@ -6132,6 +6185,7 @@ static void scene_post(Prog *pr, CmdRec *r) {
         TexBackend *b = vk_tex(t, false);
         if (!b->image || b->layers != 1 || b->samples != 1 || b->depth != 1 || (b->aspect & ~VK_IMAGE_ASPECT_COLOR_BIT)) continue;
         bool up = fsr && (ow > b->width + 1 || oh > b->height + 1);  // (else at its size in the window already)
+        bool cas = cas_setting && !up; // RCAS already performs sharpness filtering; avoid redundant CAS pass
         if (!up && !cas) return;
         VkFormatProperties fp;
         vkGetPhysicalDeviceFormatProperties(g_vk.phys, b->format, &fp);

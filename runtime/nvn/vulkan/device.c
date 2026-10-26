@@ -781,6 +781,35 @@ static void create_swapchain(void) {
                                     .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
         VK_CHECK(vkCreateImageView(g_vk.dev, &vi, NULL, &g_vk.sc_views[i]));
     }
+    {
+        OutScale os;
+        output_scale(ext.width, ext.height, true, &os);
+        uint32_t scene_w = (uint32_t)(1600.0 * os.scene_sx);
+        uint32_t scene_h = (uint32_t)(900.0 * os.scene_sy);
+        const char *u_names[] = {"Off", "MetalFX", "FSR1", "FSR3", "DLSS"};
+        const char *q_names[] = {"Ultra", "Quality", "Balanced", "Performance"};
+        const char *u_name = (g_settings.upscaler >= 0 && g_settings.upscaler < 5) ? u_names[g_settings.upscaler] : "Unknown";
+        const char *q_name = (g_settings.upscale_quality >= 0 && g_settings.upscale_quality < 4) ? q_names[g_settings.upscale_quality] : "Quality";
+        unsigned shadow_sz = shadow_map_size(0);
+        if (!shadow_sz) shadow_sz = 896;
+        const char *c = getenv("SAVAGEWIND_SNAPSHOT_CONSERVATIVE");
+        const char *pe = getenv("IRISWINDS_SNAPSHOT_PLANNER");
+        bool planner_on = !(c && atoi(c) != 0) && (!pe || atoi(pe) != 0);
+        bool nosnap = env_bool("SAVAGEWIND_NO_SNAPSHOT_REUSE", false);
+        const char *sc = getenv("IRISWINDS_SETC_WAYS");
+        int setc_mode = sc && atoi(sc) == 2 ? 2 : (getenv("SAVAGEWIND_SETC_16K") ? 1 : 0);
+        const char *ah = getenv("SAVAGEWIND_VK_NO_HOLD");
+        const char *ae = getenv("IRISWINDS_ASYNC_SUBMIT");
+        const char *as = getenv("SAVAGEWIND_VK_ASYNC_SUBMIT");
+        bool async = (ah && atoi(ah) != 0) || (ae && atoi(ae) != 0) || (as && atoi(as) != 0);
+
+        LOG("[iriswinds] Build: Target 6 | GPU: %s | Swapchain: %ux%u @ %.2f Hz | Mode: %s | VSync: %d | FPS: %d | Upscaler: %s (%s) | Scene: %ux%u | Shadow: %u | Planner: %s | SnapReuse: %s | SetCache: Mode %d | AsyncSubmit: %s\n",
+            g_vk.props.deviceName, ext.width, ext.height, winsize_refresh_rate(),
+            present_mode_name(mode), g_settings.vsync, g_settings.fps_limit,
+            u_name, q_name, scene_w, scene_h, shadow_sz,
+            planner_on ? "ON" : "OFF", nosnap ? "DISABLED" : "ENABLED",
+            setc_mode, async ? "ON" : "OFF");
+    }
 }
 
 // ================================================================== present timing
@@ -1346,7 +1375,8 @@ static void present_locked(NvnTexture *t) {
         extern bool g_gpuprof_frame;
         extern void vk_gpuprof_report(void);
         if (g_gpuprof_frame) { g_gpuprof_frame = false; vk_gpuprof_report(); }
-        const char *e = getenv("SAVAGEWIND_GPUPROF_AT");
+        const char *e = getenv("IRISWINDS_GPUPROF_AT");
+        if (!e) e = getenv("SAVAGEWIND_GPUPROF_AT");
         for (const char *p = e; p && *p;) {
             long at = strtol(p, (char **)&p, 10);
             if (at == (long)total_frames) { g_gpuprof_frame = true; break; }

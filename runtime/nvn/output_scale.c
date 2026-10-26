@@ -54,6 +54,14 @@ bool upscale_modes_available(void) {
 }
 
 double upscale_factor(void) {
+    const char *fsr_env = getenv("IRISWINDS_FSR_MODE");
+    if (fsr_env) {
+        if (!strcasecmp(fsr_env, "off")) return 1.0;
+        if (!strcasecmp(fsr_env, "ultra")) return 1.3;
+        if (!strcasecmp(fsr_env, "quality")) return 1.5;
+        if (!strcasecmp(fsr_env, "balanced")) return 1.7;
+        if (!strcasecmp(fsr_env, "perf") || !strcasecmp(fsr_env, "performance")) return 2.0;
+    }
     int u = g_settings.upscaler;
     return u != UPSCALE_OFF && upscaler_available(u) && upscale_modes_available()
                ? upscale_mode_factor(g_settings.upscale_quality) : 1.0;
@@ -79,6 +87,13 @@ void output_scale(double dw, double dh, bool reshape_allowed, OutScale *o) {
     double out_div = upscale_factor(), scene_div = 1.0;
 #else
     double out_div = 1.0, scene_div = upscale_factor();
+    const char *scene_scale_env = getenv("IRISWINDS_SCENE_SCALE");
+    if (scene_scale_env) {
+        double s = atof(scene_scale_env);
+        if (s >= 0.25 && s <= 4.0) {
+            scene_div = (1080.0 / SCENE_LINES) / s;
+        }
+    }
 #endif
     double h = forced > 0 ? forced : (reshape ? dh / 1080.0 : fit) / out_div;
     h = fmax(h, 0.1);  // (a tiny window)
@@ -92,6 +107,14 @@ void output_scale(double dw, double dh, bool reshape_allowed, OutScale *o) {
     o->scene_sx = sx * k; o->scene_sy = sy * k;
     double scap = fmin(MAX_TEX / (1920.0 * o->scene_sx), MAX_TEX / (1080.0 * o->scene_sy));
     if (scap < 1.0) { o->scene_sx *= scap; o->scene_sy *= scap; }
+    static double logged_scene_sx = -1, logged_scene_sy = -1;
+    if (o->scene_sx != logged_scene_sx || o->scene_sy != logged_scene_sy) {
+        logged_scene_sx = o->scene_sx;
+        logged_scene_sy = o->scene_sy;
+        LOG("[output] 3D scene internal resolution: %ux%u (scene_scale: %.3fx, scene_div: %.3f)\n",
+            (uint32_t)(1600.0 * o->scene_sx), (uint32_t)(900.0 * o->scene_sy),
+            (double)o->scene_sy, (double)scene_div);
+    }
     // where the image goes in the window: fills it when reshaped, else a fitted 16:9 box
     if (reshape) { o->vw = dw; o->vh = dh; }
     else { o->vw = 1920.0 * fit; o->vh = 1080.0 * fit; }
