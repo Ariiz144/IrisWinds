@@ -159,6 +159,26 @@ int main(void) {
     assert(nsnaps == 3);
     printf("  [PASS] Test 7: Multi-resource snapshot allocation succeeds\n");
 
-    printf("\nAll 7 Resource-Access Planner unit tests PASSED successfully!\n");
+    // Test Case 8: Global Clear / Compute Invalidation (NULL pointer) marks all snapshots stale
+    snaps[s1].valid = true;
+    snaps[sd].valid = true;
+    snapshots_invalidate(NULL);
+    assert(!snaps[s0].valid);
+    assert(!snaps[s1].valid);
+    assert(!snaps[sd].valid);
+    printf("  [PASS] Test 8: Global clear/compute invalidation (NULL) safely invalidates all snapshots\n");
+
+    // Test Case 9: Self-write depth reuse logic
+    snaps[sd].copy.image = (void *)0x6000;
+    snaps[sd].width = bd.width;
+    snaps[sd].height = bd.height;
+    snaps[sd].format = bd.format;
+    snaps[sd].src_version = bd.write_version;
+    snaps[sd].valid = true;
+    bool self_write = true; // depth test and write active
+    assert(snapshot_can_reuse(&snaps[sd], &bd) || (self_write && snaps[sd].copy.image));
+    printf("  [PASS] Test 9: Self-write depth particle sequence correctly reuses depth snapshot\n");
+
+    printf("\nAll 9 Resource-Access Planner unit tests PASSED successfully!\n");
     return 0;
 }

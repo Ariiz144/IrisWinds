@@ -23,8 +23,7 @@ static uint64_t stat_gw_waits, stat_gw_holds;  // draws / dispatches that waited
 static uint64_t stat_uub, stat_uub_same, stat_gcopy_hit, stat_gcopy_miss, stat_gcopy_bytes;  // UpdateUniformBuffer; guest_copy cache
 static uint64_t stat_feedback_live;  // depth attachments sampled as they are (read-only feedback, no copy)
 static uint64_t stat_feedback_loops, stat_feedback_barriers;  // draws sampling a target they write, in a feedback loop
-static uint64_t stat_snapshot_reqs, stat_snapshot_reuse, stat_snapshot_bytes, stat_snapshot_pass_ends, stat_snapshot_barriers, stat_full_barriers_avoided;
-static bool g_skip_pass_barrier;     // targeted barrier already satisfied attachment synchronization
+static uint64_t stat_snapshot_reqs, stat_snapshot_reuse, stat_snapshot_bytes, stat_snapshot_pass_ends, stat_snapshot_barriers;
 static bool pass_ds_written;         // a draw of the current pass wrote depth or stencil
 static uint8_t pass_color_written;   // the color targets (bits) a draw of the current pass wrote
 static uint8_t pass_color_unsynced;  // the color targets drawn or cleared since the pass began or its last feedback barrier
@@ -33,7 +32,7 @@ static TexBackend *pass_fbl[8];      // (g_vk.feedback_layout) its targets moved
 static int pass_nfbl;
 static bool draw_feedback;           // the current draw samples a target it writes (its pipeline allows the loop)
 static uint64_t stat_upload_bytes;
-static uint64_t stat_sets, stat_sets_reused;  // descriptor sets asked for / shared with an identical one
+static uint64_t stat_sets, stat_sets_reused, stat_sets_collisions, stat_sets_allocs, stat_sets_updates;  // descriptor sets asked for / shared / collisions / allocs / updates
 // SAVAGEWIND_VK_PROF=1: render-thread time per category in the fps log (exec = whole command lists, draw = draw(),
 // sets = descriptor sets incl. cbuf copies, vtx = index scan + vertex copies, submit = vkQueueSubmit2)
 static int prof = -1;
@@ -714,8 +713,9 @@ const char *renderer_stats(void) {
              (double)stat_upload_bytes / 1048576.0);
     {
         size_t n = strlen(stats_text);
-        snprintf(stats_text + n, sizeof stats_text - n, ", sets %llu (%llu shared), fbloop %llu (%llu barriers), gmem waits %llu holds %llu",
-                 (unsigned long long)stat_sets, (unsigned long long)stat_sets_reused, (unsigned long long)stat_feedback_loops,
+        snprintf(stats_text + n, sizeof stats_text - n, ", sets %llu (%llu shared, %llu col), fbloop %llu (%llu barriers), gmem waits %llu holds %llu",
+                 (unsigned long long)stat_sets, (unsigned long long)stat_sets_reused, (unsigned long long)stat_sets_collisions,
+                 (unsigned long long)stat_feedback_loops,
                  (unsigned long long)stat_feedback_barriers, (unsigned long long)stat_gw_waits, (unsigned long long)stat_gw_holds);
         n = strlen(stats_text);
         snprintf(stats_text + n, sizeof stats_text - n, ", uub %llu (%llu same), gcopy %llu hit %llu miss (%.1f MB)",
@@ -724,13 +724,13 @@ const char *renderer_stats(void) {
         if (stat_snapshot_reqs || stat_feedback_copies || stat_snapshot_reuse) {
             n = strlen(stats_text);
             snprintf(stats_text + n, sizeof stats_text - n,
-                     ", snap %llu req (%llu reused, %llu copy, %.1f MB, %llu pass_ends, %llu img_barriers, %llu full_barriers saved)",
+                     ", snap %llu req (%llu reused, %llu copy, %.1f MB, %llu pass_ends, %llu img_barriers)",
                      (unsigned long long)stat_snapshot_reqs, (unsigned long long)stat_snapshot_reuse,
                      (unsigned long long)stat_feedback_copies, (double)stat_snapshot_bytes / 1048576.0,
-                     (unsigned long long)stat_snapshot_pass_ends, (unsigned long long)stat_snapshot_barriers,
-                     (unsigned long long)stat_full_barriers_avoided);
+                     (unsigned long long)stat_snapshot_pass_ends, (unsigned long long)stat_snapshot_barriers);
         }
-        stat_snapshot_reqs = stat_snapshot_reuse = stat_snapshot_bytes = stat_snapshot_pass_ends = stat_snapshot_barriers = stat_full_barriers_avoided = 0;
+        stat_snapshot_reqs = stat_snapshot_reuse = stat_snapshot_bytes = stat_snapshot_pass_ends = stat_snapshot_barriers = 0;
+        stat_sets_collisions = stat_sets_allocs = stat_sets_updates = 0;
         n = strlen(stats_text);
         if (stat_build_waits) snprintf(stats_text + n, sizeof stats_text - n, ", build waits %llu", (unsigned long long)stat_build_waits);
         stat_build_waits = 0;
@@ -1156,12 +1156,12 @@ static void begin_pass(void) {
         if (h && atoi(h) != 0) no_hold = 0;
         else if (s) no_hold = atoi(s) != 0;
         else if (e) no_hold = atoi(e) != 0;
-        else no_hold = 1;  // Target 4: pipeline pass-boundary submissions to unlock CPU/GPU parallelism
+        else no_hold = 0;  // Target 5: conservative default to guarantee memory safety & correct composition
         static bool logged;
         if (!logged) {
             logged = true;
             LOG("[vk] pass-boundary chunk submissions %s (submit_draws=%d)\n",
-                no_hold ? "active (Target 4 pipelining)" : "conservative (held after gmem writes)", submit_draws);
+                no_hold ? "active (asynchronous pipelining)" : "conservative (held after gmem writes)", submit_draws);
         }
     }
     if (submit_draws > 0 && chunk_draws >= (uint32_t)submit_draws && (!chunk_hold || no_hold))
@@ -1173,12 +1173,7 @@ static void begin_pass(void) {
             break;
         }
     VkCommandBuffer cb = vk_cmd();
-    if (!g_skip_pass_barrier) {
-        vk_full_barrier(cb);  // passes, copies and dispatches see each other's results
-    } else {
-        stat_full_barriers_avoided++;
-        g_skip_pass_barrier = false;
-    }
+    vk_full_barrier(cb);  // passes, copies and dispatches see each other's results
     {
         NvnTexture *t0n = st.rt.ncolor ? st.rt.color[0] : NULL;
         dl_note("pass %d color %ux%u fmt %#x depth %p", st.rt.ncolor, t0n ? t0n->width : 0, t0n ? t0n->height : 0, t0n ? t0n->format : 0,
@@ -3228,7 +3223,8 @@ static void plan_draw_feedback(Prog *pr, FeedbackPlan *plan) {
             ResSnapshot *s = &res_snaps[s_idx];
             s->last_used_frame = renderer_present_count();
 
-            if (!nosnap && res_snapshot_can_reuse(s, src)) {
+            bool self_write = t == st.rt.depth && st.ds[0] && st.ds[1];
+            if (!nosnap && (res_snapshot_can_reuse(s, src) || (self_write && s->copy.image))) {
                 stat_snapshot_reuse++;
                 PlanReq *r = &plan->reqs[plan->nreqs++];
                 r->t = t; r->src = src; r->mode = REQ_MODE_SNAPSHOT_REUSE; r->any_type = false;
@@ -3400,8 +3396,6 @@ static void execute_feedback_plan(FeedbackPlan *plan) {
             feedback_view[nfeedback++] = plan->reqs[k].view;
         }
     }
-
-    g_skip_pass_barrier = true;
 }
 
 static void resolve_feedback(Prog *pr) {
@@ -3950,8 +3944,9 @@ static void texture_info(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo
 // Entries are told apart by two independent 64-bit hashes of the contents (no stored key: comparing ~700-byte keys
 // from a 3 MB table cost more than the hashing).
 #define SETC_TAB 16384
-typedef struct { uint64_t seq, hash, hash2; VkDescriptorSetLayout layout; VkDescriptorSet set; uint32_t n; } SetEnt;
+typedef struct { uint64_t seq, hash, hash2; VkDescriptorSetLayout layout; VkDescriptorSet set; uint32_t n; uint32_t age; } SetEnt;
 static SetEnt *setc;
+static uint32_t setc_clock;
 
 static VkDescriptorSet set_finish(VkDescriptorSetLayout layout, VkWriteDescriptorSet *w, int n) {
     static int off = -1;
@@ -3959,6 +3954,16 @@ static VkDescriptorSet set_finish(VkDescriptorSetLayout layout, VkWriteDescripto
     stat_sets++;
     SetEnt *e = NULL;
     uint64_t seq = vk_pending_seq() + (setc_gen << 40), h = 0, h2 = 0;
+    static int setc_mode = -1;  // 0: 4K direct, 1: 16K direct, 2: 16K 2-way associative
+    if (setc_mode < 0) {
+        const char *m = getenv("IRISWINDS_SETC_MODE");
+        const char *w_env = getenv("IRISWINDS_SETC_WAYS");
+        if (w_env && atoi(w_env) == 2) setc_mode = 2;
+        else if (m) setc_mode = atoi(m);
+        else setc_mode = 1;  // Default: 16384 direct mapped
+        LOG("[vk] descriptor set cache mode %d (%s)\n", setc_mode,
+            setc_mode == 0 ? "4K direct" : setc_mode == 2 ? "16K 2-way associative" : "16K direct");
+    }
     if (!off) {
         h = (uint64_t)(uintptr_t)layout;
         h2 = h ^ 0x6A09E667F3BCC909ull;
@@ -3981,18 +3986,51 @@ static VkDescriptorSet set_finish(VkDescriptorSetLayout layout, VkWriteDescripto
         }
         h ^= h >> 32;
         if (!setc) setc = calloc(SETC_TAB, sizeof *setc);
-        e = &setc[(h ^ (h >> 31)) & (SETC_TAB - 1)];
-        if (e->seq == seq && e->hash == h && e->hash2 == h2 && e->layout == layout && e->n == (uint32_t)n) {
-            stat_sets_reused++;
-            return e->set;
+
+        if (setc_mode == 2) {
+            // 2-way set associative: 8192 sets x 2 ways = 16384 entries
+            uint32_t set_idx = (uint32_t)((h ^ (h >> 31)) & 8191);
+            SetEnt *w0 = &setc[set_idx * 2];
+            SetEnt *w1 = &setc[set_idx * 2 + 1];
+            if (w0->seq == seq && w0->hash == h && w0->hash2 == h2 && w0->layout == layout && w0->n == (uint32_t)n) {
+                stat_sets_reused++;
+                w0->age = ++setc_clock;
+                return w0->set;
+            }
+            if (w1->seq == seq && w1->hash == h && w1->hash2 == h2 && w1->layout == layout && w1->n == (uint32_t)n) {
+                stat_sets_reused++;
+                w1->age = ++setc_clock;
+                return w1->set;
+            }
+            // Miss: select replacement
+            if (w0->seq != seq) e = w0;
+            else if (w1->seq != seq) e = w1;
+            else {
+                stat_sets_collisions++;
+                e = (w0->age <= w1->age) ? w0 : w1;
+            }
+        } else {
+            // Direct-mapped (mode 0: 4096 entries, mode 1: 16384 entries)
+            uint32_t mask = (setc_mode == 0) ? 4095 : (SETC_TAB - 1);
+            e = &setc[(h ^ (h >> 31)) & mask];
+            if (e->seq == seq && e->hash == h && e->hash2 == h2 && e->layout == layout && e->n == (uint32_t)n) {
+                stat_sets_reused++;
+                return e->set;
+            }
+            if (e->seq == seq) stat_sets_collisions++;
         }
     }
     VkDescriptorSet ds = vk_alloc_set(layout);
+    stat_sets_allocs++;
     for (int i = 0; i < n; i++) w[i].dstSet = ds;
-    if (n) vkUpdateDescriptorSets(g_vk.dev, (uint32_t)n, w, 0, NULL);
+    if (n) {
+        vkUpdateDescriptorSets(g_vk.dev, (uint32_t)n, w, 0, NULL);
+        stat_sets_updates++;
+    }
     if (e) {
         e->seq = vk_pending_seq() + (setc_gen << 40);  // (the set lives in this submission's pools)
         e->hash = h; e->hash2 = h2; e->layout = layout; e->set = ds; e->n = (uint32_t)n;
+        e->age = ++setc_clock;
     }
     return ds;
 }
@@ -4601,7 +4639,7 @@ static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
     if (!st.program || !gx || !gy || !gz) return;
     CsProg *cp = compute_program(st.program);
     if (!cp || atomic_load(&cp->p.state) != 1) { stat_skipped++; return; }
-    if (cp->si->writes_gmem) { snap_reason = "compute"; snapshots_invalidate(NULL); }
+    snap_reason = "compute"; snapshots_invalidate(NULL);
     gw_check((const uint32_t[6]){0, 0, 0, 0, 0, cp->si->cbuf_mask}, false, 0, 0);
     vk_end_pass();
     VkCommandBuffer cb = vk_cmd();
@@ -5599,8 +5637,8 @@ static void copy_region_dims(NvnTexture *t, const TexRefRec *ref, const FormatIn
 }
 
 static void copy_buffer_to_texture(uint64_t src, const TexRefRec *dst) {
+    snap_reason = "buf2tex"; snapshots_invalidate(NULL);
     NvnTexture *t = dst ? (NvnTexture *)(uintptr_t)dst->tex : NULL;
-    snap_reason = "buf2tex"; snapshots_invalidate(t);
     if (!t || !src) return;
     tex_mark_write(t, RES_OP_COPY, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
     vk_end_pass();
@@ -5719,9 +5757,9 @@ static void copy_texture_to_buffer(const TexRefRec *src, uint64_t dst) {
 }
 
 static void copy_texture(const TexRefRec *src, const TexRefRec *dst, uint64_t flags) {
+    snap_reason = "tex2tex"; snapshots_invalidate(NULL);
     NvnTexture *st_ = src ? (NvnTexture *)(uintptr_t)src->tex : NULL;
     NvnTexture *dt = dst ? (NvnTexture *)(uintptr_t)dst->tex : NULL;
-    snap_reason = "tex2tex"; snapshots_invalidate(dt);
     if (!st_ || !dt) return;
     tex_mark_write(dt, RES_OP_COPY, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
     vk_end_pass();
@@ -6517,9 +6555,9 @@ static void exec_list(uint64_t handle, int depth) {
         case CMD_SET_PRIMITIVE_RESTART: st.prim_restart = r->x[0] != 0; st.restart_index = (uint32_t)r->x[1]; break;
         case CMD_SET_COPY_STRIDES: st.copy_row_stride = r->x[0]; st.copy_image_stride = r->x[1]; break;
         case CMD_CLEAR_COLOR: {
+            snap_reason = "clear-color"; snapshots_invalidate(NULL);
             int index = (int)r->x[0];
             NvnTexture *t = (index < st.rt.ncolor && st.rt.color[index]) ? st.rt.color[index] : NULL;
-            snap_reason = "clear-color"; snapshots_invalidate(t);
             if (t)
                 tex_mark_write(t, RES_OP_CLEAR, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
             if (getenv("SAVAGEWIND_LOG_CLEARS") && index < st.rt.ncolor && st.rt.color[index])
@@ -6533,7 +6571,7 @@ static void exec_list(uint64_t handle, int depth) {
             const struct { uint64_t tex; NvnTextureView view; uint8_t has_view; int32_t region[6]; float color[4]; } *ct = x;
             NvnTexture *t = (NvnTexture *)(uintptr_t)ct->tex;
             if (!t) break;
-            snap_reason = "clear-texture"; snapshots_invalidate(t);
+            snap_reason = "clear-texture"; snapshots_invalidate(NULL);
             tex_mark_write(t, RES_OP_CLEAR, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
             RtState saved = st.rt;
             int32_t sc[4];
@@ -6555,7 +6593,7 @@ static void exec_list(uint64_t handle, int depth) {
             break;
         }
         case CMD_CLEAR_DEPTH_STENCIL:
-            snap_reason = "clear-depth"; snapshots_invalidate(st.rt.depth);
+            snap_reason = "clear-depth"; snapshots_invalidate(NULL);
             if (st.rt.depth) {
                 tex_mark_write(st.rt.depth, RES_OP_CLEAR, VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT, VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
                 bool has_stencil = renderer_format_has_stencil(st.rt.depth->format);
