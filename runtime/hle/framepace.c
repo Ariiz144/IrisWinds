@@ -103,7 +103,10 @@ bool framepace_menu_ui(void) { return *(uint32_t *)(uintptr_t)PAUSE_STATE == 2; 
 
 int framepace_target(void) {
     static int forced = -2, movie = -2, menu = -2, event = -2;
-    if (forced == -2) forced = env_int("SAVAGEWIND_FPS", -1);
+    if (forced == -2) {
+        forced = env_int("IRISWINDS_FPS", -2);
+        if (forced == -2) forced = env_int("SAVAGEWIND_FPS", -1);
+    }
     extern bool movie_paced(void);
     if (movie == -2) movie = env_int("SAVAGEWIND_MOVIE_FPS", movie_paced() ? 0 : -1);  // (-1: the movie's own frame rate)
     if (menu == -2) {

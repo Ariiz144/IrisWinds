@@ -708,8 +708,8 @@ static const char *present_mode_name(VkPresentModeKHR m) {
          : "other";
 }
 
-// The wanted mode, or what comes closest on this surface: Adaptive -> On, Off -> Fast (no waiting either), Fast -> On
-// (FIFO is always there). *have: the surface's modes, for the log.
+// The wanted mode, or what comes closest on this surface: Fast -> Mailbox -> Immediate -> FIFO,
+// Adaptive -> FIFO Relaxed -> FIFO, Off -> Immediate -> Mailbox -> FIFO, On -> FIFO.
 static VkPresentModeKHR present_mode(char *have, size_t cap) {
     uint32_t n = 0;
     vkGetPhysicalDeviceSurfacePresentModesKHR(g_vk.phys, g_vk.surface, &n, NULL);
@@ -723,9 +723,10 @@ static VkPresentModeKHR present_mode(char *have, size_t cap) {
     for (VkPresentModeKHR want = wanted_present_mode();;) {
         for (uint32_t i = 0; i < n; i++)
             if (m[i] == want) return want;
-        if (want == VK_PRESENT_MODE_IMMEDIATE_KHR) want = VK_PRESENT_MODE_MAILBOX_KHR;
-        else if (want == VK_PRESENT_MODE_FIFO_KHR) return want;
-        else want = VK_PRESENT_MODE_FIFO_KHR;
+        if (want == VK_PRESENT_MODE_MAILBOX_KHR) want = VK_PRESENT_MODE_IMMEDIATE_KHR;
+        else if (want == VK_PRESENT_MODE_IMMEDIATE_KHR) want = VK_PRESENT_MODE_FIFO_RELAXED_KHR;
+        else if (want == VK_PRESENT_MODE_FIFO_RELAXED_KHR) want = VK_PRESENT_MODE_FIFO_KHR;
+        else return VK_PRESENT_MODE_FIFO_KHR;
     }
 }
 

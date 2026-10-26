@@ -485,7 +485,7 @@ static VkSpan copy_dedupe(int slot, const void *data, uint64_t size, uint64_t al
 // the range it wrote: each copy keeps the update count it was made at and which written ranges it covers. (Copies used
 // to be shared within one GPU piece of ~300 draws and every UpdateUniformBuffer dropped them all: ~3000 copies, ~15 MB,
 // a frame in the open world.)
-#define GCOPY_TAB 4096
+#define GCOPY_TAB 16384
 #define UUB_MAX 64
 static struct { uint64_t addr, size, gen, serial, mask; int chunk; VkSpan span; } gcopy[GCOPY_TAB];
 static uint64_t gcopy_gen = 1;
@@ -1149,7 +1149,21 @@ static void begin_pass(void) {
     // 7). The rest of such a list goes in one piece at its end and sees the memory as it was, as before. (Waiting for
     // the piece instead cost more: the GPU is ~13 ms behind the translation at that point of BOTW's frame.)
     static int no_hold = -1;  // (debugging) SAVAGEWIND_VK_NO_HOLD=1: pieces go on after such a shader too
-    if (no_hold < 0) no_hold = getenv("SAVAGEWIND_VK_NO_HOLD") != NULL;
+    if (no_hold < 0) {
+        const char *e = getenv("IRISWINDS_ASYNC_SUBMIT");
+        const char *s = getenv("SAVAGEWIND_VK_NO_HOLD");
+        const char *h = getenv("SAVAGEWIND_VK_GMEM_HOLD");
+        if (h && atoi(h) != 0) no_hold = 0;
+        else if (s) no_hold = atoi(s) != 0;
+        else if (e) no_hold = atoi(e) != 0;
+        else no_hold = 1;  // Target 4: pipeline pass-boundary submissions to unlock CPU/GPU parallelism
+        static bool logged;
+        if (!logged) {
+            logged = true;
+            LOG("[vk] pass-boundary chunk submissions %s (submit_draws=%d)\n",
+                no_hold ? "active (Target 4 pipelining)" : "conservative (held after gmem writes)", submit_draws);
+        }
+    }
     if (submit_draws > 0 && chunk_draws >= (uint32_t)submit_draws && (!chunk_hold || no_hold))
         vk_submit_extra(VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE);
     st.rt_dirty = false;
@@ -3935,7 +3949,7 @@ static void texture_info(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo
 // the same material textures and constants): saves the allocation and the update. SAVAGEWIND_VK_NO_SET_CACHE=1: off.
 // Entries are told apart by two independent 64-bit hashes of the contents (no stored key: comparing ~700-byte keys
 // from a 3 MB table cost more than the hashing).
-#define SETC_TAB 4096
+#define SETC_TAB 16384
 typedef struct { uint64_t seq, hash, hash2; VkDescriptorSetLayout layout; VkDescriptorSet set; uint32_t n; } SetEnt;
 static SetEnt *setc;
 
@@ -4584,10 +4598,10 @@ bool vk_pso_wait(int ms, float *done) {
 }
 
 static void dispatch_compute(uint32_t gx, uint32_t gy, uint32_t gz) {
-    snap_reason = "compute"; snapshots_invalidate(NULL);
     if (!st.program || !gx || !gy || !gz) return;
     CsProg *cp = compute_program(st.program);
     if (!cp || atomic_load(&cp->p.state) != 1) { stat_skipped++; return; }
+    if (cp->si->writes_gmem) { snap_reason = "compute"; snapshots_invalidate(NULL); }
     gw_check((const uint32_t[6]){0, 0, 0, 0, 0, cp->si->cbuf_mask}, false, 0, 0);
     vk_end_pass();
     VkCommandBuffer cb = vk_cmd();
@@ -5585,8 +5599,8 @@ static void copy_region_dims(NvnTexture *t, const TexRefRec *ref, const FormatIn
 }
 
 static void copy_buffer_to_texture(uint64_t src, const TexRefRec *dst) {
-    snap_reason = "buf2tex"; snapshots_invalidate(NULL);
-    NvnTexture *t = (NvnTexture *)(uintptr_t)dst->tex;
+    NvnTexture *t = dst ? (NvnTexture *)(uintptr_t)dst->tex : NULL;
+    snap_reason = "buf2tex"; snapshots_invalidate(t);
     if (!t || !src) return;
     tex_mark_write(t, RES_OP_COPY, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
     vk_end_pass();
@@ -5705,8 +5719,9 @@ static void copy_texture_to_buffer(const TexRefRec *src, uint64_t dst) {
 }
 
 static void copy_texture(const TexRefRec *src, const TexRefRec *dst, uint64_t flags) {
-    snap_reason = "tex2tex"; snapshots_invalidate(NULL);
-    NvnTexture *st_ = (NvnTexture *)(uintptr_t)src->tex, *dt = (NvnTexture *)(uintptr_t)dst->tex;
+    NvnTexture *st_ = src ? (NvnTexture *)(uintptr_t)src->tex : NULL;
+    NvnTexture *dt = dst ? (NvnTexture *)(uintptr_t)dst->tex : NULL;
+    snap_reason = "tex2tex"; snapshots_invalidate(dt);
     if (!st_ || !dt) return;
     tex_mark_write(dt, RES_OP_COPY, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
     vk_end_pass();
@@ -6502,10 +6517,11 @@ static void exec_list(uint64_t handle, int depth) {
         case CMD_SET_PRIMITIVE_RESTART: st.prim_restart = r->x[0] != 0; st.restart_index = (uint32_t)r->x[1]; break;
         case CMD_SET_COPY_STRIDES: st.copy_row_stride = r->x[0]; st.copy_image_stride = r->x[1]; break;
         case CMD_CLEAR_COLOR: {
-            snap_reason = "clear-color"; snapshots_invalidate(NULL);
             int index = (int)r->x[0];
-            if (index < st.rt.ncolor && st.rt.color[index])
-                tex_mark_write(st.rt.color[index], RES_OP_CLEAR, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+            NvnTexture *t = (index < st.rt.ncolor && st.rt.color[index]) ? st.rt.color[index] : NULL;
+            snap_reason = "clear-color"; snapshots_invalidate(t);
+            if (t)
+                tex_mark_write(t, RES_OP_CLEAR, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
             if (getenv("SAVAGEWIND_LOG_CLEARS") && index < st.rt.ncolor && st.rt.color[index])
                 LOG("[cclear] frame %llu idx %d %ux%u f%#x mask %#x\n", (unsigned long long)renderer_present_count(), index,
                     st.rt.color[index]->width, st.rt.color[index]->height, st.rt.color[index]->format, (uint32_t)r->x[2]);
@@ -6517,7 +6533,7 @@ static void exec_list(uint64_t handle, int depth) {
             const struct { uint64_t tex; NvnTextureView view; uint8_t has_view; int32_t region[6]; float color[4]; } *ct = x;
             NvnTexture *t = (NvnTexture *)(uintptr_t)ct->tex;
             if (!t) break;
-            snap_reason = "clear-texture"; snapshots_invalidate(NULL);
+            snap_reason = "clear-texture"; snapshots_invalidate(t);
             tex_mark_write(t, RES_OP_CLEAR, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
             RtState saved = st.rt;
             int32_t sc[4];
@@ -6539,7 +6555,7 @@ static void exec_list(uint64_t handle, int depth) {
             break;
         }
         case CMD_CLEAR_DEPTH_STENCIL:
-            snap_reason = "clear-depth"; snapshots_invalidate(NULL);
+            snap_reason = "clear-depth"; snapshots_invalidate(st.rt.depth);
             if (st.rt.depth) {
                 tex_mark_write(st.rt.depth, RES_OP_CLEAR, VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT, VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
                 bool has_stencil = renderer_format_has_stencil(st.rt.depth->format);
