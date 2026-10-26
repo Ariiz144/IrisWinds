@@ -229,7 +229,7 @@ def _vfr_ratio(gen, a):
 
 def _gui_speed(gen, a):
     assert _word(gen, a) == 0xbd0b2100, hex(_word(gen, a))  # str s0, [x8, #0xb20]
-    return ('{ extern float rt_gui_speed(float); union { uint32_t u; float f; } s = { .u = (uint32_t)VS32(0) }; '
+    return ('{ extern float rt_gui_speed(float); union { uint32_t u; float f; } s = { .u = (uint32_t)c->v[0] }; '
             's.f = rt_gui_speed(s.f); ST32(c->x[8] + 0xb20, s.u); }'
             f'  /* {a:#x}: str s0, [x8, #0xb20] (GUI speed) */')
 
@@ -324,7 +324,7 @@ def _cam_stick(gen, a):
 def _cam_pitch(gen, a):
     # fmul s1, s0, s0 just above, fnmul s3, s0, s0 here: the vertical part kept its sign squared, s1 or s3 by s0's sign
     assert _word(gen, a) == 0x1e208803 and _word(gen, a - 4) == 0x1e200801, hex(_word(gen, a))
-    return ('{ extern int rt_cam_pitch(float *); union { uint32_t u; float f; } y = { .u = (uint32_t)VS32(0) }; '
+    return ('{ extern int rt_cam_pitch(float *); union { uint32_t u; float f; } y = { .u = (uint32_t)c->v[0] }; '
             'if (rt_cam_pitch(&y.f)) c->v[1] = y.u; else y.f = -(y.f * y.f); c->v[3] = y.u; }'
             f'  /* {a:#x}: fnmul s3, s0, s0 (camera: the vertical stick part squared) */')
 
