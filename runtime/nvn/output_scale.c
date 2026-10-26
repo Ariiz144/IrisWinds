@@ -146,6 +146,22 @@ float output_view_shape(void) { return g_view_shape; }
 // turned (issue #103). What the game set is kept per projection (wide_cam), so the next build, a change of the window
 // or of the field of view, and the screen-to-camera loads (tools/patches.py _persp_unproject) start from it again
 // instead of widening twice. SAVAGEWIND_NO_WIDE_CAMERA_FIX=1: the matrix only, as before.
+static WorldProj g_world;
+static pthread_mutex_t world_lock = PTHREAD_MUTEX_INITIALIZER;
+
+void output_world_proj_set(float t, float a, float n, float f) {
+    pthread_mutex_lock(&world_lock);
+    g_world = (WorldProj){t, a, n, f, g_world.serial + 1};
+    pthread_mutex_unlock(&world_lock);
+}
+
+bool output_world_proj(WorldProj *p) {
+    pthread_mutex_lock(&world_lock);
+    *p = g_world;
+    pthread_mutex_unlock(&world_lock);
+    return p->serial != 0;
+}
+
 static struct { uint64_t proj; uint32_t set_t, set_a, wrote_t, wrote_a; } wide_cam[16];
 static unsigned wide_cam_next;
 static pthread_mutex_t wide_cam_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -186,6 +202,7 @@ void rt_persp(uint64_t proj, uint32_t *tan_fovy, uint32_t *aspect) {
     if (fov != 1 && nf[1] > 10001) t = tanf(fminf(atanf(t) * fov, 1.4f));  // (under 160 degrees)
     a *= shape;
     memcpy(tan_fovy, &t, 4), memcpy(aspect, &a, 4);
+    if (world) output_world_proj_set(t, a, nf[0], nf[1]);
     if (world && wide_fix && (*tan_fovy != set_t || *aspect != set_a)) {  // (the world's camera: written back)
         memcpy((void *)(uintptr_t)(proj + 0xac), tan_fovy, 4), memcpy((void *)(uintptr_t)(proj + 0xb0), aspect, 4);
         pthread_mutex_lock(&wide_cam_lock);

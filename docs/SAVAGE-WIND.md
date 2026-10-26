@@ -1395,6 +1395,136 @@ La 1.9.0 (2026-10-22, rama `game-1.9.0`; archivos del usuario en `extracted-1.9.
   La preparación acepta la carpeta 1.9.0 (versión "1.9.0", 39008+ ficheros) y rechaza `exefs` 1.9.0 con `romfs`
   1.8.2 y al revés.
 
+## Frame generation (AMD FSR 3)
+
+Video > Frame generation (AMD FSR 3) (Off by default; `frame_generation = 0|1`; `SAVAGEWIND_FG=0|1` overrides it in
+tests) makes a frame between each two the game draws, with the frame interpolation and optical flow of AMD's
+FidelityFX SDK 1.1.4 (MIT, `third_party/FidelityFX`, see its README). Windows and Linux (Vulkan); no row on macOS.
+
+**Driving the SDK.** The SDK's own path is its frame interpolation swapchain: it replaces `vkCreateSwapchainKHR`,
+`vkAcquireNextImageKHR` and `vkQueuePresentKHR`, wants a present queue and an acquire queue the game never touches,
+paces the frames itself, and is Windows-only (`Windows.h`, Win32 threads and events). Savage Wind uses neither it nor
+the ffx-api DLL layer: `runtime/nvn/vulkan/framegen.cpp` does in C++ what the ffx-api provider
+(`ffx_provider_framegeneration.cpp`) does: a shared backend context for the resources the effects exchange (optical
+flow vectors and scene change detection, two sets of dilated depth, dilated motion vectors and the previous frame's
+reconstructed depth, which alternate), the optical flow context and the frame interpolation context. Per frame:
+frame interpolation's prepare (dilates the depth and motion vectors), the optical flow over the HUD-less image, the
+interpolation. All of it is recorded into the frame's own command buffer, on the game's queue, and the runtime keeps
+its own present thread, its HDR10 pass, the VSync modes and the window's crop. The SDK's shaders are built by
+`tools/ffx_shaders.py` (glslangValidator and a small SPIR-V reader for the bindings, in place of the SDK's
+Windows-only FidelityFX_SC.exe), only the permutations used: wave32, 32-bit floats, render-size motion vectors without
+jitter, both depth directions. `framegen.cpp` is the SDK's blob lookup (`ffxGetPermutationBlobByIndex`). The backend
+asks for a few extension functions it then calls unchecked (debug labels, `vkGetBufferMemoryRequirements2KHR`):
+`framegen.cpp` hands it no-ops or the core ones. Two changes to `ffx_vk.cpp`, for clang: the arrays in its scratch
+memory are 64-byte aligned (they were 4: clang's aligned SSE stores faulted).
+
+**Inputs** (`runtime/nvn/vulkan/exec.c`, "frame generation"):
+
+- The camera. The world's draws into the 3D scene's depth read a context constant buffer (`c3` of the vertex stage)
+  that holds, as floats, the view (0-11, a 3x4 matrix by rows), the view-projection (12-27), the projection (28-43,
+  OpenGL style, z -1..1), the camera's own matrix (44-55: right, up, back and position in its columns) and near / far
+  (56, 57). It was found by looking for the world camera's projection, known from `rt_persp`, in the bound constant
+  buffers. The world camera's buffer is the one with a perspective projection (row 3 = 0 0 -1 0) and a far plane over
+  10000 (25000; the HUD's layers and the menus' 3D models have 10000), on the depth target the most such draws use;
+  the 58 floats are copied at its first draw of the frame.
+- The depth: that target, at the 3D scene's size (`RS_SCENE`, the internal resolution), D32. OpenGL-style depth
+  (0 near, 1 far: not inverted, not infinite).
+- The motion vectors: BOTW has none. `fg_mv.frag` (`shaders.c`) takes each pixel's depth back to NDC, through the
+  previous frame's view-projection times this frame's inverse to where that point was, and writes the difference in
+  uv units (R16G16F, render size). Camera motion only: what moves on its own (Link, enemies, animals, grass and trees
+  in the wind, water, particles) gets the vector of a still object at its place, and the interpolation's optical flow
+  has to find the rest. Link gets his own: the camera orbits him, so on screen he stays where he is while the camera's
+  vectors took him along with the world behind him, and players saw a smear around him whenever the camera turned
+  sideways onto him (not from behind). His position (uking::act::PlayerInfo +0x88, read with the camera's buffer)
+  gives a box around him, his feet + 0.1 to 1.9 m and 0.7 m to each side, projected to the screen and to a depth
+  range; the pixels inside both (him, and a strip of ground at his feet) take the motion of his centre on screen
+  between the two frames. His limbs and what he holds are still the optical flow's. `SAVAGEWIND_FG_MV_DEBUG=1` paints
+  the box (red) and the pixels taken as him (yellow) into the motion vectors (dump them with
+  `SAVAGEWIND_FG_INPUTS_AT=<n>`); `SAVAGEWIND_FG_NO_LINK=1` leaves him out. Other moving things (enemies, horses,
+  animals) would need per-object vectors: each draw's previous transform, which the translated vertex shaders could
+  output from the previous frame's constant buffers kept per draw. Not done.
+- The HUD-less image: BOTW composites the scene into a linear 10-bit image of the final size (A2B10G10R10), draws the
+  HUD into that, then copies it sRGB-encoded into the 8-bit image it presents. The composite's target is copied right
+  after the composite (`scene_composite`, the draw `scene_post` also uses), before the next draw, the HUD's first,
+  with a blit into an sRGB image: that encodes as the game's copy does, and read through a UNORM view it matches the
+  presented image bit for bit where there is no HUD. The SDK tells the HUD apart by comparing the two, so the HUD, the
+  minimap and Savage Wind's overlay stay sharp in the generated frames (a raw copy of the 10-bit bits made everything
+  look like HUD, and the "generated" frames were the game's next ones).
+- A cut (a jump of over 10 m, or the view turned over ~35 degrees in a frame), a frame without all of the above, or
+  the first frame after the menus: no history (the SDK's reset). Its own scene change detection catches the rest.
+
+**Presenting** (`device.c` `present_locked`, `present_wait_turn`). The interpolated image is the game's final image
+(`RS_OUT`), so it goes through the same path as the game's frames: the crop and placement in the window (Fill wide
+screens, bars), SMAA or FSR 1 to the window's size, the F1 menu and performance overlay, the HDR10 pass. The display
+shows a frame when the GPU has drawn it, not when the CPU hands it over: the GPU runs a frame or two behind (present to
+shown ~33 ms at 50 drawn fps), and both frames of a pair are drawn within a millisecond of each other. So the present
+thread waits for each frame of a pair to be drawn (the submission's timeline value), presents the generated one at
+once and the game's half the time between generated frames later, as AMD's frame interpolation swapchain does. The
+presents queue up for it (the game's frame waits there while the next frame is drawn; plain presents stay one at a
+time, as before), and `vkAcquireNextImageKHR` / `vkQueuePresentKHR` share a lock (the swapchain is externally
+synchronized); the swapchain has one image more for the queued pair. Same scene as below, hidden window at 120 Hz,
+VSync On: presented every 8.6-9.6 ms with a standard deviation of 0.4-1.2 ms, present to shown 4-7 ms (17-20 ms
+without frame generation, where the CPU runs ahead).
+
+The first two versions spaced the presents by the CPU's clock (half the measured frame time, then whole refreshes):
+on the user's G-SYNC display both frames of a pair showed together, then a long gap, and the picture ghosted while the
+camera moved with VSync On, Fast or Adaptive (with Off, tearing hid it). The display's own times
+(`SAVAGEWIND_PRESENT_CSV`, VK_KHR_present_wait) showed it: intervals of 7-15 ms, not whole refreshes (G-SYNC on).
+
+**Frame rate.** Video > Frame rate counts the presented frames: with frame generation the game is paced at half of it
+(`framepace_period_ns`, `g_fg_active`): 120 shows 60 drawn + 60 generated, 60 shows 30 + 30, no limit draws as fast
+as it can (300 at most) and doubles that. The game's clock follows the frames it draws, as always. With VSync On or
+Adaptive the presented rate stays under the display's refresh rate as without frame generation (116 at 120 Hz).
+
+**When.** In play only: not on the start screen, in the pause menu or the map, or with the F1 menu open
+(`fg_wanted`): there the picture mostly stands still, and the game's own frames keep its cursor crisp. Cutscenes and
+talks are generated too. When it stops, the next frame starts without history.
+
+Tests: `SAVAGEWIND_FG_SHOT_AT=<frame>,...` saves two presents in a row from there, each generated frame and the
+game's frame after it (`build/frames/window_N_<0|1>_<gen|real>.png`); `SAVAGEWIND_FG_DEBUG_VIEW=1` shows the SDK's
+debug view (motion vector fields, optical flow, disocclusion) instead of the generated frames; `SAVAGEWIND_FG_LOG=1`
+why frames aren't generated; the `[fg]` lines count generated and presented frames every 2 s. `SAVAGEWIND_EXIT_AT=<frame>`
+ends a scripted run.
+
+**Measured** (2026-10-25, RTX 3060, Ryzen 5 5600X, hidden 2560x1440 window, HDR10 on, SMAA, no upscaler, VSync
+Off; the Great Plateau by the Temple of Time's walls, standing, then turning the camera; each line the mean over 2 s,
+from the runtime's `[vk]` and `[fg]` lines):
+
+| Frame rate | Frame generation | Drawn by the game | Presented |
+|---|---|---|---|
+| 60 | Off | 60 | 60 |
+| 60 | On | 30 | 60 (30 generated) |
+| 120 | Off | 106-118 standing, 81-89 turning | the same |
+| 120 | On | 60 standing, 59 turning | 120 standing, 117 turning |
+| No limit | Off | 108-118 standing, 82-90 turning | the same |
+| No limit | On | 71-78 standing, 56-59 turning | 142-155 standing, 112-118 turning |
+
+So with frame generation the game draws about 4 ms longer per frame here. GPU time per frame
+(`SAVAGEWIND_GPUPROF_AT`, which marks the frame generation steps): motion vectors 0.06 ms, the SDK's optical flow and
+interpolation 3.4 ms, the generated frame's own present (SMAA, the HDR10 pass) about 0.4 ms. `SAVAGEWIND_FG_TEST=1`
+makes the frame without presenting it, `=2` presents the HUD-less copy instead of interpolating (to tell the parts'
+costs apart: no limit, 113 drawn fps off, 72 with the interpolation alone, 98 with the second present alone). The
+SDK's 16-bit shaders (`FFX_HALF`, with shaderFloat16 on) were tried: no faster on the RTX 3060, so not kept.
+The performance overlay counts the presented frames with frame generation on (generated ones included); its frame
+time and graph are the game's frames. At 120 it
+holds 120 presented where the game alone doesn't, at the cost of drawing 60 (and the controls answering as at 60,
+half a frame later). Also tried: a 3440x1440 window with Fill wide screens and FSR 1 Quality (render 2293x960 -> 3440x1440,
+112-116 presented at 120), HUD 16:9 in the middle, the generated frames right.
+
+**What it looks like** (shots: `SAVAGEWIND_FG_SHOT_AT`, compared to the game's frames before and after; the generated
+frame's PSNR against each is 1.5-2.5 dB over theirs against each other, so it lies between them):
+
+- The camera turning, standing: clean. The world, Link standing, the HUD and the minimap as in the game's frames.
+- Running: Link himself ghosts. His motion isn't in the vectors (camera only), the optical flow finds part of it, and
+  what it misses is blended: at 30 drawn fps (60 presented) a clear double image of his legs, sword and bow in the
+  generated frames; at 60 drawn (120 presented) the same, smaller (a soft second outline of the legs and the sword).
+  On screen that shows as a faint shimmer around him while he runs. The grass in the wind moves too little to show.
+- The HUD is the game's newer frame's in both, so its animations (the minimap turning) step at the drawn rate.
+- Not looked at yet: enemies, horses, water, particles, fast cuts in cutscenes, and the image on a real display
+  (VSync On / FIFO, VRR, HDR10 brightness): the shots are taken from the window image before the present. Not
+  measured: the added latency. The Linux build of the SDK's sources (`ffx_compat.h` has what glibc lacks) isn't
+  tried yet.
+
 ## Audio
 
 El `sdk` de BOTW trae el AudioRenderer entero: el servidor (`nn::audio::server`: voces, mezclas, efectos,

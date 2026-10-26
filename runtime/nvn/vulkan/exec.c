@@ -16,6 +16,9 @@
 #include "vk.h"
 #include "../renderer.h"
 #include "../../settings.h"
+#include "../output_scale.h"
+#include "framegen.h"
+#include "../../game_sites.h"
 
 static uint64_t stat_build_waits;  // draws that waited for their pipeline (draw_must_happen)
 static uint64_t stat_draws, stat_skipped, stat_passes, stat_dispatches, stat_wait_ns, stat_flushes, stat_feedback_copies;
@@ -3615,6 +3618,8 @@ void vk_exec_reset(void) {
 // The 3D scene upscaled / sharpened for this draw (scene_post): sampled instead of the scene texture, at its scale.
 static struct { NvnTexture *t; TexBackend *img; float sx, sy; } scene_up;
 static void scene_post(Prog *pr, CmdRec *r);
+static void fg_draw(Prog *pr, CmdRec *r);  // (frame generation, below: the camera, the depth, the HUD-less image)
+static void fg_before_draw(void);
 
 // SAVAGEWIND_ANISO_ALL=<presented frame>: from then on every texture takes Video > Anisotropic filtering's override,
 // as before texture_info left some out (same-view A/B in one run)
@@ -4542,6 +4547,7 @@ static void wait_built(_Atomic int *state) {  // (0 building: until built or fai
 
 static void draw_(CmdRec *r, bool indexed) {
     if (profd) prof_tp_ = SDL_GetTicksNS();
+    fg_before_draw();
     if (!st.program) { stat_skipped++; return; }
     static int no_key_gen = -1;
     if (no_key_gen < 0) no_key_gen = getenv("SAVAGEWIND_VK_NO_KEY_GEN") != NULL;
@@ -4682,6 +4688,7 @@ static void draw_(CmdRec *r, bool indexed) {
     if (lst_on > 0) lst_draw(pr);
     resolve_feedback(pr);
     scene_post(pr, r);
+    fg_draw(pr, r);
     snap_reason = "draw-depthwrite";
     if (st.rt.depth && st.ds[0] && st.ds[1]) snapshots_invalidate(st.rt.depth);
     snap_reason = "draw-colorwrite";
@@ -5642,7 +5649,7 @@ static VkPipeline post_pipeline(const char *fs, VkFormat fmt) {
             b[i] = (VkDescriptorSetLayoutBinding){i, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL};
         VkDescriptorSetLayoutCreateInfo li = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 3, .pBindings = b};
         VK_CHECK(vkCreateDescriptorSetLayout(g_vk.dev, &li, NULL, &post_set_layout));
-        VkPushConstantRange r = {VK_SHADER_STAGE_FRAGMENT_BIT, 0, 32};
+        VkPushConstantRange r = {VK_SHADER_STAGE_FRAGMENT_BIT, 0, 112};  // (the passes push 32 bytes, fg_mv.frag 112)
         VkPipelineLayoutCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1,
                                          .pSetLayouts = &post_set_layout, .pushConstantRangeCount = 1, .pPushConstantRanges = &r};
         VK_CHECK(vkCreatePipelineLayout(g_vk.dev, &ci, NULL, &post_layout));
@@ -5737,8 +5744,8 @@ static VkImageView smaa_lut(int i) {
 
 // One post pass (outside the window image's rendering): srcs (bindings 0..n-1) -> dst, fragment shader `fs`.
 // clear: start from zero (SMAA's edge pass only writes edge pixels; its weights / output read them).
-static void post_pass(VkCommandBuffer cb, const char *fs, const VkImageView *srcs, int n, TexBackend *dst, const float pc[8],
-                      bool clear) {
+static void post_pass_pc(VkCommandBuffer cb, const char *fs, const VkImageView *srcs, int n, TexBackend *dst, const float *pc,
+                         uint32_t pc_bytes, bool clear) {
     VkPipeline pipe = post_pipeline(fs, dst->format);  // (before the rendering begins: created inside it, the NVIDIA driver crashed)
     vk_full_barrier(cb);
     VkRenderingAttachmentInfo ca = {.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = post_view(dst),
@@ -5765,9 +5772,14 @@ static void post_pass(VkCommandBuffer cb, const char *fs, const VkImageView *src
     VkRect2D sc = {{0, 0}, {dst->width, dst->height}};
     vkCmdSetViewport(cb, 0, 1, &vp);
     vkCmdSetScissor(cb, 0, 1, &sc);
-    vkCmdPushConstants(cb, post_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, 32, pc);
+    vkCmdPushConstants(cb, post_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, pc_bytes, pc);
     vkCmdDraw(cb, 3, 1, 0, 0);
     vkCmdEndRendering(cb);
+}
+
+static void post_pass(VkCommandBuffer cb, const char *fs, const VkImageView *srcs, int n, TexBackend *dst, const float pc[8],
+                      bool clear) {
+    post_pass_pc(cb, fs, srcs, n, dst, pc, 32, clear);
 }
 
 // The view the present samples: the game image, or its anti-aliased / upscaled version. ow x oh: the whole image's
@@ -5827,6 +5839,23 @@ static VkImageView post_process(VkCommandBuffer cb, TexBackend *b, double ow_d, 
 // sharpens it; then CAS, if on, sharpens the result (or the native scene, with the upscaler off), all in the scene's
 // own format (10-bit: no banding); the draw then samples that at 1:1 (texture_info). SAVAGEWIND_SCENE_FSR=0: the
 // game's own bilinear composite (A/B); SAVAGEWIND_SCENE_CAS=0: no sharpening whatever the setting.
+// The draw is the scene -> final image composite: a few vertices into the final image (RS_OUT) over most of it,
+// sampling a full-size scene target (not one of its reduced steps: bloom, blur). Its scene texture, or NULL.
+static NvnTexture *scene_composite(Prog *pr, CmdRec *r) {
+    NvnTexture *rt = st.rt.ncolor ? st.rt.color[0] : NULL;
+    if (!rt || r->x[2] > 6 || !pr->fi->ntex || vk_texture_scale_group(rt) != RS_OUT) return NULL;
+    const float *vp = st.viewport[0];
+    if (vp[2] < rt->width * 0.5f || vp[3] < rt->height * 0.5f) return NULL;  // (a composite fills most of the image)
+    for (int i = 0; i < pr->fi->ntex && i < 64; i++) {
+        NvnTexture *t = shader_texture_object(1, &pr->fi->tex[i]);
+        if (!t || t->target != 1 || vk_texture_scale_group(t) != RS_SCENE || t->width * 2 < vp[2] || t->height * 2 < vp[3]) continue;
+        TexBackend *b = vk_tex(t, false);
+        if (!b->image || b->layers != 1 || b->samples != 1 || b->depth != 1 || (b->aspect & ~VK_IMAGE_ASPECT_COLOR_BIT)) continue;
+        return t;
+    }
+    return NULL;
+}
+
 static void scene_post(Prog *pr, CmdRec *r) {
     scene_up.t = NULL;
     static int fsr_on = -1, cas_on = -1;
@@ -5834,26 +5863,21 @@ static void scene_post(Prog *pr, CmdRec *r) {
     if (cas_on < 0) cas_on = getenv("SAVAGEWIND_SCENE_CAS") ? atoi(getenv("SAVAGEWIND_SCENE_CAS")) : 1;
     bool fsr = fsr_on && g_settings.upscaler == UPSCALE_FSR1, cas = cas_on && g_settings.sharpening > 0;
     if (!fsr && !cas) return;
-    NvnTexture *rt = st.rt.ncolor ? st.rt.color[0] : NULL;
-    if (!rt || r->x[2] > 6 || !pr->fi->ntex || vk_texture_scale_group(rt) != RS_OUT) return;
+    NvnTexture *t = scene_composite(pr, r), *rt = st.rt.ncolor ? st.rt.color[0] : NULL;
+    if (!t) return;
     const float *vp = st.viewport[0];
-    if (vp[2] < rt->width * 0.5f || vp[3] < rt->height * 0.5f) return;  // (a composite fills most of the image)
     float osx, osy;
     renderer_texture_scale(rt, &osx, &osy);
     uint32_t ow = (uint32_t)lroundf(vp[2] * osx), oh = (uint32_t)lroundf(vp[3] * osy);
     if (ow > 16384) ow = 16384;
     if (oh > 16384) oh = 16384;
-    for (int i = 0; i < pr->fi->ntex && i < 64; i++) {
-        NvnTexture *t = shader_texture_object(1, &pr->fi->tex[i]);
-        // the scene: a full-size scene target (not one of its reduced steps: bloom, blur)
-        if (!t || t->target != 1 || vk_texture_scale_group(t) != RS_SCENE || t->width * 2 < vp[2] || t->height * 2 < vp[3]) continue;
+    {
         TexBackend *b = vk_tex(t, false);
-        if (!b->image || b->layers != 1 || b->samples != 1 || b->depth != 1 || (b->aspect & ~VK_IMAGE_ASPECT_COLOR_BIT)) continue;
         bool up = fsr && (ow > b->width + 1 || oh > b->height + 1);  // (else at its size in the window already)
         if (!up && !cas) return;
         VkFormatProperties fp;
         vkGetPhysicalDeviceFormatProperties(g_vk.phys, b->format, &fp);
-        if (!(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT)) continue;
+        if (!(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT)) return;
         vk_end_pass();
         VkCommandBuffer cb = vk_cmd();
         static const VkComponentMapping id = {0};
@@ -5893,6 +5917,315 @@ static void scene_post(Prog *pr, CmdRec *r) {
         lw = b->width; lh = b->height; low = w; loh = h; lcas = g_settings.sharpening;
         return;
     }
+}
+
+// ================================================================== frame generation (Video > Frame generation)
+// AMD FSR 3 frame interpolation (framegen.cpp) makes a frame between each two the game draws, from the two frames'
+// final images, the newer one's 3D scene depth, its HUD-less image and motion vectors made here from the camera
+// (BOTW has none). device.c presents it, then the game's frame half a frame later. See docs/SAVAGE-WIND.md.
+//   - The camera: the world's draws into the 3D scene's depth read a context constant buffer (c3) that holds, as
+//     floats, the view (0-11, 3x4 rows), view-projection (12-27), projection (28-43, OpenGL style), the camera's own
+//     matrix (44-55: right, up, back, position in its columns) and near / far (56, 57). The world camera's is the
+//     one with a perspective projection (row 3 = 0 0 -1 0) and the far plane over 10000 (25000; the HUD's layers and
+//     the menus' are 10000), on the depth target the most draws use.
+//   - The HUD-less image: the composite's target right after the scene -> final image composite (scene_composite),
+//     before the next draw, which is the HUD's first; converted as the game converts it into the presented image
+//     (fg_copy_hudless).
+//   - The motion vectors (fg_mv.frag): each pixel's depth back to a point in the world with this frame's
+//     view-projection, and that point through the previous frame's: where it was. Camera motion only: what moves by
+//     itself (Link, enemies, grass in the wind, water) gets the vectors of a still object there, and the
+//     interpolation's optical flow has to make up the rest.
+static void save_view_png(TexBackend *b, VkImageView src, const char *path);
+volatile int g_fg_want;  // device.c: frame generation is wanted for the frame being drawn
+void vk_fg_wait_idle(void);  // (device.c)
+
+enum { FG_CAMERA_FLOATS = 58 };
+static struct {
+    NvnTexture *out_rt, *scene;  // the image the scene was composited into this frame, and the scene
+    VkFormat present_format;     // the presented image's (the HUD-less copy is made in it)
+    bool copy_pending, hudless_ok;
+    struct { NvnTexture *depth; uint64_t cb; int draws; float m[FG_CAMERA_FLOATS], link[3]; bool has_link; } cand[4];
+    int ncand;
+    double prev_vp[16];
+    float prev_pos[3], prev_fwd[3], prev_link[3];
+    bool have_prev_link;
+    bool have_prev;
+    uint64_t frame_id, last_ns;
+} fg;
+
+// Its own images (with storage use, which post_image's lack): 0 the HUD-less copy, 1 motion vectors, 2 the
+// interpolated frame
+static TexBackend *fg_image(int i, uint32_t w, uint32_t h, VkFormat f, VkImageUsageFlags usage) {
+    static TexBackend img[3];
+    TexBackend *d = &img[i];
+    if (d->image && (d->width != w || d->height != h || d->format != f)) {
+        vk_views_forget(d);
+        vk_defer_image(d->image, d->mem);
+        d->image = VK_NULL_HANDLE;
+        d->mem = VK_NULL_HANDLE;
+    }
+    if (!d->image) {
+        VkImageCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT,
+                                .imageType = VK_IMAGE_TYPE_2D, .format = f, .extent = {w, h, 1}, .mipLevels = 1,
+                                .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
+                                .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | usage};
+        VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+        VK_CHECK(vmaCreateImage(g_vk.vma, &ci, &ai, &d->image, &d->mem, NULL));
+        d->format = f; d->width = w; d->height = h; d->depth = 1; d->layers = 1; d->levels = 1;
+        d->samples = 1; d->aspect = VK_IMAGE_ASPECT_COLOR_BIT; d->base_type = VK_IMAGE_VIEW_TYPE_2D;
+        vk_image_init_layout(vk_cmd(), d->image, d->aspect);
+    }
+    return d;
+}
+
+static VkFormat unorm_of(VkFormat f) {  // (the bytes as written: an sRGB image is interpolated as stored)
+    return f == VK_FORMAT_R8G8B8A8_SRGB ? VK_FORMAT_R8G8B8A8_UNORM : f == VK_FORMAT_B8G8R8A8_SRGB ? VK_FORMAT_B8G8R8A8_UNORM : f;
+}
+
+static VkFormat srgb_of(VkFormat f) {
+    return f == VK_FORMAT_R8G8B8A8_UNORM ? VK_FORMAT_R8G8B8A8_SRGB : f == VK_FORMAT_B8G8R8A8_UNORM ? VK_FORMAT_B8G8R8A8_SRGB : f;
+}
+
+static void fg_copy_hudless(void) {
+    fg.copy_pending = false;
+    TexBackend *s = fg.out_rt ? vk_tex(fg.out_rt, true) : NULL;
+    if (!s || !s->image || s->aspect != VK_IMAGE_ASPECT_COLOR_BIT || s->layers != 1 || s->samples != 1) return;
+    // (as the presented image has it: BOTW draws the HUD into a linear 10-bit image, then copies that sRGB-encoded into
+    // the 8-bit one it presents; a blit into an sRGB image encodes the same way, and it is read through a UNORM view)
+    TexBackend *d = fg_image(0, s->width, s->height, srgb_of(fg.present_format ? fg.present_format : VK_FORMAT_R8G8B8A8_UNORM),
+                             VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+    vk_end_pass();
+    VkCommandBuffer cb = vk_cmd();
+    vk_full_barrier(cb);
+    VkImageBlit bl = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                      .srcOffsets = {{0, 0, 0}, {(int32_t)s->width, (int32_t)s->height, 1}},
+                      .dstOffsets = {{0, 0, 0}, {(int32_t)s->width, (int32_t)s->height, 1}}};
+    vkCmdBlitImage(cb, s->image, VK_IMAGE_LAYOUT_GENERAL, d->image, VK_IMAGE_LAYOUT_GENERAL, 1, &bl, VK_FILTER_NEAREST);
+    vk_full_barrier(cb);
+    fg.hudless_ok = true;
+}
+
+static void fg_before_draw(void) {
+    if (fg.copy_pending) fg_copy_hudless();
+}
+
+static void fg_draw(Prog *pr, CmdRec *r) {
+    if (!g_fg_want) return;
+    if (st.rt.depth && vk_texture_scale_group(st.rt.depth) == RS_SCENE) {
+        Range u = st.ubuf[0][0];
+        const float *f = (const float *)(uintptr_t)u.addr;
+        if (u.addr && u.size >= FG_CAMERA_FLOATS * 4 && f[40] == 0 && f[41] == 0 && f[42] == -1 && f[43] == 0 &&
+            f[57] > 10001 && f[56] > 0) {
+            int i = 0;
+            while (i < fg.ncand && (fg.cand[i].depth != st.rt.depth || fg.cand[i].cb != u.addr)) i++;
+            if (i == fg.ncand && i < 4) {
+                fg.ncand++;
+                fg.cand[i].depth = st.rt.depth, fg.cand[i].cb = u.addr, fg.cand[i].draws = 0;
+                memcpy(fg.cand[i].m, f, sizeof fg.cand[i].m);
+                // Link's position as this frame's camera saw it (uking::act::PlayerInfo +0x88, framepace.c)
+                uint64_t pinfo = g_site.player_info ? *(uint64_t *)(uintptr_t)g_site.player_info : 0;
+                fg.cand[i].has_link = pinfo != 0;
+                if (pinfo) memcpy(fg.cand[i].link, (const void *)(uintptr_t)(pinfo + 0x88), sizeof fg.cand[i].link);
+            }
+            if (i < 4) fg.cand[i].draws++;
+        }
+    }
+    NvnTexture *t = scene_composite(pr, r);
+    if (t) {
+        fg.out_rt = st.rt.color[0];
+        fg.scene = t;
+        fg.copy_pending = true;  // (after this draw: fg_before_draw)
+    }
+}
+
+static bool invert4(const double *m, double *o) {  // (row-major, Gauss-Jordan)
+    double a[4][8];
+    for (int r = 0; r < 4; r++)
+        for (int c = 0; c < 8; c++) a[r][c] = c < 4 ? m[r * 4 + c] : (c - 4 == r);
+    for (int c = 0; c < 4; c++) {
+        int p = c;
+        for (int r = c + 1; r < 4; r++) if (fabs(a[r][c]) > fabs(a[p][c])) p = r;
+        if (fabs(a[p][c]) < 1e-12) return false;
+        for (int k = 0; k < 8; k++) { double t = a[c][k]; a[c][k] = a[p][k]; a[p][k] = t; }
+        double d = a[c][c];
+        for (int k = 0; k < 8; k++) a[c][k] /= d;
+        for (int r = 0; r < 4; r++) {
+            if (r == c) continue;
+            double s = a[r][c];
+            for (int k = 0; k < 8; k++) a[r][k] -= s * a[c][k];
+        }
+    }
+    for (int r = 0; r < 4; r++)
+        for (int c = 0; c < 4; c++) o[r * 4 + c] = a[r][c + 4];
+    return true;
+}
+
+// A world point through a row-major view-projection: uv in the depth image (ysign: the rows' direction) and its depth
+// value. false: behind the camera.
+static bool fg_project(const double *vp, const float *p, float ysign, bool gl_depth, float *uv, float *d) {
+    double c[4];
+    for (int r = 0; r < 4; r++) c[r] = vp[r * 4] * p[0] + vp[r * 4 + 1] * p[1] + vp[r * 4 + 2] * p[2] + vp[r * 4 + 3];
+    if (c[3] <= 1e-4) return false;
+    uv[0] = (float)((c[0] / c[3] + 1) / 2), uv[1] = (float)((c[1] / c[3] * ysign + 1) / 2);
+    *d = (float)(gl_depth ? (c[2] / c[3] + 1) / 2 : c[2] / c[3]);
+    return true;
+}
+
+// At the game's present (device.c), outside the window image's rendering: the frame between the previous one and
+// t (b: its image), or NULL (not wanted, or this frame lacks what it needs: the next one starts over).
+TexBackend *vk_fg_generate(NvnTexture *t, TexBackend *b) {
+    // (the game composites the scene into an image of its own and copies that into the presented one: the same size)
+    TexBackend *ob = fg.out_rt ? vk_tex(fg.out_rt, true) : NULL;
+    bool same = ob && ob->width == b->width && ob->height == b->height && fg.present_format == unorm_of(b->format);
+    fg.present_format = unorm_of(b->format);
+    if (fg.copy_pending) fg_copy_hudless();  // (nothing drawn after the composite)
+    uint64_t now = SDL_GetTicksNS();
+    float frame_ms = fg.last_ns ? (float)((now - fg.last_ns) / 1e6) : 16.7f;
+    fg.last_ns = now;
+    TexBackend *out = NULL, *scene = fg.scene && same ? vk_tex(fg.scene, true) : NULL;
+    int best = -1;
+    for (int i = 0; scene && i < fg.ncand; i++) {
+        TexBackend *d = vk_tex(fg.cand[i].depth, true);
+        if (d->image && d->width == scene->width && d->height == scene->height && d->layers == 1 && d->samples == 1 &&
+            (best < 0 || fg.cand[i].draws > fg.cand[best].draws))
+            best = i;
+    }
+    bool ok = g_fg_want && fg.hudless_ok && best >= 0 && b->image && b->layers == 1 && b->samples == 1;
+    {   // why not, now and then (a frame in play without what generation needs)
+        static uint64_t n;
+        if (g_fg_want && !ok && n++ % 300 == 0)
+            LOG("[fg] frame not generated: HUD-less image %d (composite into an image of the presented one's size %d), scene %s, %d camera "
+                "candidates%s\n", fg.hudless_ok, same, scene ? "found" : "missing", fg.ncand,
+                best < 0 && fg.ncand ? " (none on a depth target of the scene's size)" : "");
+    }
+    if (ok) {
+        const float *m = fg.cand[best].m;
+        double vp[16], inv[16], mm[16];
+        for (int i = 0; i < 16; i++) vp[i] = m[12 + i];
+        float pos[3] = {m[47], m[51], m[55]}, right[3] = {m[44], m[48], m[52]}, up[3] = {m[45], m[49], m[53]};
+        float fwd[3] = {-m[46], -m[50], -m[54]};
+        float dp = 0, dot = 0;
+        for (int k = 0; k < 3; k++) dp += (pos[k] - fg.prev_pos[k]) * (pos[k] - fg.prev_pos[k]), dot += fwd[k] * fg.prev_fwd[k];
+        // a cut: no history (a jump of over 10 m, or the view turned over ~35 degrees in a frame)
+        bool reset = !fg.have_prev || dp > 100 || dot < 0.82f;
+        {
+            static int lg = -1;
+            static uint64_t k;
+            if (lg < 0) lg = getenv("SAVAGEWIND_FG_LOG") != NULL;
+            if (lg && k++ % 60 < 4)
+                LOG("[fg] camera %d of %d (%d draws) at %.1f %.1f %.1f, moved %.2f m, turn %.4f%s\n", best, fg.ncand,
+                    fg.cand[best].draws, pos[0], pos[1], pos[2], sqrtf(dp), dot, reset ? ", reset" : "");
+        }
+        if (reset) memcpy(fg.prev_vp, vp, sizeof vp);
+        ok = invert4(vp, inv);
+        for (int r = 0; ok && r < 4; r++)  // (previous view-projection x this one's inverse: this frame's NDC -> the previous one's clip)
+            for (int c = 0; c < 4; c++) {
+                double s = 0;
+                for (int k = 0; k < 4; k++) s += fg.prev_vp[r * 4 + k] * inv[k * 4 + c];
+                mm[r * 4 + c] = s;
+            }
+        TexBackend *db = vk_tex(fg.cand[best].depth, true);
+        if (ok) {
+            vk_end_pass();
+            VkCommandBuffer cb = vk_cmd();
+            static const VkComponentMapping id = {0};
+            VkImageView dv = vk_image_view(db, VK_IMAGE_VIEW_TYPE_2D, db->format, 0, 1, 0, 1, id, VK_IMAGE_ASPECT_DEPTH_BIT);
+            TexBackend *mv = fg_image(1, db->width, db->height, VK_FORMAT_R16G16_SFLOAT, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+            static float ysign;
+            if (!ysign) {
+                const char *e = getenv("SAVAGEWIND_FG_YSIGN");  // (testing: the image rows' direction)
+                ysign = e ? (float)atof(e) : renderer_origin_lower_left() ? 1.0f : -1.0f;
+            }
+            float pc[28] = {0};
+            for (int r = 0; r < 4; r++)
+                for (int c = 0; c < 4; c++) pc[c * 4 + r] = (float)mm[r * 4 + c];  // (GLSL: column-major)
+            bool gl_depth = nvn_depth_mode() == 0;
+            pc[16] = (float)db->width, pc[17] = (float)db->height, pc[18] = ysign, pc[19] = gl_depth ? 1.0f : 0.0f;
+            if (getenv("SAVAGEWIND_FG_MV_DEBUG")) pc[19] = 2;  // (testing: Link's box in the motion vector image)
+            // Link: the pixels in his box (1.4 m wide, his feet + 0.1 to 1.9 m: on screen and in depth) move as he does,
+            // not as a still object there. The camera orbits him: on screen he stays where he is, and the camera's
+            // vectors alone took him along with the world behind, which the interpolation smeared. His limbs and
+            // what he holds are still the optical flow's.
+            pc[20] = pc[21] = 2, pc[22] = pc[23] = -1;  // (an empty box: none)
+            const float *lk = fg.cand[best].link;
+            static int no_link = -1;  // (A/B) SAVAGEWIND_FG_NO_LINK=1: camera motion only
+            if (no_link < 0) no_link = getenv("SAVAGEWIND_FG_NO_LINK") != NULL;
+            if (!no_link && fg.cand[best].has_link && !reset && fg.have_prev_link) {
+                float lo[2] = {1e9f, 1e9f}, hi[2] = {-1e9f, -1e9f}, dlo = 1e9f, dhi = -1e9f, uv[2], d;
+                bool ok_box = true;
+                for (int k = 0; k < 8 && ok_box; k++) {
+                    float p[3] = {lk[0] + (k & 1 ? 0.7f : -0.7f), lk[1] + (k & 2 ? 1.9f : 0.1f), lk[2] + (k & 4 ? 0.7f : -0.7f)};
+                    ok_box = fg_project(vp, p, ysign, gl_depth, uv, &d);
+                    for (int a = 0; a < 2; a++) lo[a] = fminf(lo[a], uv[a]), hi[a] = fmaxf(hi[a], uv[a]);
+                    dlo = fminf(dlo, d), dhi = fmaxf(dhi, d);
+                }
+                float c_now[3] = {lk[0], lk[1] + 0.9f, lk[2]}, c_prev[3] = {fg.prev_link[0], fg.prev_link[1] + 0.9f, fg.prev_link[2]};
+                float uv_now[2], uv_prev[2], dd;
+                if (ok_box && fg_project(vp, c_now, ysign, gl_depth, uv_now, &dd) &&
+                    fg_project(fg.prev_vp, c_prev, ysign, gl_depth, uv_prev, &dd)) {
+                    pc[20] = lo[0], pc[21] = lo[1], pc[22] = hi[0], pc[23] = hi[1];
+                    pc[24] = dlo, pc[25] = dhi, pc[26] = uv_prev[0] - uv_now[0], pc[27] = uv_prev[1] - uv_now[1];
+                }
+                static int lg = -1;
+                static uint64_t k;
+                if (lg < 0) lg = getenv("SAVAGEWIND_FG_LOG") != NULL;
+                if (lg && k++ % 60 == 0)
+                    LOG("[fg] Link at %.2f %.2f %.2f: box uv %.3f..%.3f x %.3f..%.3f, depth %.6f..%.6f, motion %.4f %.4f\n",
+                        lk[0], lk[1], lk[2], pc[20], pc[22], pc[21], pc[23], pc[24], pc[25], pc[26], pc[27]);
+            }
+            if (g_gpuprof_frame) gp_mark(cb, "frame generation: motion vectors");
+            post_pass_pc(cb, "fg_mv.frag", &dv, 1, mv, pc, sizeof pc, false);
+            TexBackend *hl = fg_image(0, b->width, b->height, srgb_of(unorm_of(b->format)), VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+            {   // (testing) SAVAGEWIND_FG_INPUTS_AT=<n>: the n-th generated frame's HUD-less image and motion vectors
+                static long at = -1;
+                if (at < 0) at = getenv("SAVAGEWIND_FG_INPUTS_AT") ? atol(getenv("SAVAGEWIND_FG_INPUTS_AT")) : 0;
+                if (at && (long)fg.frame_id + 1 == at) {
+                    mkdir("build/frames", 0755);
+                    save_view_png(hl, raw_view(hl), "build/frames/fg_hudless.png");
+                    save_view_png(mv, post_view(mv), "build/frames/fg_motion.png");
+                    save_view_png(b, raw_view(b), "build/frames/fg_color.png");
+                    cb = vk_cmd();
+                }
+            }
+            TexBackend *o = fg_image(2, b->width, b->height, unorm_of(b->format), VK_IMAGE_USAGE_STORAGE_BIT);
+            FgConfig cfg = {b->width, b->height, db->width, db->height, unorm_of(b->format), unorm_of(hl->format), false};
+            static int dbg = -1;
+            if (dbg < 0) dbg = getenv("SAVAGEWIND_FG_DEBUG_VIEW") != NULL;
+            FgFrame f = {.color = {b->image, unorm_of(b->format), b->width, b->height},
+                         .hudless = {hl->image, unorm_of(hl->format), hl->width, hl->height},
+                         .depth = {db->image, db->format, db->width, db->height},
+                         .motion = {mv->image, mv->format, mv->width, mv->height},
+                         .out = {o->image, o->format, o->width, o->height},
+                         .near_ = m[56], .far_ = m[57], .fovy = 2 * atanf(1 / m[33]), .frame_ms = frame_ms,
+                         .frame_id = ++fg.frame_id, .reset = reset, .debug_view = dbg};
+            memcpy(f.cam_pos, pos, sizeof pos), memcpy(f.cam_up, up, sizeof up);
+            memcpy(f.cam_right, right, sizeof right), memcpy(f.cam_fwd, fwd, sizeof fwd);
+            if (!g_fg_vk.dev) g_fg_vk = (FgVk){g_vk.phys, g_vk.dev, vk_fg_wait_idle};
+            vk_full_barrier(cb);
+            if (g_gpuprof_frame) gp_mark(cb, "frame generation: FSR 3 optical flow + interpolation");
+            static int test = -1;  // (measuring) SAVAGEWIND_FG_TEST=2: no interpolation (the HUD-less copy shown instead)
+            if (test < 0) test = getenv("SAVAGEWIND_FG_TEST") ? atoi(getenv("SAVAGEWIND_FG_TEST")) : 0;
+            ok = test == 2 ? true : fg_dispatch(cb, &cfg, &f);
+            if (test == 2) o = hl;
+            vk_full_barrier(cb);
+            if (g_gpuprof_frame) gp_mark(cb, "frame generation: done");
+            vk_dyn_forget();
+            if (ok) out = o;
+            static int logged;
+            if (!logged++)
+                LOG("[fg] first frame: depth %ux%u format %d, final image %ux%u format %d, near %g far %g fovy %.1f\n",
+                    db->width, db->height, db->format, b->width, b->height, b->format, m[56], m[57], f.fovy * 57.29578f);
+        }
+        memcpy(fg.prev_vp, vp, sizeof vp);
+        memcpy(fg.prev_pos, pos, sizeof pos), memcpy(fg.prev_fwd, fwd, sizeof fwd);
+        fg.have_prev_link = fg.cand[best].has_link;
+        memcpy(fg.prev_link, fg.cand[best].link, sizeof fg.prev_link);
+    }
+    fg.have_prev = ok;
+    fg.ncand = 0;
+    fg.hudless_ok = fg.copy_pending = false;
+    fg.out_rt = fg.scene = NULL;
+    return out;
 }
 
 // Inside the window image's rendering (device.c vk_frame_begin): the game image into (vx, vy, vw, vh).

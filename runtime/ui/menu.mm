@@ -708,6 +708,12 @@ static void tab_display(void) {
                    "AMD FidelityFX CAS sharpens the 3D image after the upscaler (or at the window's resolution with the "
                    "upscaler off), before the HUD is drawn over it: edges get crisper without halos. Most useful with "
                    "AMD FSR 1.", false);
+        // AMD FSR 3 frame generation (vulkan/framegen.cpp; the frame rate counts the presented frames: framepace.c)
+        opt_toggle("Frame generation (AMD FSR 3)", &g_settings.frame_gen, false,
+                   "AMD FSR 3 makes a frame between each two the game draws: about twice the frames on screen. The "
+                   "frame rate above counts them all, so the game itself draws half of it (60 with 120) and the "
+                   "controls answer as at that rate, a little later. In play only: the menus and the map show the "
+                   "game's own frames. Fast moves can leave faint smears around Link and what moves on its own.");
     }
 #endif
     opt_toggle("Asynchronous shaders", &g_settings.async_shaders, false,
@@ -857,7 +863,8 @@ static void perf_overlay_draw(ImGuiIO &io, float scale) {
     const ImVec4 gpu_c(0.55f, 0.83f, 0.31f, 1), cpu_c(0.18f, 0.59f, 0.80f, 1), ram_c(0.80f, 0.45f, 0.70f, 1),
                  fps_c(0.95f, 0.95f, 0.95f, 1);
     if (g_settings.perf_overlay == PERF_FPS) {
-        ImGui::TextColored(fps_c, "%.0f FPS  %.1f ms", s.fps, s.frame_ms_avg);
+        // (frame generation: the presented frames, generated ones included)
+        ImGui::TextColored(fps_c, "%.0f FPS  %.1f ms", s.fps + s.fps_generated, s.frame_ms_avg);
         ImGui::End();
         return;
     }
@@ -872,7 +879,8 @@ static void perf_overlay_draw(ImGuiIO &io, float scale) {
         ImGui::TableNextColumn(); ImGui::TextColored(ram_c, "RAM");
         perf_cell("%.1f GB", s.ram_used_mb / 1024); perf_cell("/ %.1f GB", s.ram_total_mb / 1024); perf_cell(tr("game %.1f GB"), s.ram_game_mb / 1024);
         ImGui::TableNextColumn(); ImGui::TextColored(fps_c, "FPS");
-        perf_cell("%.0f", s.fps); perf_cell("%.1f ms", s.frame_ms_avg); perf_cell(tr("max %.1f ms"), s.frame_ms_max);
+        perf_cell("%.0f", s.fps + s.fps_generated);
+        perf_cell("%.1f ms", s.frame_ms_avg); perf_cell(tr("max %.1f ms"), s.frame_ms_max);
         ImGui::EndTable();
     }
     float top = s.frame_ms_max > 50 ? s.frame_ms_max : 50;

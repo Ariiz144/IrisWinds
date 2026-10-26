@@ -154,6 +154,26 @@ RT_OBJ   := $(patsubst runtime/%.c,$(B)/rt/%.o,$(RT_SRC))
 RTFLAGS  := -O2 -g -fno-strict-aliasing -Wall -Wno-unused-function -Iruntime -Iruntime/nvn -isystem third_party -isystem third_party/stb $(DEPINC) $(OSFLAGS)
 CXXFLAGS := -O2 -g -std=c++17 -I$(IMGUI) -I$(IMGUI)/backends -Iruntime -Iruntime/nvn -isystem third_party -Ithird_party/stb $(DEPINC)
 
+.DEFAULT_GOAL := all
+
+# AMD FidelityFX SDK 1.1.4 (third_party/FidelityFX, MIT): FSR 3 frame interpolation and optical flow on its Vulkan
+# backend (runtime/nvn/vulkan/framegen.cpp). Its sources unchanged, with ffx_compat.h for what MSVC's headers bring;
+# the shaders are tools/ffx_shaders.py's (third_party/FidelityFX/spirv).
+FFX      := third_party/FidelityFX
+FFX_SRC  := $(FFX)/sdk/src/components/frameinterpolation/ffx_frameinterpolation.cpp \
+            $(FFX)/sdk/src/components/opticalflow/ffx_opticalflow.cpp $(FFX)/sdk/src/backends/vk/ffx_vk.cpp \
+            $(wildcard $(FFX)/sdk/src/shared/*.cpp)
+FFX_OBJ  := $(patsubst $(FFX)/sdk/src/%.cpp,$(B)/ffx/%.o,$(FFX_SRC))
+FFX_INC  := -I$(FFX)/sdk/include -I$(FFX)/sdk/src/components -I$(FFX)/sdk/src/shared -I$(FFX)/sdk/src/backends/shared
+ifneq ($(PLATFORM),macos)
+BACKEND_OBJ += $(FFX_OBJ)
+endif
+$(B)/ffx/%.o: $(FFX)/sdk/src/%.cpp $(FFX)/ffx_compat.h
+	@mkdir -p $(dir $@)
+	$(CXX) -O2 -g -std=c++17 -w -include $(FFX)/ffx_compat.h $(FFX_INC) -I$(FFX)/sdk/include/FidelityFX/gpu $(DEPINC) -c $< -o $@
+$(B)/rt/nvn/vulkan/framegen.o: CXXFLAGS += -include $(FFX)/ffx_compat.h $(FFX_INC) -I$(FFX)/spirv
+$(B)/rt/nvn/vulkan/framegen.o: $(FFX)/spirv/ffx_shaders_vk.h
+
 all: $(EXE) $(CONFIG_EXE) $(if $(strip $(GEN_SRC)),$(GAMELIB))  # (GEN_SRC is a space when there is no generated/)
 
 $(B)/obj/%.o: $(GEN)/%.c runtime/cpu.h runtime/simd.h runtime/simd_fp.h runtime/simd_softfma.h  # (cpu.h includes them)
@@ -301,6 +321,7 @@ dist:
 	cp third_party/fonts/FiraSans/OFL.txt "$(DIST)/FiraSans-OFL.txt"
 	cp third_party/fonts/NotoSansThai/NotoSansThai-Medium.ttf "$(DIST)/"  # (Thai menus, OFL)
 	cp third_party/fonts/NotoSansThai/OFL.txt "$(DIST)/NotoSansThai-OFL.txt"
+	cp third_party/FidelityFX/LICENSE.txt "$(DIST)/FidelityFX-LICENSE.txt"  # (AMD FidelityFX SDK, MIT: README "License")
 	cp README.md LICENSE "$(DIST)/"  # (licenses and source links of the bundled components: README "License")
 	PATH="$(CURDIR)/build/deps-win/bin:$$PATH" ldd $(WIN_B)/savagewind.exe | awk '(/ucrt64/ || /deps-win/) && !/vulkan-1/ {print $$3}' | sort -u | \
 	    xargs -I{} cp -u {} "$(DIST)/"

@@ -49,8 +49,21 @@ void perfmon_frame(void) {
     pthread_mutex_unlock(&g_lock);
 }
 
+static uint64_t g_gen_at[512];  // when each generated frame was presented (the last 512)
+static unsigned g_gen_n;
+
+void perfmon_generated_frame(void) {
+    uint64_t now = plat_now_ns();
+    pthread_mutex_lock(&g_lock);
+    g_gen_at[g_gen_n++ % 512] = now;
+    pthread_mutex_unlock(&g_lock);
+}
+
 static void frames_summary(PerfStats *s) {  // (lock held)
     uint64_t now = plat_now_ns();
+    int gen = 0;
+    for (unsigned i = 0; i < 512 && i < g_gen_n && now - g_gen_at[(g_gen_n - 1 - i) % 512] <= 1000000000ull; i++) gen++;
+    s->fps_generated = (float)gen;
     double sum = 0, mx = 0;
     int n = 0;
     for (int i = 0; i < g_ring_n; i++) {

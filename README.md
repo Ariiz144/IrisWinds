@@ -48,8 +48,10 @@ integrated graphics, which share the PC's RAM, 8 GB isn't enough: the game's 3 G
 to the GPU ([#117](https://github.com/Revivedx/SavageWindRecomp/issues/117)).
 
 1. Download from [Releases](https://github.com/Revivedx/SavageWindRecomp/releases):
-   - **Windows:** `SavageWind-0.3.0-alpha.3-windows.zip`. Extract it to a folder you can write to (not Program
-     Files): your game files, saves and settings are kept in that folder.
+   - **Windows:** `SavageWind-0.3.1-alpha.3-windows.zip`. Extract it to a folder you can write to (not Program
+     Files): your game files, saves and settings are kept in that folder. 0.3.1 is a hotfix for AMD and Intel
+     graphics on Windows (a black window in 0.3.0, [#85](https://github.com/Revivedx/SavageWindRecomp/issues/85)); on
+     NVIDIA it runs exactly as 0.3.0.
    - **Linux (x86-64, Steam Deck too):** `Savage_Wind-0.3.0-alpha.3-x86_64.AppImage`. Make it executable
      (`chmod +x`) and run it; your game files, saves and settings go to `~/.local/share/savagewind`. See
      [docs/linux.md](docs/linux.md).
@@ -137,7 +139,7 @@ Estimates of where each part stands. "Tested in game" is how much of the game ha
 | ✅ | **Variable refresh rate (VRR)** | ![100%](https://progress-bar.xyz/100/?width=150&style=square&progress_color=5cb85c) | Video > VSync: On lets G-SYNC and FreeSync displays show every frame as soon as it's ready, a little under the refresh rate; Fast (the default), Adaptive and Off too. Tried on a VRR display |
 | 🔧 | **Tested in game** | ![50%](https://progress-bar.xyz/50/?width=150&style=square&progress_color=f0ad4e) | The Shrine of Resurrection, the Great Plateau, and a walk through every region on a 100% save file. The main quests and the Divine Beasts aren't tested yet, so expect bugs there: [report what breaks](https://github.com/Revivedx/SavageWindRecomp/issues/new/choose) |
 | 🔧 | **Linux** | ![90%](https://progress-bar.xyz/90/?width=150&style=square&progress_color=5cb85c) | Builds and runs on x86-64 (from LAS Recomp); a steady 144 fps on an RTX 3070 Ti with a Ryzen 5 7600X, and no Linux-only issues so far |
-| 🗺️ | **AMD FSR 3 + frame generation** | ![5%](https://progress-bar.xyz/5/?width=150&style=square&progress_color=d9534f) | Planned: motion vectors from depth and the camera, FidelityFX SDK |
+| 🔧 | **AMD FSR 3 + frame generation** | ![60%](https://progress-bar.xyz/60/?width=150&style=square&progress_color=f0ad4e) | Video > Frame generation (AMD FSR 3): a frame made between each two the game draws, about twice the frames on screen, with the HUD kept sharp. Motion vectors from depth and the camera, and Link's own; enemies and animals can still leave a faint smear. Smooth with VSync and G-SYNC. Works on Windows; Linux and the Steam Deck aren't tried yet. Only frame generation for now: FSR 3 upscaling is next |
 | 🗺️ | **NVIDIA DLSS (RTX)** | ![0%](https://progress-bar.xyz/0/?width=150&style=square&progress_color=d9534f) | Planned, after FSR 3; under NVIDIA's own SDK license |
 | 🗺️ | **Colour grading and HDR** | ![0%](https://progress-bar.xyz/0/?width=150&style=square&progress_color=d9534f) | Planned: exposure, contrast and saturation settings, colour presets, fog and bloom on or off, and real HDR output on HDR displays |
 | 🗺️ | **Draw distance and detail** | ![0%](https://progress-bar.xyz/0/?width=150&style=square&progress_color=d9534f) | Planned: trees, grass and objects drawn farther away on strong PCs, or nearer for more fps, and a fixed level of detail (the most detailed models at any distance) |
@@ -232,6 +234,8 @@ switches - are in [docs/SAVAGE-WIND.md](docs/SAVAGE-WIND.md).
   [Vulkan Memory Allocator](https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator) (MIT),
   [SMAA](https://github.com/iryoku/smaa) (MIT), [AMD FidelityFX Super Resolution 1](https://github.com/GPUOpen-Effects/FidelityFX-FSR)
   (MIT), [AMD FidelityFX CAS](https://github.com/GPUOpen-Effects/FidelityFX-CAS) (MIT),
+  [AMD FidelityFX SDK 1.1.4](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/tree/v1.1.4) (MIT: FSR 3 frame
+  generation),
   [Fira Sans](https://github.com/mozilla/Fira) (SIL OFL 1.1), [Noto Sans Thai](https://github.com/notofonts/thai)
   (SIL OFL 1.1), [stb_image / stb_image_write](https://github.com/nothings/stb)
   (public domain / MIT), [shaderc](https://github.com/google/shaderc)
@@ -258,5 +262,8 @@ The Windows release zip also bundles, unchanged unless noted, under their own li
 - `swgen/`, this project's generator frozen with PyInstaller 6.22 (GPL 2.0 with the bootloader exception): Python
   3.14 (PSF License), Capstone 5.0.9 (BSD), [Unicorn 2.1.4](https://github.com/unicorn-engine/unicorn/tree/2.1.4)
   (GPL 2.0, source at that link) and python-lz4 4.4.5 (BSD).
+- AMD FidelityFX SDK 1.1.4 (MIT, `FidelityFX-LICENSE.txt`), compiled into savagewind.exe: FSR 3 frame interpolation,
+  optical flow and the Vulkan backend, from [its source](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/tree/v1.1.4)
+  with two alignment fixes (`third_party/FidelityFX/README.md`) and shaders compiled by `tools/ffx_shaders.py`.
 - The Fira Sans font, Medium and SemiBold (SIL OFL 1.1, `FiraSans-OFL.txt`), and the Noto Sans Thai font, Medium,
   for the menus in Thai (SIL OFL 1.1, `NotoSansThai-OFL.txt`).

@@ -12,6 +12,7 @@
 #include "../../framepace.h"
 #include "../../imageload.h"
 #include "../../paths.h"
+#include "../../perfmon.h"
 #include "../../settings.h"
 #include "../../ui/menu.h"
 #include "../../window_size.h"
@@ -939,7 +940,7 @@ static void create_swapchain(void) {
     hdr_failed = hdr && !hdr_found;
     if (hdr && !hdr_found) LOG("[vk] HDR wanted, but this display offers no HDR10 swapchain format: SDR\n");
     if (hdr_found) draw.format = VK_FORMAT_B8G8R8A8_UNORM;
-    uint32_t count = caps.minImageCount + 1;
+    uint32_t count = caps.minImageCount + 2;  // (+1, and one for frame generation's queued pair: present_wait_room)
     if (caps.maxImageCount && count > caps.maxImageCount) count = caps.maxImageCount;
     if (count > 8) count = 8;
     VkSwapchainKHR old = g_vk.swapchain;
@@ -1146,29 +1147,63 @@ static void recreate_swapchain(void) {
 // came on top of translating the next frame, and BOTW's frame timer dropped the game to 20 fps (interval 3) whenever
 // three frames in a row ran over 31.7 ms. On the console a present only queues the frame. Here a thread of its own
 // presents, on a second queue of the same family (queues are externally synchronized: the GPU thread keeps submitting
-// on the first one meanwhile). One present at a time; the next acquire, a swapchain change and teardown wait for it.
+// on the first one meanwhile). The presents queue up (frame generation's pair: the game's frame waits there while the
+// next frame is drawn); vkQueuePresentKHR and vkAcquireNextImageKHR take sc_lock (the swapchain is externally
+// synchronized). The next frame begins once only a game frame after a generated one is still waiting (vk_frame_begin:
+// one frame at a time otherwise, as before); a swapchain change and teardown wait for them all.
 // SAVAGEWIND_VK_PRESENT_THREAD=0 (or a family with one queue): presents on the calling thread, as before.
 static pthread_mutex_t pres_m = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t pres_cv = PTHREAD_COND_INITIALIZER;
-static bool pres_busy;           // a present is queued or in progress
-static VkPresentInfoKHR pres_info;
-static VkSwapchainKHR pres_sc;
-static VkSemaphore pres_sem;
-static uint32_t pres_img;
+static pthread_mutex_t sc_lock = PTHREAD_MUTEX_INITIALIZER;
+enum { PRES_Q = 4 };
+static struct { VkSwapchainKHR sc; VkSemaphore sem; uint32_t img; int kind; uint64_t seq; } presq[PRES_Q];
+static int presq_head, presq_n;  // (pres_m) queued or being presented
 static _Atomic int pres_stale;   // that present said the swapchain is out of date or suboptimal
+// Frame generation (exec.c vk_fg_generate) presents two frames for each the game draws, the generated one, then the
+// game's (PRES_GEN, PRES_AFTER_GEN). The display shows a frame when the GPU has drawn it, not when it is handed over:
+// the GPU runs a frame or two behind (present to shown ~33 ms at 50 drawn fps), and both frames of a pair are done
+// within a millisecond of each other. Spacing the presents by the CPU's clock left them on screen together and then a
+// long gap (with VSync's FIFO and with G-SYNC: ghosting while the camera moved). So each is presented once the GPU has
+// drawn it, the generated one at once, the game's half the time between generated frames after it, as AMD's frame
+// interpolation swapchain does.
+enum { PRES_PLAIN, PRES_GEN, PRES_AFTER_GEN };
+
+static void present_wait_turn(int kind, uint64_t seq) {
+    static uint64_t last_gen;
+    static double gen_iv;  // (between generated frames, averaged: the game's frame time)
+    if (kind == PRES_PLAIN) return;
+    VkSemaphoreWaitInfo wi = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1, .pSemaphores = &g_vk.timeline,
+                              .pValues = &seq};
+    vkWaitSemaphores(g_vk.dev, &wi, 1000000000ull);  // (drawn; a second at most)
+    uint64_t now = SDL_GetTicksNS();
+    if (kind == PRES_GEN) {
+        double dt = last_gen ? (double)(now - last_gen) : 0;
+        if (dt > 0 && dt < 1e8) gen_iv = gen_iv > 0 ? gen_iv + (dt - gen_iv) * 0.1 : dt;
+        last_gen = now;
+        return;
+    }
+    uint64_t at = last_gen + (uint64_t)(gen_iv / 2);
+    if (gen_iv > 0 && now < at) SDL_DelayPrecise(at - now);
+}
 
 static void *present_thread(void *arg) {
     (void)arg;
     pthread_mutex_lock(&pres_m);
     for (;;) {
-        while (!pres_busy) pthread_cond_wait(&pres_cv, &pres_m);
-        VkPresentInfoKHR pi = pres_info;
+        while (!presq_n) pthread_cond_wait(&pres_cv, &pres_m);
+        __typeof__(presq[0]) q = presq[presq_head];
         pthread_mutex_unlock(&pres_m);
+        present_wait_turn(q.kind, q.seq);
+        VkPresentInfoKHR pi = {.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, .waitSemaphoreCount = 1, .pWaitSemaphores = &q.sem,
+                               .swapchainCount = 1, .pSwapchains = &q.sc, .pImageIndices = &q.img};
+        pthread_mutex_lock(&sc_lock);
         VkResult r = queue_present(g_vk.present_queue, &pi);
+        pthread_mutex_unlock(&sc_lock);
         if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) atomic_store(&pres_stale, 1);
         else if (r != VK_SUCCESS) { static int n; if (n++ < 5) LOG("[vk] present failed: %d\n", r); }
         pthread_mutex_lock(&pres_m);
-        pres_busy = false;
+        presq_head = (presq_head + 1) % PRES_Q;
+        presq_n--;
         pthread_cond_broadcast(&pres_cv);
     }
     return NULL;
@@ -1187,27 +1222,48 @@ static bool present_threaded(void) {
 
 void vk_present_idle(void) {
     pthread_mutex_lock(&pres_m);
-    while (pres_busy) pthread_cond_wait(&pres_cv, &pres_m);
+    while (presq_n) pthread_cond_wait(&pres_cv, &pres_m);
     pthread_mutex_unlock(&pres_m);
 }
 
-// Present window image img once sem is signalled. Returns false when the swapchain must be made again.
-static bool present_image(uint32_t img, VkSemaphore sem) {
+// Before the next window image is drawn: no plain present waiting (one frame at a time, as before), at most two of
+// frame generation's (the previous pair's game frame, this pair's generated one)
+static void present_wait_room(void) {
+    pthread_mutex_lock(&pres_m);
+    for (;;) {
+        bool plain = false;
+        for (int i = 0; i < presq_n; i++) plain |= presq[(presq_head + i) % PRES_Q].kind == PRES_PLAIN;
+        if (!plain && presq_n <= 2) break;
+        pthread_cond_wait(&pres_cv, &pres_m);
+    }
+    pthread_mutex_unlock(&pres_m);
+}
+
+static VkResult acquire_image(VkSemaphore sem, uint32_t *img) {
+    if (!present_threaded()) return vkAcquireNextImageKHR(g_vk.dev, g_vk.swapchain, UINT64_MAX, sem, VK_NULL_HANDLE, img);
+    for (;;) {  // (a short timeout at a time: not holding the swapchain while the present thread needs it)
+        pthread_mutex_lock(&sc_lock);
+        VkResult r = vkAcquireNextImageKHR(g_vk.dev, g_vk.swapchain, 2000000, sem, VK_NULL_HANDLE, img);
+        pthread_mutex_unlock(&sc_lock);
+        if (r != VK_TIMEOUT && r != VK_NOT_READY) return r;
+    }
+}
+
+// Present window image img once sem is signalled (kind, seq: frame generation's pair and the frame's submission, see
+// present_wait_turn). Returns false when the swapchain must be made again.
+static bool present_image(uint32_t img, VkSemaphore sem, int kind, uint64_t seq) {
     if (!present_threaded()) {
         VkPresentInfoKHR pi = {.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, .waitSemaphoreCount = 1, .pWaitSemaphores = &sem,
                                .swapchainCount = 1, .pSwapchains = &g_vk.swapchain, .pImageIndices = &img};
+        present_wait_turn(kind, seq);
         VkResult r = queue_present(g_vk.queue, &pi);
         return !(r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR);
     }
     pthread_mutex_lock(&pres_m);
-    while (pres_busy) pthread_cond_wait(&pres_cv, &pres_m);
-    pres_sc = g_vk.swapchain;
-    pres_sem = sem;
-    pres_img = img;
-    pres_info = (VkPresentInfoKHR){.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, .waitSemaphoreCount = 1, .pWaitSemaphores = &pres_sem,
-                                   .swapchainCount = 1, .pSwapchains = &pres_sc, .pImageIndices = &pres_img};
-    pres_busy = true;
-    pthread_cond_signal(&pres_cv);
+    while (presq_n == PRES_Q) pthread_cond_wait(&pres_cv, &pres_m);
+    presq[(presq_head + presq_n) % PRES_Q] = (__typeof__(presq[0])){g_vk.swapchain, sem, img, kind, seq};
+    presq_n++;
+    pthread_cond_broadcast(&pres_cv);
     pthread_mutex_unlock(&pres_m);
     return true;
 }
@@ -1276,7 +1332,7 @@ bool vk_frame_begin(const float clear[4]) {
     // minimised (Windows keeps the window's size then, but its surface is 0 x 0: every acquire was out of date)
     if (!w || !h || (SDL_GetWindowFlags(window) & SDL_WINDOW_MINIMIZED)) return false;
     uint64_t tp = SDL_GetTicksNS();
-    vk_present_idle();  // (the swapchain is externally synchronized: no acquire while the present thread presents)
+    present_wait_room();
     g_present_split[4] += SDL_GetTicksNS() - tp;
     float white;  // (Windows HDR turned on or off, the window moved to another display, Video > HDR changed)
     bool hdr = hdr_wanted(&white);
@@ -1294,11 +1350,11 @@ bool vk_frame_begin(const float clear[4]) {
     vk_wait_seq(slot_seq[slot]);
     g_present_split[5] += SDL_GetTicksNS() - tw;
     uint64_t ta = SDL_GetTicksNS();
-    VkResult r = vkAcquireNextImageKHR(g_vk.dev, g_vk.swapchain, UINT64_MAX, acquire_sem[slot], VK_NULL_HANDLE, &cur_frame.image);
+    VkResult r = acquire_image(acquire_sem[slot], &cur_frame.image);
     g_present_split[0] += SDL_GetTicksNS() - ta;
     if (r == VK_ERROR_OUT_OF_DATE_KHR) {
         recreate_swapchain();
-        r = vkAcquireNextImageKHR(g_vk.dev, g_vk.swapchain, UINT64_MAX, acquire_sem[slot], VK_NULL_HANDLE, &cur_frame.image);
+        r = acquire_image(acquire_sem[slot], &cur_frame.image);
     }
     if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) {
         static unsigned failed;  // (a few, then every 1000th: one a frame filled the log)
@@ -1360,6 +1416,7 @@ static void save_window_image(VkCommandBuffer cb, VkSpan *out) {
 }
 
 // End rendering into the window image and present it. shot_path: also save the window image as PNG.
+static int frame_kind;  // (frame generation: PRES_GEN / PRES_AFTER_GEN for the next vk_frame_end's present)
 void vk_frame_end(const char *shot_path) {
     if (!cur_frame.ok) return;
     VkCommandBuffer cb = vk_cmd();
@@ -1375,7 +1432,8 @@ void vk_frame_end(const char *shot_path) {
     vk_submit_extra(cur_frame.acquired, done_sem[img], VK_NULL_HANDLE);
     g_present_split[3] += SDL_GetTicksNS() - ts;
     ts = SDL_GetTicksNS();
-    if (!present_image(img, done_sem[img])) recreate_swapchain();
+    if (!present_image(img, done_sem[img], frame_kind, seq)) recreate_swapchain();
+    frame_kind = PRES_PLAIN;
     g_present_split[4] += SDL_GetTicksNS() - ts;
     cur_frame.ok = false;
     if (shot_path) {
@@ -1461,6 +1519,33 @@ static uint64_t pso_wait(void) {  // ns waited
     return dt;
 }
 
+// Frame generation (Video > Frame generation; exec.c vk_fg_generate): wanted in play, not over the menus (the pause
+// menu's pages, the map, the title screen, the F1 menu), where the picture mostly stands and the game's own frames
+// keep its cursor crisp. SAVAGEWIND_FG=0/1 overrides the setting (tests).
+extern volatile int g_fg_want;
+extern volatile int g_fg_active;  // (framepace.c: the game draws every other presented frame)
+TexBackend *vk_fg_generate(NvnTexture *t, TexBackend *b);
+static uint64_t gen_frames;
+static char fg_real_shot[256];  // (SAVAGEWIND_FG_SHOT_AT: the game's frame after a generated one saved)
+
+void vk_fg_wait_idle(void) {
+    vk_present_idle();
+    vkDeviceWaitIdle(g_vk.dev);
+}
+
+static bool fg_wanted(void) {
+    static int forced = -2;
+    if (forced == -2) forced = getenv("SAVAGEWIND_FG") ? atoi(getenv("SAVAGEWIND_FG")) : -1;
+    if (!(forced >= 0 ? forced : g_settings.frame_gen)) return false;
+    static int log = -1;
+    static uint64_t n;
+    if (log < 0) log = getenv("SAVAGEWIND_FG_LOG") != NULL;
+    if (log && n++ % 300 == 0)
+        LOG("[fg] wanted? title %d menu %d paused %d F1 menu %d\n", framepace_title_ui(), framepace_menu_ui(),
+            framepace_paused(), menu_is_open());
+    return !framepace_title_ui() && !framepace_menu_ui() && !framepace_paused() && !menu_is_open();
+}
+
 static void present_locked(NvnTexture *t) {
     g_last_presented = t;
     TexBackend *b = vk_tex(t, true);
@@ -1469,6 +1554,14 @@ static void present_locked(NvnTexture *t) {
     vk_end_pass();
     g_present_split[1] += SDL_GetTicksNS() - t0;
     t0 += pso_wait();  // (not the acquire's time)
+    // Frame generation: the frame between the last one and this (exec.c vk_fg_generate), presented first
+    TexBackend *gen = vk_fg_generate(t, b);
+    {   // (measuring) SAVAGEWIND_FG_TEST=1: the frame made, not presented
+        static int test = -1;
+        if (test < 0) test = getenv("SAVAGEWIND_FG_TEST") ? atoi(getenv("SAVAGEWIND_FG_TEST")) : 0;
+        if (test == 1) gen = NULL;
+    }
+    g_fg_active = gen != NULL;
     static const float black[4] = {0, 0, 0, 1};
     bool have = vk_frame_begin(black);
     uint64_t nd = SDL_GetTicksNS() - t0;
@@ -1499,6 +1592,39 @@ static void present_locked(NvnTexture *t) {
         float pv[8] = {renderer_origin_lower_left() ? 1.0f : 0.0f, 0, 0, 0, crop[0], crop[1], crop[2], crop[3]};
         memcpy(g_shot_crop, crop, sizeof crop);
         uint64_t td = SDL_GetTicksNS();
+        if (gen) {  // the generated frame, as the game's are (crop, anti-aliasing, menu), then this one half a frame later
+            vk_present_draw(cb, gen, (float)vx, (float)vy, (float)vw, (float)vh, pv);
+            menu_render((void *)cb, g_vk.sc_extent.width, g_vk.sc_extent.height);
+            // SAVAGEWIND_FG_SHOT_AT=<frame>,... (counted as SAVAGEWIND_SHOT_AT): the window at two presents in a row
+            // from there, each generated frame and the game's after it -> build/frames/window_N_<0|1>_<gen|real>.png
+            // (real 0, gen 1, real 1: a generated frame between the two it was made from)
+            static const char *gnext;
+            static int ginit, gleft;
+            static long gat;
+            if (!ginit) { ginit = 1; gnext = getenv("SAVAGEWIND_FG_SHOT_AT"); if (gnext) mkdir("build/frames", 0755); }
+            if (!gleft && gnext && *gnext) {
+                extern uint64_t framepace_script_frame(uint64_t presented);
+                long at = strtol(gnext, NULL, 10);
+                if ((long)framepace_script_frame(total_frames + 1) >= at) {
+                    gat = at, gleft = 2;
+                    while (*gnext && *gnext != ',') gnext++;
+                    if (*gnext == ',') gnext++;
+                }
+            }
+            char gpath[256] = "";
+            if (gleft) {
+                snprintf(gpath, sizeof gpath, "build/frames/window_%05ld_%d_gen.png", gat, 2 - gleft);
+                snprintf(fg_real_shot, sizeof fg_real_shot, "build/frames/window_%05ld_%d_real.png", gat, 2 - gleft);
+                gleft--;
+            }
+            frame_kind = PRES_GEN;
+            vk_frame_end(gpath[0] ? gpath : NULL);
+            frame_kind = PRES_AFTER_GEN;  // (the game's frame, below)
+            gen_frames++;
+            perfmon_generated_frame();
+            if (!vk_frame_begin(black)) { renderer_submit(); goto presented; }
+            cb = vk_cmd();
+        }
         vk_present_draw(cb, b, (float)vx, (float)vy, (float)vw, (float)vh, pv);
         static long menu_at = -1;
         if (menu_at < 0) menu_at = getenv("SAVAGEWIND_MENU_AT") ? atol(getenv("SAVAGEWIND_MENU_AT")) : 0;
@@ -1523,11 +1649,14 @@ static void present_locked(NvnTexture *t) {
                 if (*wnext == ',') wnext++;
             }
         }
-        vk_frame_end(shot ? "build/window.png" : wpath[0] ? wpath : NULL);
+        vk_frame_end(shot ? "build/window.png" : wpath[0] ? wpath : fg_real_shot[0] ? fg_real_shot : NULL);
+        fg_real_shot[0] = 0;
         if (shot && getenv("SAVAGEWIND_EXIT_AFTER_SHOT")) { fflush(stderr); _exit(0); }
     } else {
         renderer_submit();
     }
+presented:
+    g_fg_want = fg_wanted();  // (for the next frame's draws)
     extern void vk_prof_frame(uint64_t frame, uint64_t present_ns);
     vk_prof_frame(total_frames, SDL_GetTicksNS() - t0);
     extern void vk_list_stats_frame(void);
@@ -1545,6 +1674,11 @@ static void present_locked(NvnTexture *t) {
     extern uint64_t framepace_script_frame(uint64_t presented);
     uint64_t script_frame = framepace_script_frame(total_frames);  // (SAVAGEWIND_SCRIPT_CLOCK: 30ths of a second)
     input_frame(script_frame);
+    {   // SAVAGEWIND_EXIT_AT=<frame> (counted as SAVAGEWIND_INPUT): end the run there
+        static long exit_at = -1;
+        if (exit_at < 0) exit_at = getenv("SAVAGEWIND_EXIT_AT") ? atol(getenv("SAVAGEWIND_EXIT_AT")) : 0;
+        if (exit_at && (long)script_frame >= exit_at) { fflush(stderr); _exit(0); }
+    }
     static long slow_ms = -1;
     if (slow_ms < 0) slow_ms = getenv("SAVAGEWIND_SLOW_FRAME_MS") ? atol(getenv("SAVAGEWIND_SLOW_FRAME_MS")) : 0;
     if (slow_ms > 0 && total_frames > 2600) SDL_Delay((Uint32)slow_ms);
@@ -1667,8 +1801,12 @@ static void present_locked(NvnTexture *t) {
         if (last_fps_time > 0)
             LOG("[vk] t=%.1f frame %llu %.1f fps max %.0fms (%s)\n", now, (unsigned long long)total_frames,
                 frames / (now - last_fps_time), max_gap * 1000.0, renderer_stats());
+        if (gen_frames && last_fps_time > 0)
+            LOG("[fg] %.1f generated frames/s: %.1f presented\n", gen_frames / (now - last_fps_time),
+                (frames + gen_frames) / (now - last_fps_time));
         max_gap = 0;
         frames = 0;
+        gen_frames = 0;
         last_fps_time = now;
     }
 }
