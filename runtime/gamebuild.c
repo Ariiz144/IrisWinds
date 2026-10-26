@@ -231,8 +231,9 @@ static void log_tail(const char *path, char *out, size_t n) {  // the last line 
     snprintf(out, n, "%s", nl ? nl + 1 : buf);
 }
 
-// The end of a failed generator's log, into this log: the work folder (and the generator's own log with it) is
-// deleted after the build, and a crash leaves a stack (faulthandler, tools/gen.py) of many lines, not one message.
+// The end of a failed generator's or compile's log, into this log: the work folder (and their own logs with it) is
+// deleted after the build, a crash leaves a stack (faulthandler, tools/gen.py) of many lines, and a compile's last
+// line is only "1 error generated", after the error itself.
 static void log_gen_tail(const char *path, int exit_code) {
     if (exit_code > 128 && exit_code < 255)  // (Linux, macOS: ended by a signal; 9, killed: often out of memory)
         LOG("[gamebuild]   ended by signal %d\n", exit_code - 128);
@@ -489,6 +490,7 @@ bool gamebuild_run(const char *game_dir, const GameBuildOpts *o, char *why, size
                 char last[300];
                 log_tail(u->log, last, sizeof last);
                 LOG("[gamebuild] compiling %s failed: %s\n", u->src, last);
+                log_gen_tail(u->log, r);  // (the compiler's errors: its last line is only "1 error generated", #123)
                 snprintf(why, why_size, "the game code didn't compile");
                 ok = false;
             }
