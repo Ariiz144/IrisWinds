@@ -123,7 +123,20 @@ typedef struct TexBackend {
     bool kept;                   // parked past PARK_FRAMES with its contents (textures.c idle_expire)
     uint64_t drawn_frame, prev_drawn;  // last two frames a pass drew into it (exec.c: one-shot draws)
     uint64_t serial;             // which image this is: every image made gets a new one (exec.c's linear targets)
+    uint64_t write_version;      // incremented on writes (draws, clears, compute, copies, uploads)
+    uint32_t last_write_op;      // RES_OP_* operation that last modified this image
+    VkPipelineStageFlags2 last_write_stages;
+    VkAccessFlags2 last_write_access;
 } TexBackend;
+
+enum {
+    RES_OP_NONE = 0,
+    RES_OP_DRAW = 1,
+    RES_OP_CLEAR = 2,
+    RES_OP_COMPUTE = 3,
+    RES_OP_COPY = 4,
+    RES_OP_UPLOAD = 5
+};
 
 TexBackend *vk_tex(NvnTexture *t, bool for_render);  // backend image (uploads CPU contents unless for_render)
 VkFormat vk_format(uint32_t nvn_format);

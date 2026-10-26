@@ -357,6 +357,8 @@ static void create_image(NvnTexture *t, TexBackend *b) {
     }
     static uint64_t serials;
     b->serial = __atomic_add_fetch(&serials, 1, __ATOMIC_RELAXED);
+    b->write_version = 1;
+    b->last_write_op = RES_OP_NONE;
     b->format = vf;
     b->width = tw; b->height = th; b->depth = depth; b->layers = layers; b->levels = levels; b->samples = samples;
     b->aspect = depthfmt ? aspect_of(t->format) : VK_IMAGE_ASPECT_COLOR_BIT;
@@ -734,6 +736,10 @@ static void upload_texture(NvnTexture *t, TexBackend *b, bool written) {
     if (b->uploaded && h != b->data_hash && !written) b->dynamic = true;
     b->data_hash = h;
     b->uploaded = true;
+    b->write_version++;
+    b->last_write_op = RES_OP_UPLOAD;
+    b->last_write_stages = VK_PIPELINE_STAGE_2_COPY_BIT;
+    b->last_write_access = VK_ACCESS_2_TRANSFER_WRITE_BIT;
     {   // (debugging) SAVAGEWIND_DUMP_RAW=<w>x<h>x<nvn format hex>: the guest storage of such textures as uploaded
         static const char *e = (const char *)1;
         if (e == (const char *)1) e = getenv("SAVAGEWIND_DUMP_RAW");
