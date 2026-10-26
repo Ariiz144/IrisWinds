@@ -32,6 +32,15 @@ mouse, and its text and voices in any of its languages.
 > Savage Wind never decrypts anything: it only reads files you have already extracted yourself. The recompilation of
 > the game code happens locally, on your machine, from your files.
 
+## Before you report a bug
+
+- **Use the [latest release](https://github.com/Revivedx/SavageWindRecomp/releases/latest)** and game version
+  **1.9.0**: 1.8.2 isn't supported, and many bugs of older releases are already fixed.
+- **Search the [existing issues](https://github.com/Revivedx/SavageWindRecomp/issues?q=is%3Aissue)** first.
+- **Attach `savagewind.log`.** On Windows it's next to `savagewind.exe`, in the Savage Wind folder; on Linux, in
+  `~/.local/share/savagewind/`. The game writes a new one each time it starts, so take it right after the bug.
+- Reports missing any of these get a `needs-info` label and are closed after 7 days without it.
+
 ## Getting started (Alpha 3)
 
 1. Download from [Releases](https://github.com/Revivedx/SavageWindRecomp/releases):

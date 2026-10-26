@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Before you report a bug
+    url: https://github.com/Revivedx/SavageWindRecomp#before-you-report-a-bug
+    about: The supported versions, where savagewind.log is, and what every report needs.
+  - name: Latest release and known issues
+    url: https://github.com/Revivedx/SavageWindRecomp/releases/latest
+    about: Downloads, what's new, and the issues already known in this release.
